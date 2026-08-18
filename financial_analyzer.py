@@ -858,7 +858,7 @@ def build_markdown_report(ticker, data, m):
 - Equity Value: {m['equity_value'] / 1e9:,.2f} млрд. {trading_ccy}
 
 **Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
-Текущая цена: {m['price']:.2f} {trading_ccy} | Статус: **{m['val_status']}**
+Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
 
 ### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на 2.5% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
 
@@ -1100,8 +1100,9 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     story.append(Spacer(1, 8))
 
     val_banner_text = (
-        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {fair_value_share:.2f} USD</b><br/>"
-        f"Текущая рыночная цена: {price:.2f} USD | Статус: <font color='{val_color.hexval()}'><b>{val_status}</b></font>"
+        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {fair_value_share:.2f} {trading_ccy}</b><br/>"
+        f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
+        f"| Статус: <font color='{val_color.hexval()}'><b>{val_status}</b></font>"
     )
     story.append(
         CalloutBox(
