@@ -361,7 +361,7 @@ def generate_fcf_chart(years, hist_fcf, proj_years, proj_fcf, ticker):
     ax.grid(axis="y", linestyle="--", alpha=0.3, color="#64748B")
 
     plt.tight_layout()
-    chart_path = f"/workspace/scratch/{ticker}_fcf_chart.png"
+    chart_path = os.path.join(SCRATCH_DIR, f"{ticker}_fcf_chart.png")
     plt.savefig(chart_path, dpi=300, bbox_inches="tight")
     plt.close()
     return chart_path
@@ -607,7 +607,7 @@ def build_pdf_report(ticker):
     )
 
     # 5. BUILD THE STORY FOR PDF
-    pdf_filename = f"/workspace/out/{ticker}_fundamental_report.pdf"
+    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report.pdf")
 
     doc = BaseDocTemplate(
         pdf_filename,
