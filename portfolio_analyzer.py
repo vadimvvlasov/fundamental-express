@@ -170,6 +170,59 @@ def build_comparative_pdf(results, name="Portfolio"):
     return pdf_path
 
 
+def build_comparative_markdown(results, name="Portfolio"):
+    md_path = f"{OUTPUT_DIR}/{name}_Comparative_Report.md"
+    lines = [
+        f"# Сравнительный анализ портфеля: {name}",
+        "",
+        "Методика: экспресс-чеклист «грехов» + DCF (CAPM WACC), real data only.",
+        "",
+        "## 1. Сводная таблица",
+        "",
+        "| Тикер | Вес | Цена | DCF fair value | Откл. от справ. цены | Вердикт | Грехи |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    failed = []
+    for r in results:
+        w = f"{r['weight']:g}%"
+        if not r["ok"]:
+            lines.append(f"| {r['ticker']} | {w} | н/д | н/д | нет данных (Yahoo) | н/д | н/д |")
+            failed.append(r["ticker"])
+            continue
+        m = r["metrics"]
+        ou = m["over_under_pct"]
+        ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
+        lines.append(
+            f"| {r['ticker']} | {w} | ${m['price']:,.2f} | ${m['fair_value_share']:,.2f} | "
+            f"{ou_label} | {m['verdict']} | {len(m['sins'])}/5 |"
+        )
+    lines.append("")
+
+    if failed:
+        lines += [
+            f"> **Нет данных:** {', '.join(failed)} — Yahoo Finance не отдал данные после нескольких попыток. "
+            "Никаких mock-чисел не подставлено; повторите запуск позже.",
+            "",
+        ]
+
+    lines.append("## 2. Детали по «грехам»")
+    lines.append("")
+    for r in results:
+        if not r["ok"]:
+            continue
+        m = r["metrics"]
+        if m["sins"]:
+            lines.append(f"- **{r['ticker']}**: " + "; ".join(m["sins"]))
+        else:
+            lines.append(f"- **{r['ticker']}**: грехов не обнаружено.")
+    lines.append("")
+
+    with open(md_path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"Success! Markdown comparative report saved to: {md_path}")
+    return md_path
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Compare multiple companies (express sins-checklist + DCF) - real data only",
@@ -188,3 +241,4 @@ if __name__ == "__main__":
     results = analyze_holdings(holdings, retries=args.retries, retry_delay=args.retry_delay)
     print_table(results)
     build_comparative_pdf(results, name=args.name)
+    build_comparative_markdown(results, name=args.name)

@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from datetime import datetime
 
 # Resolve workspace root relative to this script file
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -135,6 +136,20 @@ class DataUnavailableError(Exception):
         self.attempts = attempts
 
 
+def _fx_rate(from_ccy, to_ccy):
+    """USD-per-unit-of-from_ccy conversion rate, or None if it can't be fetched."""
+    if from_ccy == to_ccy:
+        return 1.0
+    try:
+        fx = yf.Ticker(f"{from_ccy}{to_ccy}=X")
+        rate = fx.info.get("regularMarketPrice") or fx.info.get("previousClose")
+        if rate:
+            return float(rate)
+    except Exception:
+        pass
+    return None
+
+
 # ── FINANCIAL DATA COLLECTOR ────────────────────────────────────────────
 def _fetch_once(ticker):
     """Single real-data fetch attempt. Returns a data dict, or None on any failure."""
@@ -150,13 +165,50 @@ def _fetch_once(ticker):
         if financials.empty or balance.empty or cashflow.empty:
             return None
 
-        price = info.get("currentPrice") or info.get("previousClose")
+        if info.get("currentPrice"):
+            price, price_kind = info["currentPrice"], "последняя сделка (currentPrice)"
+        elif info.get("previousClose"):
+            price, price_kind = info["previousClose"], "цена предыдущего закрытия (previousClose)"
+        else:
+            price, price_kind = None, None
         shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
         if not price or not shares:
             return None
 
+        # regularMarketTime is a real exchange timestamp for the quote above;
+        # fall back to "now" (script run time) only if yfinance omits it, and
+        # say so plainly rather than implying it's a market timestamp.
+        market_time_epoch = info.get("regularMarketTime")
+        exchange_tz = info.get("exchangeTimezoneName")
+        if market_time_epoch:
+            from datetime import timezone as _tz
+            quote_time = datetime.fromtimestamp(market_time_epoch, tz=_tz.utc)
+            if exchange_tz:
+                try:
+                    from zoneinfo import ZoneInfo
+                    quote_time = quote_time.astimezone(ZoneInfo(exchange_tz))
+                except Exception:
+                    pass
+            quote_time_label = quote_time.strftime("%Y-%m-%d %H:%M %Z")
+        else:
+            quote_time_label = f"{datetime.now().strftime('%Y-%m-%d %H:%M')} (время запуска скрипта, не биржевое время)"
+
         beta = info.get("beta") or 1.1
         name = info.get("longName") or info.get("shortName") or ticker
+
+        # Foreign issuers (e.g. TSM/TSMC) often report financial statements in
+        # their home currency (TWD) while price/shares/market cap are quoted in
+        # USD via the ADR. Mixing the two without converting corrupts every
+        # dollar figure downstream (DCF fair value, fundamentals table) even
+        # though ratio-based checks (current ratio, margins, YoY trends) stay
+        # correct since they compare same-currency figures.
+        financial_ccy = info.get("financialCurrency")
+        trading_ccy = info.get("currency") or "USD"
+        fx_rate = 1.0
+        if financial_ccy and financial_ccy != trading_ccy:
+            fx_rate = _fx_rate(financial_ccy, trading_ccy)
+            if fx_rate is None:
+                return None  # can't safely mix currencies - treat like any other fetch failure
 
         return {
             "ticker": ticker.upper(),
@@ -168,6 +220,11 @@ def _fetch_once(ticker):
             "balance": balance,
             "cashflow": cashflow,
             "is_sample": False,
+            "price_kind": price_kind,
+            "quote_time_label": quote_time_label,
+            "fx_rate": fx_rate,
+            "financial_currency": financial_ccy or trading_ccy,
+            "trading_currency": trading_ccy,
         }
     except Exception as e:
         print(f"  [{ticker}] fetch attempt failed: {e}")
@@ -213,6 +270,11 @@ def _sample_data(ticker):
         "balance": balance_df,
         "cashflow": cashflow_df,
         "is_sample": True,
+        "price_kind": "SAMPLE - НЕ РЕАЛЬНАЯ ЦЕНА",
+        "quote_time_label": f"{datetime.now().strftime('%Y-%m-%d %H:%M')} (время запуска скрипта на SAMPLE-данных)",
+        "fx_rate": 1.0,
+        "financial_currency": "USD",
+        "trading_currency": "USD",
     }
 
 
@@ -421,10 +483,41 @@ def compute_metrics(data):
     total_assets = find_row(df_bal, ["total assets"])
     goodwill = find_row(df_bal, ["goodwill"])
     equity = find_row(df_bal, ["stockholders equity", "total stockholders equity"])
-    debt = find_row(df_bal, ["total debt", "long term debt"])
+    # "Total Debt" from yfinance usually bundles in capitalized lease
+    # obligations (ASC 842) - for lease-heavy businesses (restaurants,
+    # retail) that materially overstates net debt relative to what a classic
+    # debt-cash bridge means, and double-counts against FCF (which already
+    # reflects lease payments as an operating outflow). Prefer the narrower
+    # "Long Term Debt" line; fall back to "Total Debt" only if that's absent.
+    debt = find_row(df_bal, ["long term debt", "total debt"])
     cash = find_row(df_bal, ["cash and cash equivalents", "cash cash equivalents"])
+    # yfinance sometimes exposes a pre-computed, lease-adjusted Net Debt row
+    # directly - prefer that over our own debt-minus-cash math when present.
+    net_debt_reported = find_row(df_bal, ["net debt"], default_val=float("nan"))
 
     fcf = find_row(df_cf, ["free cash flow", "fcf"])
+
+    # Convert monetary rows to the trading currency (e.g. TWD -> USD for TSM's
+    # ADR) so they're comparable to price/shares, which are always quoted in
+    # the trading currency. Ratio-based figures (current ratio, margins, share
+    # counts, EPS) are left alone - EPS in particular is quoted per home-market
+    # ordinary share, not per ADR, so currency conversion alone wouldn't make
+    # it comparable to the ADR price anyway; that's a separate, undocumented
+    # ADR-ratio issue we don't attempt to fix here.
+    fx_rate = data.get("fx_rate", 1.0)
+    if fx_rate != 1.0:
+        revenue = revenue * fx_rate
+        operating_income = operating_income * fx_rate
+        net_income = net_income * fx_rate
+        curr_assets = curr_assets * fx_rate
+        curr_liab = curr_liab * fx_rate
+        total_assets = total_assets * fx_rate
+        goodwill = goodwill * fx_rate
+        equity = equity * fx_rate
+        debt = debt * fx_rate
+        cash = cash * fx_rate
+        fcf = fcf * fx_rate
+        net_debt_reported = net_debt_reported * fx_rate
 
     curr_ratios = curr_assets / curr_liab
     net_margin = net_income / revenue * 100
@@ -478,7 +571,10 @@ def compute_metrics(data):
     else:
         verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
         verdict_color_key = "danger"
-        reasoning = f"Обнаружено {len(sins)} финансовых нарушений (грехов). Слабая ликвидность, падающие потоки капитала или отрицательный свободный кэш делают эту инвестицию крайне рискованной на текущем этапе."
+        reasoning = (
+            f"Обнаружено {len(sins)} финансовых нарушений (грехов) — см. список ниже. "
+            "Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
+        )
 
     # ── DCF valuation (CAPM WACC) ───────────────────────────────────────
     fcf_values = fcf.values
@@ -506,6 +602,7 @@ def compute_metrics(data):
         w_debt = latest_debt / total_cap
         wacc = (w_equity * cost_of_equity) + (w_debt * after_tax_debt)
     else:
+        w_equity, w_debt = 1.0, 0.0
         wacc = 0.09
     wacc = max(0.05, min(0.15, wacc))
 
@@ -530,7 +627,19 @@ def compute_metrics(data):
 
     enterprise_value = sum_pv_fcfs + pv_terminal_val
     latest_cash = cash.iloc[-1] if not pd.isna(cash.iloc[-1]) else 0.0
-    net_debt = latest_debt - latest_cash
+    latest_net_debt_reported = (
+        net_debt_reported.iloc[-1] if len(net_debt_reported) else float("nan")
+    )
+    if not pd.isna(latest_net_debt_reported):
+        net_debt = latest_net_debt_reported
+        net_debt_source = "reported"
+        # keep the displayed debt figure consistent with whichever net_debt
+        # number actually feeds the DCF, rather than mixing two sources
+        debt_for_display = net_debt + latest_cash
+    else:
+        net_debt = latest_debt - latest_cash
+        net_debt_source = "computed"
+        debt_for_display = latest_debt
     equity_value = enterprise_value - net_debt
     fair_value_share = equity_value / shares if shares > 0 else 0.0
 
@@ -586,12 +695,19 @@ def compute_metrics(data):
         "reasoning": reasoning,
         "beta": beta,
         "wacc": wacc,
+        "cost_of_equity": cost_of_equity,
+        "cost_of_debt_after_tax": after_tax_debt,
+        "equity_weight": w_equity,
+        "debt_weight": w_debt,
         "cagr": cagr,
         "proj_years": proj_years,
         "projected_fcfs": projected_fcfs,
         "pv_fcfs": pv_fcfs,
         "enterprise_value": enterprise_value,
         "net_debt": net_debt,
+        "net_debt_source": net_debt_source,
+        "gross_debt": debt_for_display,
+        "cash_balance": latest_cash,
         "equity_value": equity_value,
         "price": price,
         "fair_value_share": fair_value_share,
@@ -606,11 +722,105 @@ def compute_metrics(data):
 
 
 # ── MAIN PDF COMPILER ───────────────────────────────────────────────────
-def build_pdf_report(ticker, retries=5, allow_sample=False):
-    data = get_company_data(ticker, retries=retries, allow_sample=allow_sample)
+def build_markdown_report(ticker, data, m):
+    """Plain-text/Markdown twin of the PDF report - same numbers, no charts."""
+    name = data["name"]
+    trading_ccy = data.get("trading_currency", "USD")
+    financial_ccy = data.get("financial_currency", "USD")
+    fx_line = (
+        f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
+        f"{data.get('fx_rate', 1.0):.4f}\n\n"
+        if financial_ccy != trading_ccy else ""
+    )
+    year_labels = m["year_labels"]
+
+    def row(label, series, fmt="{:,.1f}"):
+        return f"| {label} | " + " | ".join(fmt.format(v) for v in series) + " |"
+
+    sins_block = (
+        "\n".join(f"- {s}" for s in m["sins"]) if m["sins"] else "- Грехов не обнаружено."
+    )
+    debt_label = (
+        "Долг" if m["net_debt_source"] == "computed"
+        else "Эффективный долг (из отчётного Net Debt Yahoo Finance)"
+    )
+    sens_header = "| " + " | ".join(m["sensitivity_headers"]) + " |"
+    sens_sep = "|" + "---|" * len(m["sensitivity_headers"])
+    sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m["sensitivity_rows"])
+
+    md = f"""# Фундаментальный анализ & оценка DCF: {ticker.upper()}
+
+Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
+
+{fx_line}## 1. Экспресс-вердикт и оценка рисков
+
+**{m['verdict']}**
+
+{m['reasoning']}
+
+**Выявленные риски:**
+
+{sins_block}
+
+## 2. Экспресс-анализ финансовых результатов и баланса
+
+Показатели в млн. {trading_ccy}.
+
+| Показатель | {" | ".join(year_labels)} |
+|---|{"---|" * len(year_labels)}
+{row("Выручка (Revenue)", [v / 1e6 for v in m["revenue"]])}
+{row("Операционная прибыль", [v / 1e6 for v in m["operating_income"]])}
+{row("Чистая прибыль (Net Income)", [v / 1e6 for v in m["net_income"]])}
+{row("Разводненная EPS, USD", list(m["eps"]), fmt="{:.2f}")}
+{row("Оборотные активы", [v / 1e6 for v in m["curr_assets"]])}
+{row("Краткосрочные обязательства", [v / 1e6 for v in m["curr_liab"]])}
+{row("Current Ratio", list(m["curr_ratios"]), fmt="{:.2f}")}
+{row("Акционерный капитал", [v / 1e6 for v in m["equity"]])}
+{row("Free Cash Flow", [v / 1e6 for v in m["fcf"]])}
+
+## 3. Модель дисконтирования денежных потоков (DCF)
+
+- Стоимость собственного капитала (CAPM): Ke = 4% + β×5% = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%
+- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m['cost_of_debt_after_tax'] * 100:.2f}%
+- Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m['equity_weight'] * 100:.1f}%, D/(D+E) = {m['debt_weight'] * 100:.1f}%
+- **WACC:** {m['equity_weight'] * 100:.1f}%×{m['cost_of_equity'] * 100:.2f}% + {m['debt_weight'] * 100:.1f}%×{m['cost_of_debt_after_tax'] * 100:.2f}% = **{m['wacc'] * 100:.2f}%**
+- CAGR роста FCF: {m['cagr'] * 100:.2f}% (историческая, ограничена 2-15%)
+- Терминальный темп роста: 2.5%
+- Чистый долг: {m['net_debt'] / 1e9:,.2f} млрд. {trading_ccy} ({debt_label} {m['gross_debt'] / 1e9:,.2f} млрд. − Кэш {m['cash_balance'] / 1e9:,.2f} млрд.)
+- Enterprise Value: {m['enterprise_value'] / 1e9:,.2f} млрд. {trading_ccy}
+- Equity Value: {m['equity_value'] / 1e9:,.2f} млрд. {trading_ccy}
+
+**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
+Текущая цена: {m['price']:.2f} {trading_ccy} | Статус: **{m['val_status']}**
+
+### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на 2.5% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
+
+{sens_header}
+{sens_sep}
+{sens_rows}
+
+---
+Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
+"""
+    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report.md")
+    with open(md_filename, "w") as f:
+        f.write(md)
+    return md_filename
+
+
+def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
+    data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
     m = compute_metrics(data)
 
     name = data["name"]
+    price_kind = data["price_kind"]
+    quote_time_label = data["quote_time_label"]
+    financial_ccy = data.get("financial_currency", "USD")
+    trading_ccy = data.get("trading_currency", "USD")
+    fx_note = (
+        f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
+        if financial_ccy != trading_ccy else ""
+    )
     price = m["price"]
     beta = m["beta"]
     year_labels = m["year_labels"]
@@ -634,6 +844,13 @@ def build_pdf_report(ticker, retries=5, allow_sample=False):
     pv_fcfs = m["pv_fcfs"]
     enterprise_value = m["enterprise_value"]
     net_debt = m["net_debt"]
+    net_debt_source = m["net_debt_source"]
+    gross_debt = m["gross_debt"]
+    cash_balance = m["cash_balance"]
+    cost_of_equity = m["cost_of_equity"]
+    cost_of_debt_after_tax = m["cost_of_debt_after_tax"]
+    equity_weight = m["equity_weight"]
+    debt_weight = m["debt_weight"]
     equity_value = m["equity_value"]
     fair_value_share = m["fair_value_share"]
     val_status = m["val_status"]
@@ -730,7 +947,8 @@ def build_pdf_report(ticker, retries=5, allow_sample=False):
     )
     story.append(
         Paragraph(
-            f"Полный отчет по компании: <b>{name}</b> | Текущая цена: <b>{price:.2f} USD</b>",
+            f"Полный отчет по компании: <b>{name}</b> | Цена: <b>{price:.2f} {trading_ccy}</b> "
+            f"({price_kind}, Yahoo Finance, {quote_time_label})",
             subtitle_style,
         )
     )
@@ -763,12 +981,13 @@ def build_pdf_report(ticker, retries=5, allow_sample=False):
     story.append(Paragraph("2. Экспресс-анализ финансовых результатов и баланса", h1_style))
     story.append(
         Paragraph(
-            "Ниже представлена сводная таблица фундаментальных показателей компании за последние 4 отчетных года. Основной упор сделан на динамику изменения капитала, ликвидности и денежных потоков.",
+            "Ниже представлена сводная таблица фундаментальных показателей компании за последние 4 отчетных года. "
+            f"Основной упор сделан на динамику изменения капитала, ликвидности и денежных потоков.{fx_note}",
             body_style,
         )
     )
 
-    fund_headers = ["Показатель (в млн. USD)", year_labels[0], year_labels[1], year_labels[2], year_labels[3]]
+    fund_headers = [f"Показатель (в млн. {trading_ccy})", year_labels[0], year_labels[1], year_labels[2], year_labels[3]]
     fund_rows = [
         ["Выручка (Revenue)"] + [f"{revenue.iloc[i] / 1e6:,.1f}" for i in range(4)],
         ["Операционная прибыль (Operating Income)"] + [f"{operating_income.iloc[i] / 1e6:,.1f}" for i in range(4)],
@@ -798,11 +1017,20 @@ def build_pdf_report(ticker, retries=5, allow_sample=False):
         )
     )
 
+    debt_label = (
+        "Долг" if net_debt_source == "computed"
+        else "Эффективный долг (из отчётного Net Debt Yahoo Finance)"
+    )
     dcf_info_text = (
-        f"• <b>Базовая ставка дисконтирования (WACC):</b> {wacc * 100:.2f}% (на основе беты β = {beta:.2f}, Rf = 4%, ERP = 5%)<br/>"
+        f"• <b>Стоимость собственного капитала (CAPM):</b> Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%<br/>"
+        f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {cost_of_debt_after_tax * 100:.2f}%<br/>"
+        f"• <b>Веса структуры капитала:</b> E/(D+E) = {equity_weight * 100:.1f}%, D/(D+E) = {debt_weight * 100:.1f}% "
+        f"(по рыночной капитализации, не по балансовому капиталу — у компаний с отрицательным book equity вес по балансу был бы недействителен)<br/>"
+        f"• <b>Итоговый WACC:</b> {equity_weight * 100:.1f}%×{cost_of_equity * 100:.2f}% + {debt_weight * 100:.1f}%×{cost_of_debt_after_tax * 100:.2f}% = <b>{wacc * 100:.2f}%</b><br/>"
         f"• <b>Расчетный CAGR роста потока:</b> {cagr * 100:.2f}% (среднеисторический темп роста, ограничен консервативной границей)<br/>"
         f"• <b>Терминальный темп роста:</b> 2.5% (пожизненный темп роста компании в постпрогнозный период)<br/>"
-        f"• <b>Справедливая оценка акционерного капитала:</b> {equity_value / 1e9:,.2f} млрд. USD (Enterprise Value = {enterprise_value / 1e9:,.2f} млрд. USD, Чистый долг = {net_debt / 1e9:,.2f} млрд. USD)<br/>"
+        f"• <b>Чистый долг:</b> {net_debt / 1e9:,.2f} млрд. USD ({debt_label} {gross_debt / 1e9:,.2f} млрд. USD − Кэш {cash_balance / 1e9:,.2f} млрд. USD)<br/>"
+        f"• <b>Справедливая оценка акционерного капитала:</b> {equity_value / 1e9:,.2f} млрд. USD (Enterprise Value = {enterprise_value / 1e9:,.2f} млрд. USD)<br/>"
     )
     story.append(CalloutBox(dcf_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
     story.append(Spacer(1, 8))
@@ -838,7 +1066,10 @@ def build_pdf_report(ticker, retries=5, allow_sample=False):
     )
     story.append(
         Paragraph(
-            "Таблица показывает, как меняется внутренняя стоимость одной акции при изменении ставки дисконтирования и темпов роста FCF. Позволяет оценить диапазон цен при различных сценариях развития рынка.",
+            "Таблица показывает, как меняется внутренняя стоимость одной акции при изменении ставки дисконтирования и темпов роста FCF. Позволяет оценить диапазон цен при различных сценариях развития рынка. "
+            "<b>Важно:</b> g в этой матрице — темп роста явного 5-летнего прогноза FCF, а не терминальный рост. "
+            "Терминальный рост зафиксирован отдельно на 2.5% и используется только в формуле Гордона для стоимости после 5-го года — "
+            "условие WACC &gt; g в этой матрице не требуется, оно требуется только для WACC &gt; терминальный рост (2.5%), что и проверяется отдельно.",
             body_style,
         )
     )
@@ -846,7 +1077,7 @@ def build_pdf_report(ticker, retries=5, allow_sample=False):
     story.append(Spacer(1, 12))
 
     warning_text = (
-        "<b>Важное инвесторское правило из курса ИФИ:</b><br/>"
+        "<b>Важное правило методики экспресс-анализа:</b><br/>"
         "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
         "наилучшего момента и цены входа, фундаментальный анализ <b>обязательно должен использоваться в связке с "
         "техническим анализом</b>. Не пытайтесь применять их отдельно! Справедливая стоимость по модели DCF часто "
@@ -856,7 +1087,11 @@ def build_pdf_report(ticker, retries=5, allow_sample=False):
 
     doc.build(story)
     print(f"Success! Comprehensive report saved to: {pdf_filename}")
-    return pdf_filename
+
+    md_filename = build_markdown_report(ticker, data, m)
+    print(f"Success! Markdown report saved to: {md_filename}")
+
+    return pdf_filename, md_filename
 
 
 if __name__ == "__main__":
@@ -872,13 +1107,20 @@ if __name__ == "__main__":
         help="How many times to retry Yahoo Finance before giving up (default 5)",
     )
     parser.add_argument(
+        "--retry-delay", type=int, default=5,
+        help="Seconds to wait between retries (default 5)",
+    )
+    parser.add_argument(
         "--allow-sample", action="store_true",
         help="Fall back to labeled SAMPLE data if real data can't be fetched (demo only, off by default)",
     )
     args = parser.parse_args()
 
     try:
-        build_pdf_report(args.ticker, retries=args.retries, allow_sample=args.allow_sample)
+        build_pdf_report(
+            args.ticker, retries=args.retries, retry_delay=args.retry_delay,
+            allow_sample=args.allow_sample,
+        )
     except DataUnavailableError as e:
         print(f"FAILED: {e}")
         raise SystemExit(1)
