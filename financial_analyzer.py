@@ -165,7 +165,9 @@ def _fetch_once(ticker):
         if financials.empty or balance.empty or cashflow.empty:
             return None
 
-        if info.get("currentPrice"):
+        if info.get("regularMarketPrice"):
+            price, price_kind = info["regularMarketPrice"], "последняя сделка (regularMarketPrice)"
+        elif info.get("currentPrice"):
             price, price_kind = info["currentPrice"], "последняя сделка (currentPrice)"
         elif info.get("previousClose"):
             price, price_kind = info["previousClose"], "цена предыдущего закрытия (previousClose)"
@@ -483,16 +485,25 @@ def compute_metrics(data):
     total_assets = find_row(df_bal, ["total assets"])
     goodwill = find_row(df_bal, ["goodwill"])
     equity = find_row(df_bal, ["stockholders equity", "total stockholders equity"])
-    # "Total Debt" from yfinance usually bundles in capitalized lease
-    # obligations (ASC 842) - for lease-heavy businesses (restaurants,
-    # retail) that materially overstates net debt relative to what a classic
-    # debt-cash bridge means, and double-counts against FCF (which already
-    # reflects lease payments as an operating outflow). Prefer the narrower
-    # "Long Term Debt" line; fall back to "Total Debt" only if that's absent.
-    debt = find_row(df_bal, ["long term debt", "total debt"])
+    # "Total Debt" from yfinance bundles in capitalized lease obligations
+    # (ASC 842) alongside interest-bearing debt. We treat interest-bearing
+    # debt and lease liabilities as separate line items - "Долг" in this
+    # report always means interest-bearing debt only (Long Term Debt),
+    # never the lease-inclusive Total Debt figure, and we say so plainly
+    # rather than inventing a blended "effective debt" number.
+    interest_bearing_debt = find_row(df_bal, ["long term debt"], default_val=float("nan"))
+    total_debt_incl_leases = find_row(df_bal, ["total debt"], default_val=float("nan"))
+    lease_liabilities = find_row(
+        df_bal, ["long term capital lease obligation", "capital lease obligations"],
+        default_val=float("nan"),
+    )
+    debt = interest_bearing_debt if not interest_bearing_debt.isna().all() else total_debt_incl_leases
     cash = find_row(df_bal, ["cash and cash equivalents", "cash cash equivalents"])
-    # yfinance sometimes exposes a pre-computed, lease-adjusted Net Debt row
-    # directly - prefer that over our own debt-minus-cash math when present.
+    # yfinance sometimes exposes a pre-computed Net Debt row directly -
+    # prefer that (it's whatever Yahoo's own methodology nets against cash)
+    # over our own debt-minus-cash math when present, and label it
+    # explicitly as "reported by Yahoo Finance" rather than implying our
+    # own debt figure was the source.
     net_debt_reported = find_row(df_bal, ["net debt"], default_val=float("nan"))
 
     fcf = find_row(df_cf, ["free cash flow", "fcf"])
@@ -518,6 +529,8 @@ def compute_metrics(data):
         cash = cash * fx_rate
         fcf = fcf * fx_rate
         net_debt_reported = net_debt_reported * fx_rate
+        lease_liabilities = lease_liabilities * fx_rate
+        total_debt_incl_leases = total_debt_incl_leases * fx_rate
 
     curr_ratios = curr_assets / curr_liab
     net_margin = net_income / revenue * 100
@@ -630,16 +643,22 @@ def compute_metrics(data):
     latest_net_debt_reported = (
         net_debt_reported.iloc[-1] if len(net_debt_reported) else float("nan")
     )
+    latest_lease_liabilities = (
+        lease_liabilities.iloc[-1] if len(lease_liabilities) else float("nan")
+    )
+    latest_total_debt_incl_leases = (
+        total_debt_incl_leases.iloc[-1] if len(total_debt_incl_leases) else float("nan")
+    )
     if not pd.isna(latest_net_debt_reported):
+        # Use Yahoo Finance's own "Net Debt" line as-is - we never claim
+        # it equals our own interest-bearing-debt-minus-cash figure, since
+        # Yahoo's own methodology for that field isn't something we control
+        # or can fully audit. We just report it as its own source.
         net_debt = latest_net_debt_reported
         net_debt_source = "reported"
-        # keep the displayed debt figure consistent with whichever net_debt
-        # number actually feeds the DCF, rather than mixing two sources
-        debt_for_display = net_debt + latest_cash
     else:
         net_debt = latest_debt - latest_cash
         net_debt_source = "computed"
-        debt_for_display = latest_debt
     equity_value = enterprise_value - net_debt
     fair_value_share = equity_value / shares if shares > 0 else 0.0
 
@@ -706,7 +725,9 @@ def compute_metrics(data):
         "enterprise_value": enterprise_value,
         "net_debt": net_debt,
         "net_debt_source": net_debt_source,
-        "gross_debt": debt_for_display,
+        "interest_bearing_debt": latest_debt,
+        "lease_liabilities": latest_lease_liabilities,
+        "total_debt_incl_leases": latest_total_debt_incl_leases,
         "cash_balance": latest_cash,
         "equity_value": equity_value,
         "price": price,
@@ -722,6 +743,48 @@ def compute_metrics(data):
 
 
 # ── MAIN PDF COMPILER ───────────────────────────────────────────────────
+LEASE_ASSUMPTION_NOTE = (
+    "Допущение по лизингу: обязательства по капитальной аренде исключены из net debt, "
+    "поскольку FCF в этой модели уже отражает арендные платежи как операционный отток "
+    "(lease-adjusted FCF). Такая трактовка симметрична между FCF и net debt - если это "
+    "допущение не подходит для конкретного сравнения, используйте Total Debt (включая "
+    "лизинг) вместо приведённого net debt."
+)
+
+
+def _debt_lines(m, trading_ccy):
+    """Plain (label, value) pairs for the debt/net-debt disclosure - shared
+    between the PDF and Markdown renderers so the two never drift apart.
+    Never blends sources into a single invented number: each line names
+    exactly where its figure comes from.
+    """
+    lines = [(
+        "Долгосрочный долг (Long Term Debt, только процентный долг)",
+        f"{m['interest_bearing_debt'] / 1e9:,.2f} млрд. {trading_ccy}",
+    )]
+    if not pd.isna(m["lease_liabilities"]):
+        lines.append((
+            "Обязательства по капитальной аренде (исключены из net debt ниже)",
+            f"{m['lease_liabilities'] / 1e9:,.2f} млрд. {trading_ccy}",
+        ))
+    if not pd.isna(m["total_debt_incl_leases"]):
+        lines.append((
+            "Total Debt (включая лизинг, справочно - не используется в DCF)",
+            f"{m['total_debt_incl_leases'] / 1e9:,.2f} млрд. {trading_ccy}",
+        ))
+    lines.append((
+        "Денежные средства (Cash and Cash Equivalents)",
+        f"{m['cash_balance'] / 1e9:,.2f} млрд. {trading_ccy}",
+    ))
+    net_debt_label = (
+        "Чистый долг, использован в DCF (поле Net Debt из Yahoo Finance)"
+        if m["net_debt_source"] == "reported"
+        else "Чистый долг, использован в DCF (расчёт: Долгосрочный долг − Кэш)"
+    )
+    lines.append((net_debt_label, f"{m['net_debt'] / 1e9:,.2f} млрд. {trading_ccy}"))
+    return lines
+
+
 def build_markdown_report(ticker, data, m):
     """Plain-text/Markdown twin of the PDF report - same numbers, no charts."""
     name = data["name"]
@@ -740,10 +803,7 @@ def build_markdown_report(ticker, data, m):
     sins_block = (
         "\n".join(f"- {s}" for s in m["sins"]) if m["sins"] else "- Грехов не обнаружено."
     )
-    debt_label = (
-        "Долг" if m["net_debt_source"] == "computed"
-        else "Эффективный долг (из отчётного Net Debt Yahoo Finance)"
-    )
+    debt_block = "\n".join(f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy))
     sens_header = "| " + " | ".join(m["sensitivity_headers"]) + " |"
     sens_sep = "|" + "---|" * len(m["sensitivity_headers"])
     sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m["sensitivity_rows"])
@@ -781,12 +841,16 @@ def build_markdown_report(ticker, data, m):
 ## 3. Модель дисконтирования денежных потоков (DCF)
 
 - Стоимость собственного капитала (CAPM): Ke = 4% + β×5% = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%
-- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m['cost_of_debt_after_tax'] * 100:.2f}%
+- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m['cost_of_debt_after_tax'] * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
 - Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m['equity_weight'] * 100:.1f}%, D/(D+E) = {m['debt_weight'] * 100:.1f}%
 - **WACC:** {m['equity_weight'] * 100:.1f}%×{m['cost_of_equity'] * 100:.2f}% + {m['debt_weight'] * 100:.1f}%×{m['cost_of_debt_after_tax'] * 100:.2f}% = **{m['wacc'] * 100:.2f}%**
 - CAGR роста FCF: {m['cagr'] * 100:.2f}% (историческая, ограничена 2-15%)
 - Терминальный темп роста: 2.5%
-- Чистый долг: {m['net_debt'] / 1e9:,.2f} млрд. {trading_ccy} ({debt_label} {m['gross_debt'] / 1e9:,.2f} млрд. − Кэш {m['cash_balance'] / 1e9:,.2f} млрд.)
+
+{debt_block}
+
+> {LEASE_ASSUMPTION_NOTE}
+
 - Enterprise Value: {m['enterprise_value'] / 1e9:,.2f} млрд. {trading_ccy}
 - Equity Value: {m['equity_value'] / 1e9:,.2f} млрд. {trading_ccy}
 
@@ -844,9 +908,7 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     pv_fcfs = m["pv_fcfs"]
     enterprise_value = m["enterprise_value"]
     net_debt = m["net_debt"]
-    net_debt_source = m["net_debt_source"]
-    gross_debt = m["gross_debt"]
-    cash_balance = m["cash_balance"]
+    debt_lines = _debt_lines(m, trading_ccy)
     cost_of_equity = m["cost_of_equity"]
     cost_of_debt_after_tax = m["cost_of_debt_after_tax"]
     equity_weight = m["equity_weight"]
@@ -1017,22 +1079,21 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
         )
     )
 
-    debt_label = (
-        "Долг" if net_debt_source == "computed"
-        else "Эффективный долг (из отчётного Net Debt Yahoo Finance)"
-    )
+    debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in debt_lines)
     dcf_info_text = (
         f"• <b>Стоимость собственного капитала (CAPM):</b> Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%<br/>"
-        f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {cost_of_debt_after_tax * 100:.2f}%<br/>"
+        f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {cost_of_debt_after_tax * 100:.2f}% "
+        f"(Kd=4.5%, T=21% — фиксированные допущения методики, не эффективная налоговая ставка компании)<br/>"
         f"• <b>Веса структуры капитала:</b> E/(D+E) = {equity_weight * 100:.1f}%, D/(D+E) = {debt_weight * 100:.1f}% "
         f"(по рыночной капитализации, не по балансовому капиталу — у компаний с отрицательным book equity вес по балансу был бы недействителен)<br/>"
         f"• <b>Итоговый WACC:</b> {equity_weight * 100:.1f}%×{cost_of_equity * 100:.2f}% + {debt_weight * 100:.1f}%×{cost_of_debt_after_tax * 100:.2f}% = <b>{wacc * 100:.2f}%</b><br/>"
         f"• <b>Расчетный CAGR роста потока:</b> {cagr * 100:.2f}% (среднеисторический темп роста, ограничен консервативной границей)<br/>"
         f"• <b>Терминальный темп роста:</b> 2.5% (пожизненный темп роста компании в постпрогнозный период)<br/>"
-        f"• <b>Чистый долг:</b> {net_debt / 1e9:,.2f} млрд. USD ({debt_label} {gross_debt / 1e9:,.2f} млрд. USD − Кэш {cash_balance / 1e9:,.2f} млрд. USD)<br/>"
-        f"• <b>Справедливая оценка акционерного капитала:</b> {equity_value / 1e9:,.2f} млрд. USD (Enterprise Value = {enterprise_value / 1e9:,.2f} млрд. USD)<br/>"
+        f"{debt_html}<br/>"
+        f"• <b>Справедливая оценка акционерного капитала:</b> {equity_value / 1e9:,.2f} млрд. {trading_ccy} (Enterprise Value = {enterprise_value / 1e9:,.2f} млрд. {trading_ccy})<br/>"
     )
     story.append(CalloutBox(dcf_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
+    story.append(CalloutBox(LEASE_ASSUMPTION_NOTE, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
     story.append(Spacer(1, 8))
 
     val_banner_text = (
