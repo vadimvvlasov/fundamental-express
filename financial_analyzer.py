@@ -42,11 +42,13 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-# The express "sins" checklist in compute_metrics() has 7 independent checks
-# (liquidity level, liquidity trend, equity level-or-trend, FCF level-or-trend,
-# revenue trend, net income trend, margin trend). Kept as one named constant
-# so "X out of N" displays never drift from the actual check count.
-MAX_SINS = 7
+# The express "sins" checklist in compute_metrics() has 11 independent checks:
+# liquidity level, liquidity trend (only below CR 2.0), long-term solvency
+# (goodwill-adjusted), equity level-or-trend, FCF level-or-trend, revenue
+# trend, operating income trend, net income trend, gross/operating/net
+# margin trend. Kept as one named constant so "X out of N" displays never
+# drift from the actual check count.
+MAX_SINS = 11
 
 # ── DESIGN PALETTE (Corporate Slate & Teal Archetype) ──────────────────
 COLORS = {
@@ -486,9 +488,12 @@ def compute_metrics(data):
     net_income = find_row(df_fin, ["net income", "net profit"])
     eps = find_row(df_fin, ["eps", "diluted eps", "basic eps"])
 
+    revenue_cost = find_row(df_fin, ["cost of revenue"], default_val=float("nan"))
+
     curr_assets = find_row(df_bal, ["total current assets", "current assets"])
     curr_liab = find_row(df_bal, ["total current liabilities", "current liabilities"])
     total_assets = find_row(df_bal, ["total assets"])
+    total_liab = find_row(df_bal, ["total liabilities"], default_val=float("nan"))
     goodwill = find_row(df_bal, ["goodwill"])
     equity = find_row(df_bal, ["stockholders equity", "total stockholders equity"])
     # "Total Debt" from yfinance bundles in capitalized lease obligations
@@ -524,11 +529,13 @@ def compute_metrics(data):
     fx_rate = data.get("fx_rate", 1.0)
     if fx_rate != 1.0:
         revenue = revenue * fx_rate
+        revenue_cost = revenue_cost * fx_rate
         operating_income = operating_income * fx_rate
         net_income = net_income * fx_rate
         curr_assets = curr_assets * fx_rate
         curr_liab = curr_liab * fx_rate
         total_assets = total_assets * fx_rate
+        total_liab = total_liab * fx_rate
         goodwill = goodwill * fx_rate
         equity = equity * fx_rate
         debt = debt * fx_rate
@@ -540,6 +547,20 @@ def compute_metrics(data):
 
     curr_ratios = curr_assets / curr_liab
     net_margin = net_income / revenue * 100
+    operating_margin = operating_income / revenue * 100
+    # Gross margin needs Cost of Revenue, which is the exact field whose
+    # substring collision with "Total Revenue" caused a real margin bug
+    # earlier this session (see README). Only compute/check it when the row
+    # was genuinely found - never silently divide by a zero-filled default.
+    gross_margin = (
+        (revenue - revenue_cost) / revenue * 100 if not revenue_cost.isna().all() else None
+    )
+
+    # Goodwill-adjusted long-term solvency: goodwill is a paper asset that
+    # can't be sold/monetized in a liquidation, so it's excluded before
+    # comparing long-term assets to long-term liabilities.
+    long_term_assets_adj = (total_assets - curr_assets) - goodwill
+    long_term_liab = (total_liab - curr_liab) if not total_liab.isna().all() else None
 
     # ── "Sins" checklist (express algorithm from the lecture) ──────────
     sins = []
@@ -549,14 +570,27 @@ def compute_metrics(data):
         sins.append(
             f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f})."
         )
-    elif latest_cr < 1.5:
-        sins.append(
-            f"Сниженная ликвидность: Current Ratio {latest_cr:.2f} (желательно выше 1.5-2.0)."
-        )
-    if len(curr_ratios) >= 2 and curr_ratios.iloc[-1] < curr_ratios.iloc[-2]:
+    # A CR decline is only flagged if the company also isn't comfortably
+    # liquid (CR < 2.0) after the decline - dropping from, say, 4.0 to 3.0
+    # isn't a red flag on its own.
+    if (
+        len(curr_ratios) >= 2
+        and curr_ratios.iloc[-1] < curr_ratios.iloc[-2]
+        and latest_cr < 2.0
+    ):
         sins.append(
             f"Снижающийся тренд ликвидности: Current Ratio с {curr_ratios.iloc[-2]:.2f} до {curr_ratios.iloc[-1]:.2f}."
         )
+
+    if long_term_liab is not None:
+        latest_lt_assets = long_term_assets_adj.iloc[-1]
+        latest_lt_liab = long_term_liab.iloc[-1]
+        if latest_lt_assets < latest_lt_liab:
+            sins.append(
+                f"Долгосрочная неплатёжеспособность: скорректированные (за вычетом Goodwill) "
+                f"долгосрочные активы ({latest_lt_assets / 1e6:,.0f} млн) меньше долгосрочных "
+                f"обязательств ({latest_lt_liab / 1e6:,.0f} млн)."
+            )
 
     latest_equity = equity.iloc[-1]
     if latest_equity <= 0:
@@ -572,8 +606,18 @@ def compute_metrics(data):
 
     if len(revenue) >= 2 and revenue.iloc[-1] < revenue.iloc[-2]:
         sins.append("Снижение выручки за последний год.")
+    if len(operating_income) >= 2 and operating_income.iloc[-1] < operating_income.iloc[-2]:
+        sins.append("Падение операционной прибыли за последний год.")
     if len(net_income) >= 2 and net_income.iloc[-1] < net_income.iloc[-2]:
         sins.append("Падение чистой прибыли за последний год.")
+    if gross_margin is not None and len(gross_margin) >= 2 and gross_margin.iloc[-1] < gross_margin.iloc[-2]:
+        sins.append(
+            f"Падение валовой маржи: Gross Margin с {gross_margin.iloc[-2]:.1f}% до {gross_margin.iloc[-1]:.1f}%."
+        )
+    if len(operating_margin) >= 2 and operating_margin.iloc[-1] < operating_margin.iloc[-2]:
+        sins.append(
+            f"Падение операционной маржи: Operating Margin с {operating_margin.iloc[-2]:.1f}% до {operating_margin.iloc[-1]:.1f}%."
+        )
     if len(net_margin) >= 2 and net_margin.iloc[-1] < net_margin.iloc[-2]:
         sins.append(
             f"Падение рентабельности: чистая маржа с {net_margin.iloc[-2]:.1f}% до {net_margin.iloc[-1]:.1f}%."
@@ -583,7 +627,7 @@ def compute_metrics(data):
         verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
         verdict_color_key = "success"
         reasoning = "Компания демонстрирует эталонную финансовую устойчивость, растущую выручку, отличную маржинальность и растущий свободный денежный поток. Риски минимальны."
-    elif len(sins) <= 2:
+    elif len(sins) <= 3:
         verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
         verdict_color_key = "warning"
         reasoning = "Отличный сильный бизнес, однако в финансовых трендах или балансе присутствуют незначительные погрешности. Рекомендуется покупка только ограниченной долей."
