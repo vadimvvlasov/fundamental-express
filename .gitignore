@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Generated reports and charts (regenerate via financial_analyzer.py / portfolio_analyzer.py)
+output/
+scratch/*.png
