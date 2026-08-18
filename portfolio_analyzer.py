@@ -11,6 +11,7 @@ from financial_analyzer import (
     PAGE_H,
     USABLE_W,
     OUTPUT_DIR,
+    MAX_SINS,
     SectionDivider,
     CalloutBox,
     create_reportlab_table,
@@ -75,7 +76,7 @@ def print_table(results):
             f"{r['ticker']:<7}{r['weight']:>4.0f}% "
             f"${m['price']:<10.2f}${m['fair_value_share']:<10.2f}"
             f"{ou:+.1f}% ({label:<12}) "
-            f"{m['verdict']:<20}{len(m['sins'])}/5"
+            f"{m['verdict']:<20}{len(m['sins'])}/{MAX_SINS}"
         )
     print("=" * 100)
 
@@ -141,7 +142,7 @@ def build_comparative_pdf(results, name="Portfolio"):
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         rows.append([
             r["ticker"], w, f"${m['price']:,.2f}", f"${m['fair_value_share']:,.2f}",
-            ou_label, m["verdict"], f"{len(m['sins'])}/5",
+            ou_label, m["verdict"], f"{len(m['sins'])}/{MAX_SINS}",
         ])
     story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[42, 32, 55, 65, 130, 90, 40]))
     story.append(Spacer(1, 10))
@@ -194,7 +195,7 @@ def build_comparative_markdown(results, name="Portfolio"):
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         lines.append(
             f"| {r['ticker']} | {w} | ${m['price']:,.2f} | ${m['fair_value_share']:,.2f} | "
-            f"{ou_label} | {m['verdict']} | {len(m['sins'])}/5 |"
+            f"{ou_label} | {m['verdict']} | {len(m['sins'])}/{MAX_SINS} |"
         )
     lines.append("")
 

@@ -42,6 +42,12 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+# The express "sins" checklist in compute_metrics() has 7 independent checks
+# (liquidity level, liquidity trend, equity level-or-trend, FCF level-or-trend,
+# revenue trend, net income trend, margin trend). Kept as one named constant
+# so "X out of N" displays never drift from the actual check count.
+MAX_SINS = 7
+
 # ── DESIGN PALETTE (Corporate Slate & Teal Archetype) ──────────────────
 COLORS = {
     "heading": HexColor("#1E293B"),  # Deep Slate - titles & sections
