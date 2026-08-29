@@ -262,6 +262,10 @@ def _fetch_once(ticker):
             "fx_rate": fx_rate,
             "financial_currency": financial_ccy or trading_ccy,
             "trading_currency": trading_ccy,
+            # Raw info payload, kept only for the Forward Outlook section
+            # (forwardPE/pegRatio/earningsGrowth/revenueGrowth) - never used
+            # by compute_metrics()'s core sins/DCF logic.
+            "info": info,
         }
     except Exception as e:
         print(f"  [{ticker}] fetch attempt failed: {e}")
@@ -312,6 +316,11 @@ def _sample_data(ticker):
         "fx_rate": 1.0,
         "financial_currency": "USD",
         "trading_currency": "USD",
+        # No real consensus data for sample runs - compute_forward_outlook
+        # falls through its whole chain to the Trailing P/E / Historical FCF
+        # CAGR proxies (both computable from the sample data itself) rather
+        # than crashing on a missing info dict.
+        "info": {},
     }
 
 
@@ -865,6 +874,101 @@ def compute_metrics(data):
     }
 
 
+_EMPTY_FORWARD_OUTLOOK = {
+    "forward_pe": None,
+    "forward_pe_source": None,
+    "growth_rate": None,
+    "growth_pct": None,
+    "growth_source": None,
+    "peg_ratio": None,
+    "peg_source": None,
+}
+
+
+def compute_forward_outlook(info, price, eps, historical_fcf_cagr):
+    """Forward P/E, consensus growth, and PEG - a purely informational
+    counterweight to the trailing-CAGR DCF, never fed into the Section 1
+    verdict score (see docs/spec/technical-implementation-spec.md Section 2).
+
+    yfinance's `.info` dict frequently has forwardPE/pegRatio/earningsGrowth/
+    revenueGrowth as None for a given ticker, so every field runs through a
+    fallback chain and is paired with a *_source label - the report must
+    never imply a proxy is the real analyst consensus. This function never
+    raises: any failure degrades to an all-N/A block, consistent with
+    DataUnavailableError being reserved for the core financials fetch only.
+    """
+    try:
+        info = info or {}
+        latest_eps = eps.iloc[-1] if len(eps) else None
+        trailing_pe = (
+            price / latest_eps if latest_eps and latest_eps > 0 and price else None
+        )
+
+        forward_pe = info.get("forwardPE")
+        forward_pe_source = "Forward P/E (Yahoo Finance)"
+        if not forward_pe or forward_pe <= 0:
+            forward_pe, forward_pe_source = trailing_pe, "Trailing P/E Proxy (форвардный P/E недоступен)"
+        if not forward_pe or forward_pe <= 0:
+            forward_pe, forward_pe_source = None, None
+
+        growth_rate = info.get("earningsGrowth")
+        growth_source = "Consensus Earnings Growth (Yahoo Finance)"
+        if not growth_rate:
+            growth_rate, growth_source = info.get("revenueGrowth"), "Consensus Revenue Growth (EPS growth недоступен)"
+        if not growth_rate:
+            growth_rate, growth_source = historical_fcf_cagr, "Historical FCF CAGR Proxy (консенсус недоступен)"
+        if not growth_rate:
+            growth_rate, growth_source = None, None
+
+        # Yahoo's earningsGrowth/revenueGrowth are fractional (0.12 = +12%).
+        # Known limitation: a >100% YoY growth fraction (e.g. 1.5 = +150%)
+        # reads identically to an already-converted percentage under this
+        # heuristic and would be mis-detected as "already a percent" -
+        # accepted, same tolerance for imperfect heuristics on noisy
+        # provider data as find_row's own exact-vs-partial matching.
+        growth_pct = (
+            growth_rate * 100 if growth_rate is not None and growth_rate < 1.0 else growth_rate
+        )
+
+        peg_ratio = info.get("pegRatio")
+        peg_source = "PEG Ratio (Yahoo Finance)"
+        if not peg_ratio or peg_ratio <= 0:
+            peg_ratio, peg_source = info.get("trailingPegRatio"), "Trailing PEG (Yahoo Finance, форвардный PEG недоступен)"
+        if (not peg_ratio or peg_ratio <= 0) and forward_pe and growth_pct:
+            peg_ratio = forward_pe / growth_pct
+            peg_source = "PEG Ratio (расчётный: Forward P/E ÷ Expected Growth %)"
+        if not peg_ratio or peg_ratio <= 0:
+            peg_ratio, peg_source = None, None
+
+        return {
+            "forward_pe": forward_pe,
+            "forward_pe_source": forward_pe_source,
+            "growth_rate": growth_rate,
+            "growth_pct": growth_pct,
+            "growth_source": growth_source,
+            "peg_ratio": peg_ratio,
+            "peg_source": peg_source,
+        }
+    except Exception as e:
+        print(f"  Warning: forward outlook computation failed ({e}) - rendering N/A block.")
+        return dict(_EMPTY_FORWARD_OUTLOOK)
+
+
+def _peg_assessment(peg_ratio):
+    """PEG color-coding for the Forward Outlook section (spec Section 2.4)."""
+    if peg_ratio is None:
+        return "muted", "Недостаточно данных"
+    if peg_ratio < 1.0:
+        return "success", "Недооценена с учетом роста"
+    if peg_ratio <= 2.0:
+        return "warning", "Оценена справедливо"
+    return "danger", "Переоценена относительно роста"
+
+
+def _fmt_or_na(value, fmt="{:.2f}"):
+    return fmt.format(value) if value is not None else "N/A"
+
+
 # ── MAIN PDF COMPILER ───────────────────────────────────────────────────
 LEASE_ASSUMPTION_NOTE = (
     "Допущение по лизингу: в базовом DCF обязательства по аренде исключены из net debt, "
@@ -911,11 +1015,12 @@ def _debt_lines(m, trading_ccy):
     return lines
 
 
-def build_markdown_report(ticker, data, m):
+def build_markdown_report(ticker, data, m, forward_outlook=None):
     """Plain-text/Markdown twin of the PDF report - same numbers, no charts."""
     name = data["name"]
     trading_ccy = data.get("trading_currency", "USD")
     financial_ccy = data.get("financial_currency", "USD")
+    forward_outlook = forward_outlook or dict(_EMPTY_FORWARD_OUTLOOK)
     fx_line = (
         f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
         f"{data.get('fx_rate', 1.0):.4f}\n\n"
@@ -942,6 +1047,12 @@ def build_markdown_report(ticker, data, m):
     sens_header = "| " + " | ".join(m["sensitivity_headers"]) + " |"
     sens_sep = "|" + "---|" * len(m["sensitivity_headers"])
     sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m["sensitivity_rows"])
+
+    peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
+    peg_emoji = {"success": "🟢", "warning": "🟡", "danger": "🔴", "muted": "⚪"}[peg_color_key]
+    forward_pe_txt = _fmt_or_na(forward_outlook["forward_pe"])
+    growth_txt = _fmt_or_na(forward_outlook["growth_pct"], "{:.1f}%")
+    peg_txt = _fmt_or_na(forward_outlook["peg_ratio"])
 
     md = f"""# Фундаментальный анализ & оценка DCF: {ticker.upper()}
 
@@ -998,6 +1109,14 @@ def build_markdown_report(ticker, data, m):
 {sens_sep}
 {sens_rows}
 
+## 4. Форвардные мультипликаторы и консенсус-прогноз
+
+> Раздел носит справочный характер и не влияет на балл экспресс-чеклиста из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную на экстраполяции исторических 4 лет.
+
+- Forward P/E: **{forward_pe_txt}** [источник: {forward_outlook['forward_pe_source'] or 'N/A'}]
+- Ожидаемый рост (консенсус): **{growth_txt}** [источник: {forward_outlook['growth_source'] or 'N/A'}]
+- PEG Ratio: **{peg_txt}** {peg_emoji} — {peg_label} [источник: {forward_outlook['peg_source'] or 'N/A'}]
+
 ---
 Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
 """
@@ -1011,6 +1130,7 @@ def build_markdown_report(ticker, data, m):
 def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
     m = compute_metrics(data)
+    forward_outlook = compute_forward_outlook(data.get("info", {}), m["price"], m["eps"], m["cagr"])
 
     name = data["name"]
     price_kind = data["price_kind"]
@@ -1283,6 +1403,29 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     story.append(create_reportlab_table(sensitivity_headers, sensitivity_rows, styles, COLORS))
     story.append(Spacer(1, 12))
 
+    # ── SECTION 4: FORWARD OUTLOOK ──────────────────────────────────────
+    story.append(Paragraph("4. Форвардные мультипликаторы и консенсус-прогноз", h1_style))
+    story.append(
+        Paragraph(
+            "Раздел носит исключительно информационный характер и не влияет на балл экспресс-чеклиста "
+            "из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную "
+            "на экстраполяции исторических 4 лет.",
+            body_style,
+        )
+    )
+    peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
+    outlook_text = (
+        f"• <b>Forward P/E:</b> {_fmt_or_na(forward_outlook['forward_pe'])} "
+        f"[источник: {escape_xml(forward_outlook['forward_pe_source'] or 'N/A')}]<br/>"
+        f"• <b>Ожидаемый рост (консенсус):</b> {_fmt_or_na(forward_outlook['growth_pct'], '{:.1f}%')} "
+        f"[источник: {escape_xml(forward_outlook['growth_source'] or 'N/A')}]<br/>"
+        f"• <b>PEG Ratio:</b> {_fmt_or_na(forward_outlook['peg_ratio'])} — "
+        f"<font color='{COLORS[peg_color_key].hexval()}'><b>{escape_xml(peg_label)}</b></font> "
+        f"[источник: {escape_xml(forward_outlook['peg_source'] or 'N/A')}]<br/>"
+    )
+    story.append(CalloutBox(outlook_text, USABLE_W, COLORS, callout_text_style, COLORS[peg_color_key]))
+    story.append(Spacer(1, 12))
+
     warning_text = (
         "<b>Важное правило методики экспресс-анализа:</b><br/>"
         "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
@@ -1295,7 +1438,7 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     doc.build(story)
     print(f"Success! Comprehensive report saved to: {pdf_filename}")
 
-    md_filename = build_markdown_report(ticker, data, m)
+    md_filename = build_markdown_report(ticker, data, m, forward_outlook)
     print(f"Success! Markdown report saved to: {md_filename}")
 
     return pdf_filename, md_filename
