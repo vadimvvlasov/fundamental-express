@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 # Resolve workspace root relative to this script file
@@ -42,13 +43,39 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-# The express "sins" checklist in compute_metrics() has 11 independent checks:
-# liquidity level, liquidity trend (only below CR 2.0), long-term solvency
-# (goodwill-adjusted), equity level-or-trend, FCF level-or-trend, revenue
-# trend, operating income trend, net income trend, gross/operating/net
-# margin trend. Kept as one named constant so "X out of N" displays never
-# drift from the actual check count.
-MAX_SINS = 11
+# The express "sins" checklist in compute_metrics() is a two-tier model
+# (see docs/spec/technical-implementation-spec.md Section 1):
+#   - CRITICAL sins (fcf_negative, cr_below_1, lt_insolvency, equity_negative):
+#     any single hit forces verdict = SKIP, regardless of everything else.
+#   - MINOR sins: weighted 1.0/0.5/0.3 by how directly they reflect real
+#     operating/cash health vs how noisy/paper-driven the metric is. Weights
+#     sum to MAX_MINOR_SCORE and decide BUY/WATCH/SKIP when no critical sin
+#     fired.
+
+
+@dataclass
+class Sin:
+    """One fired checklist violation. `weight` is 0.0 for critical sins -
+    weight is meaningless there since any single critical hit is decisive."""
+
+    id: str
+    tier: str  # "critical" | "minor"
+    weight: float
+    message: str
+
+
+MINOR_SIN_WEIGHTS = {
+    "equity_declining": 1.0,
+    "fcf_declining": 1.0,
+    "revenue_declining": 1.0,
+    "operating_income_declining": 1.0,
+    "cr_declining": 0.5,
+    "gross_margin_declining": 0.5,
+    "operating_margin_declining": 0.5,
+    "net_income_declining": 0.3,
+    "net_margin_declining": 0.3,
+}
+MAX_MINOR_SCORE = sum(MINOR_SIN_WEIGHTS.values())
 
 # ── DESIGN PALETTE (Corporate Slate & Teal Archetype) ──────────────────
 COLORS = {
@@ -562,81 +589,123 @@ def compute_metrics(data):
     long_term_assets_adj = (total_assets - curr_assets) - goodwill
     long_term_liab = (total_liab - curr_liab) if not total_liab.isna().all() else None
 
-    # ── "Sins" checklist (express algorithm from the lecture) ──────────
+    # ── "Sins" checklist (express algorithm from the lecture, two-tier) ──
     sins = []
 
     latest_cr = curr_ratios.iloc[-1]
     if latest_cr < 1.0:
-        sins.append(
-            f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f})."
-        )
+        sins.append(Sin(
+            "cr_below_1", "critical", 0.0,
+            f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f}).",
+        ))
     # A CR decline is only flagged if the company also isn't comfortably
-    # liquid (CR < 2.0) after the decline - dropping from, say, 4.0 to 3.0
-    # isn't a red flag on its own.
-    if (
+    # liquid (CR >= 2.0) after the decline - dropping from, say, 4.0 to 3.0
+    # isn't a red flag on its own. Requiring latest_cr >= 1.0 here keeps this
+    # mutually exclusive with cr_below_1 above - a CR crash below 1.0 is
+    # already captured as the critical sin and must not also double-count
+    # as a minor "declining trend" sin on the same underlying fact.
+    elif (
         len(curr_ratios) >= 2
         and curr_ratios.iloc[-1] < curr_ratios.iloc[-2]
         and latest_cr < 2.0
     ):
-        sins.append(
-            f"Снижающийся тренд ликвидности: Current Ratio с {curr_ratios.iloc[-2]:.2f} до {curr_ratios.iloc[-1]:.2f}."
-        )
+        sins.append(Sin(
+            "cr_declining", "minor", MINOR_SIN_WEIGHTS["cr_declining"],
+            f"Снижающийся тренд ликвидности: Current Ratio с {curr_ratios.iloc[-2]:.2f} до {curr_ratios.iloc[-1]:.2f}.",
+        ))
 
     if long_term_liab is not None:
         latest_lt_assets = long_term_assets_adj.iloc[-1]
         latest_lt_liab = long_term_liab.iloc[-1]
         if latest_lt_assets < latest_lt_liab:
-            sins.append(
+            sins.append(Sin(
+                "lt_insolvency", "critical", 0.0,
                 f"Долгосрочная неплатёжеспособность: скорректированные (за вычетом Goodwill) "
                 f"долгосрочные активы ({latest_lt_assets / 1e6:,.0f} млн) меньше долгосрочных "
-                f"обязательств ({latest_lt_liab / 1e6:,.0f} млн)."
-            )
+                f"обязательств ({latest_lt_liab / 1e6:,.0f} млн).",
+            ))
 
     latest_equity = equity.iloc[-1]
     if latest_equity <= 0:
-        sins.append("Отрицательный акционерный капитал: обязательств больше, чем реальных активов.")
+        sins.append(Sin(
+            "equity_negative", "critical", 0.0,
+            "Отрицательный акционерный капитал: обязательств больше, чем реальных активов.",
+        ))
     elif len(equity) >= 2 and equity.iloc[-1] < equity.iloc[-2]:
-        sins.append("Тренд падения капитала: Shareholder Equity снизился за последний год.")
+        sins.append(Sin(
+            "equity_declining", "minor", MINOR_SIN_WEIGHTS["equity_declining"],
+            "Тренд падения капитала: Shareholder Equity снизился за последний год.",
+        ))
 
     latest_fcf = fcf.iloc[-1]
     if latest_fcf <= 0:
-        sins.append("Сжигание денежных средств: отрицательный Free Cash Flow.")
+        sins.append(Sin(
+            "fcf_negative", "critical", 0.0,
+            "Сжигание денежных средств: отрицательный Free Cash Flow.",
+        ))
     elif len(fcf) >= 2 and fcf.iloc[-1] < fcf.iloc[-2]:
-        sins.append("Падение денежного потока: снижение FCF за последний год.")
+        sins.append(Sin(
+            "fcf_declining", "minor", MINOR_SIN_WEIGHTS["fcf_declining"],
+            "Падение денежного потока: снижение FCF за последний год.",
+        ))
 
     if len(revenue) >= 2 and revenue.iloc[-1] < revenue.iloc[-2]:
-        sins.append("Снижение выручки за последний год.")
+        sins.append(Sin(
+            "revenue_declining", "minor", MINOR_SIN_WEIGHTS["revenue_declining"],
+            "Снижение выручки за последний год.",
+        ))
     if len(operating_income) >= 2 and operating_income.iloc[-1] < operating_income.iloc[-2]:
-        sins.append("Падение операционной прибыли за последний год.")
+        sins.append(Sin(
+            "operating_income_declining", "minor", MINOR_SIN_WEIGHTS["operating_income_declining"],
+            "Падение операционной прибыли за последний год.",
+        ))
     if len(net_income) >= 2 and net_income.iloc[-1] < net_income.iloc[-2]:
-        sins.append("Падение чистой прибыли за последний год.")
+        sins.append(Sin(
+            "net_income_declining", "minor", MINOR_SIN_WEIGHTS["net_income_declining"],
+            "Падение чистой прибыли за последний год.",
+        ))
     if gross_margin is not None and len(gross_margin) >= 2 and gross_margin.iloc[-1] < gross_margin.iloc[-2]:
-        sins.append(
-            f"Падение валовой маржи: Gross Margin с {gross_margin.iloc[-2]:.1f}% до {gross_margin.iloc[-1]:.1f}%."
-        )
+        sins.append(Sin(
+            "gross_margin_declining", "minor", MINOR_SIN_WEIGHTS["gross_margin_declining"],
+            f"Падение валовой маржи: Gross Margin с {gross_margin.iloc[-2]:.1f}% до {gross_margin.iloc[-1]:.1f}%.",
+        ))
     if len(operating_margin) >= 2 and operating_margin.iloc[-1] < operating_margin.iloc[-2]:
-        sins.append(
-            f"Падение операционной маржи: Operating Margin с {operating_margin.iloc[-2]:.1f}% до {operating_margin.iloc[-1]:.1f}%."
-        )
+        sins.append(Sin(
+            "operating_margin_declining", "minor", MINOR_SIN_WEIGHTS["operating_margin_declining"],
+            f"Падение операционной маржи: Operating Margin с {operating_margin.iloc[-2]:.1f}% до {operating_margin.iloc[-1]:.1f}%.",
+        ))
     if len(net_margin) >= 2 and net_margin.iloc[-1] < net_margin.iloc[-2]:
-        sins.append(
-            f"Падение рентабельности: чистая маржа с {net_margin.iloc[-2]:.1f}% до {net_margin.iloc[-1]:.1f}%."
-        )
+        sins.append(Sin(
+            "net_margin_declining", "minor", MINOR_SIN_WEIGHTS["net_margin_declining"],
+            f"Падение рентабельности: чистая маржа с {net_margin.iloc[-2]:.1f}% до {net_margin.iloc[-1]:.1f}%.",
+        ))
 
-    if len(sins) == 0:
+    critical_sins = [s for s in sins if s.tier == "critical"]
+    minor_sins = [s for s in sins if s.tier == "minor"]
+    minor_score = sum(s.weight for s in minor_sins)
+
+    if critical_sins:
+        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
+        verdict_color_key = "danger"
+        crit_labels = ", ".join(s.id for s in critical_sins)
+        reasoning = (
+            f"Обнаружен(ы) критический(е) фактор(ы) риска ({crit_labels}) — см. список ниже. "
+            "Любой из них по отдельности делает инвестицию рискованной вне зависимости от прочих показателей."
+        )
+    elif minor_score <= 1.0:
         verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
         verdict_color_key = "success"
         reasoning = "Компания демонстрирует эталонную финансовую устойчивость, растущую выручку, отличную маржинальность и растущий свободный денежный поток. Риски минимальны."
-    elif len(sins) <= 3:
+    elif minor_score <= 2.5:
         verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
         verdict_color_key = "warning"
-        reasoning = "Отличный сильный бизнес, однако в финансовых трендах или балансе присутствуют незначительные погрешности. Рекомендуется покупка только ограниченной долей."
+        reasoning = "Отличный сильный бизнес, однако в финансовых трендах присутствуют умеренные погрешности. Рекомендуется покупка только ограниченной долей."
     else:
         verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
         verdict_color_key = "danger"
         reasoning = (
-            f"Обнаружено {len(sins)} финансовых нарушений (грехов) — см. список ниже. "
-            "Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
+            f"Взвешенный балл второстепенных нарушений составил {minor_score:.1f} из {MAX_MINOR_SCORE:.1f} — "
+            "см. список ниже. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
         )
 
     # ── DCF valuation (CAPM WACC) ───────────────────────────────────────
@@ -759,6 +828,10 @@ def compute_metrics(data):
         "fcf": fcf,
         "net_margin": net_margin,
         "sins": sins,
+        "critical_sins": critical_sins,
+        "minor_sins": minor_sins,
+        "minor_score": minor_score,
+        "max_minor_score": MAX_MINOR_SCORE,
         "verdict": verdict,
         "verdict_color_key": verdict_color_key,
         "reasoning": reasoning,
@@ -853,9 +926,18 @@ def build_markdown_report(ticker, data, m):
     def row(label, series, fmt="{:,.1f}"):
         return f"| {label} | " + " | ".join(fmt.format(v) for v in series) + " |"
 
-    sins_block = (
-        "\n".join(f"- {s}" for s in m["sins"]) if m["sins"] else "- Грехов не обнаружено."
-    )
+    if m["sins"]:
+        sins_parts = []
+        if m["critical_sins"]:
+            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m["critical_sins"]))
+        if m["minor_sins"]:
+            sins_parts.append(
+                f"**Второстепенные (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):**\n"
+                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m["minor_sins"])
+            )
+        sins_block = "\n\n".join(sins_parts)
+    else:
+        sins_block = "- Грехов не обнаружено."
     debt_block = "\n".join(f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy))
     sens_header = "| " + " | ".join(m["sensitivity_headers"]) + " |"
     sens_sep = "|" + "---|" * len(m["sensitivity_headers"])
@@ -1078,13 +1160,20 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     story.append(Paragraph(verdict, verdict_text_style))
     story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
 
-    if sins:
-        sins_text = (
-            "<b>Выявленные финансовые риски («грехи» компании):</b><br/>"
-            + "<br/>".join([f"• {escape_xml(s)}" for s in sins])
+    if m["critical_sins"]:
+        crit_text = (
+            "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
+            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m["critical_sins"])
         )
-        story.append(CalloutBox(sins_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
-    else:
+        story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
+        story.append(Spacer(1, 6))
+    if m["minor_sins"]:
+        minor_text = (
+            f"<b>Второстепенные риски (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):</b><br/>"
+            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m["minor_sins"])
+        )
+        story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
+    if not sins:
         story.append(
             CalloutBox(
                 "<b>Финансовые риски:</b> Грехов не обнаружено. Финансовые показатели компании находятся в безупречной форме.",
