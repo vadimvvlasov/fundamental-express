@@ -969,6 +969,37 @@ def _fmt_or_na(value, fmt="{:.2f}"):
     return fmt.format(value) if value is not None else "N/A"
 
 
+CATALYSTS_PLACEHOLDER = (
+    "Катализаторы не указаны — заполните вручную перед принятием решения. "
+    "Справедливая стоимость по DCF может не реализовываться рынком годами без триггера переоценки."
+)
+
+
+def resolve_catalysts_text(catalysts=None, catalysts_file=None):
+    """Resolve the qualitative catalysts/risks text for report Section 5.
+
+    Catalysts (product launches, regulatory shifts, reputational-crisis
+    recovery) aren't fetchable data - they're an analyst's judgment call, so
+    this never auto-generates or auto-fetches them. --catalysts and
+    --catalysts-file are mutually exclusive - checked here, before any
+    network call, so a bad CLI combo fails fast rather than after a slow
+    Yahoo Finance round-trip. Neither given -> the mandatory
+    methodology-reminder placeholder, never a fabricated catalyst.
+    """
+    if catalysts and catalysts_file:
+        raise SystemExit("--catalysts and --catalysts-file are mutually exclusive")
+    if catalysts_file:
+        try:
+            with open(catalysts_file, encoding="utf-8") as f:
+                text = f.read().strip()
+        except FileNotFoundError:
+            raise SystemExit(f"--catalysts-file not found: {catalysts_file}")
+        return text or CATALYSTS_PLACEHOLDER
+    if catalysts:
+        return catalysts.strip() or CATALYSTS_PLACEHOLDER
+    return CATALYSTS_PLACEHOLDER
+
+
 # ── MAIN PDF COMPILER ───────────────────────────────────────────────────
 LEASE_ASSUMPTION_NOTE = (
     "Допущение по лизингу: в базовом DCF обязательства по аренде исключены из net debt, "
@@ -1015,12 +1046,16 @@ def _debt_lines(m, trading_ccy):
     return lines
 
 
-def build_markdown_report(ticker, data, m, forward_outlook=None):
+def build_markdown_report(ticker, data, m, forward_outlook=None, catalysts_text=None):
     """Plain-text/Markdown twin of the PDF report - same numbers, no charts."""
     name = data["name"]
     trading_ccy = data.get("trading_currency", "USD")
     financial_ccy = data.get("financial_currency", "USD")
     forward_outlook = forward_outlook or dict(_EMPTY_FORWARD_OUTLOOK)
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
+    catalysts_block = "\n".join(
+        f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
+    )
     fx_line = (
         f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
         f"{data.get('fx_rate', 1.0):.4f}\n\n"
@@ -1117,6 +1152,10 @@ def build_markdown_report(ticker, data, m, forward_outlook=None):
 - Ожидаемый рост (консенсус): **{growth_txt}** [источник: {forward_outlook['growth_source'] or 'N/A'}]
 - PEG Ratio: **{peg_txt}** {peg_emoji} — {peg_label} [источник: {forward_outlook['peg_source'] or 'N/A'}]
 
+## 5. Катализаторы и риски (качественная оценка)
+
+{catalysts_block}
+
 ---
 Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
 """
@@ -1127,10 +1166,11 @@ def build_markdown_report(ticker, data, m, forward_outlook=None):
     return md_filename
 
 
-def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
+def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None):
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
     m = compute_metrics(data)
     forward_outlook = compute_forward_outlook(data.get("info", {}), m["price"], m["eps"], m["cagr"])
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
 
     name = data["name"]
     price_kind = data["price_kind"]
@@ -1426,6 +1466,12 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     story.append(CalloutBox(outlook_text, USABLE_W, COLORS, callout_text_style, COLORS[peg_color_key]))
     story.append(Spacer(1, 12))
 
+    # ── SECTION 5: QUALITATIVE CATALYSTS ────────────────────────────────
+    story.append(Paragraph("5. Катализаторы и риски (качественная оценка)", h1_style))
+    catalysts_html = "<br/>".join(escape_xml(line) for line in catalysts_text.splitlines())
+    story.append(CalloutBox(catalysts_html, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
+    story.append(Spacer(1, 12))
+
     warning_text = (
         "<b>Важное правило методики экспресс-анализа:</b><br/>"
         "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
@@ -1438,7 +1484,7 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     doc.build(story)
     print(f"Success! Comprehensive report saved to: {pdf_filename}")
 
-    md_filename = build_markdown_report(ticker, data, m, forward_outlook)
+    md_filename = build_markdown_report(ticker, data, m, forward_outlook, catalysts_text)
     print(f"Success! Markdown report saved to: {md_filename}")
 
     return pdf_filename, md_filename
@@ -1464,12 +1510,22 @@ if __name__ == "__main__":
         "--allow-sample", action="store_true",
         help="Fall back to labeled SAMPLE data if real data can't be fetched (demo only, off by default)",
     )
+    parser.add_argument(
+        "--catalysts", type=str, default=None,
+        help="Free-text note on catalysts/risks to embed in the report (e.g. product launch, regulatory event).",
+    )
+    parser.add_argument(
+        "--catalysts-file", type=str, default=None,
+        help="Path to a text file with the catalysts note (alternative to --catalysts).",
+    )
     args = parser.parse_args()
+
+    catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
 
     try:
         build_pdf_report(
             args.ticker, retries=args.retries, retry_delay=args.retry_delay,
-            allow_sample=args.allow_sample,
+            allow_sample=args.allow_sample, catalysts_text=catalysts_text,
         )
     except DataUnavailableError as e:
         print(f"FAILED: {e}")
