@@ -178,8 +178,12 @@ class DataUnavailableError(Exception):
 
 class UnsupportedSectorError(Exception):
     """Raised when the ticker's sector makes the express checklist and standard
-    FCF-based DCF mathematically invalid (Financial Services, REITs) - see
+    FCF-based DCF mathematically invalid - see
     docs/spec/technical-implementation-spec.md Section 4.
+
+    As of Step 2, this is REITs only - Financial Services (banks) has its own
+    real BankAnalyzer engine and is routed there natively, never through this
+    error (see check_sector_suitability()'s docstring).
 
     Unlike DataUnavailableError, this isn't a transient condition - retrying
     won't help, so it's raised outside get_company_data()'s retry loop.
@@ -190,7 +194,7 @@ class UnsupportedSectorError(Exception):
     def __init__(self, ticker, sector, industry):
         super().__init__(
             f"Ошибка: Тикер {ticker} относится к сектору {sector} ({industry}). "
-            "Экспресс-методика и классический DCF не применимы к финансовым компаниям и REIT. "
+            "Экспресс-методика и классический DCF не применимы к REIT. "
             "Используйте флаг --force для принудительного запуска."
         )
         self.ticker = ticker
@@ -199,8 +203,15 @@ class UnsupportedSectorError(Exception):
 
 
 def check_sector_suitability(ticker, info, force):
-    """Detect Financial Services / REIT sectors where Current Ratio and
-    standard FCF-based DCF are mathematically invalid (see spec Section 4.3).
+    """Detect REIT sectors where Current Ratio and standard FCF-based DCF
+    are mathematically invalid (see spec Section 4.3).
+
+    Financial Services (banks) is deliberately NOT restricted here anymore -
+    as of Step 2 it has its own real BankAnalyzer engine (NII/LTD checklist,
+    DDM/ROE-P-B valuation - see compute_bank_metrics()), so it no longer
+    needs the Ordinary-methodology warning-banner path this function guards.
+    AnalyzerFactory routes "Financial Services" straight to BankAnalyzer
+    before this function is ever called for that ticker (see its docstring).
 
     Returns (sector, industry) if the ticker is in a restricted sector -
     callers use this truthy/falsy to decide whether to render a warning
@@ -216,11 +227,10 @@ def check_sector_suitability(ticker, info, force):
     info = info or {}
     sector = info.get("sector") or ""
     industry = info.get("industry") or ""
-    is_financial = sector == "Financial Services"
     is_reit = sector == "Real Estate" and (
         "REIT" in industry.upper() or industry == "Real Estate - REITs"
     )
-    if not (is_financial or is_reit):
+    if not is_reit:
         return None, None
     if not force:
         raise UnsupportedSectorError(ticker, sector, industry)
@@ -1022,6 +1032,401 @@ def compute_metrics(data, required_return=None):
     }
 
 
+# ── BANK-SPECIFIC ENGINE (Step 2, docs/spec/step2-bank-analyzer-implementation-spec.md) ──
+# Commercial banks report interest income/expense, loans and deposits instead
+# of revenue/current assets/FCF - the express sins checklist and CAPM/FCF-DCF
+# above are mathematically invalid for them (spec Section 1). This is a
+# parallel engine, not a variant of compute_metrics(): different checklist
+# weights, different valuation models (DDM or ROE/P-B), never called from the
+# Ordinary path.
+BANK_MINOR_SIN_WEIGHTS = {
+    "nii_declining": 1.0,
+    "provision_spike": 1.0,
+    "dilution": 1.0,
+    "ltd_imbalance": 0.5,
+    "dead_cash": 0.5,
+    "negative_jaws": 0.5,
+    "commissions_declining": 0.3,
+    "net_income_declining": 0.3,
+}
+BANK_BUYBACK_BONUS_WEIGHT = -0.5
+BANK_MAX_MINOR_SCORE = sum(BANK_MINOR_SIN_WEIGHTS.values())
+
+
+def compute_bank_metrics(data, required_return=None):
+    """Bank sins-checklist (spec Section 4) + DDM/ROE-P-B fair value (spec
+    Section 5). Mirrors compute_metrics()'s output shape for the keys
+    portfolio_analyzer.py and the report renderers actually read (sins/
+    critical_sins/minor_sins/minor_score/max_minor_score/verdict/
+    verdict_color_key/reasoning/price/fair_value_share/over_under_pct/
+    val_status/val_color_key) so those callers work unmodified for banks;
+    everything else is bank-specific (NII, LTD, DDM/ROE-P-B disclosure, ...).
+    """
+    df_fin = data["financials"]
+    df_bal = data["balance"]
+    df_cf = data["cashflow"]
+    price = data["price"]
+    shares = data["shares"]
+    beta = data["beta"]
+    info = data.get("info") or {}
+
+    years = list(df_fin.columns)
+    try:
+        years_sorted = sorted(years, key=lambda x: int(str(x).split("-")[0]))
+        df_fin = df_fin[years_sorted]
+        df_bal = df_bal[years_sorted]
+        df_cf = df_cf[years_sorted]
+        years = years_sorted
+    except Exception:
+        pass
+    year_labels = [str(y).split("-")[0] for y in years]
+
+    # ── Section 3.1: Income statement ───────────────────────────────────
+    interest_income = find_row(df_fin, ["Interest Income", "InterestIncome", "Interest Income Bank"])
+    interest_expense = find_row(df_fin, ["Interest Expense", "InterestExpense", "Interest Expense Bank"])
+    net_interest_income = find_row(df_fin, ["Net Interest Income", "NetInterestIncome"], default_val=float("nan"))
+    if net_interest_income.isna().all():
+        net_interest_income = interest_income - interest_expense
+    commissions_income = find_row(df_fin, [
+        "Fees and Commissions", "Net Fees and Income", "Commission Income",
+        "Net Fee and Commission Income", "Fee Income and Other Non-Interest Income",
+    ])
+    trading_income = find_row(df_fin, [
+        "Trading Revenue", "Investment Banking Income", "TradingAndInvestmentBankingIncome",
+        "Trading Revenue and Other",
+    ])
+    credit_loss_provision = find_row(df_fin, [
+        "Provision for Credit Losses", "Credit Loss Provision",
+        "Provision For Doubtful Accounts", "Provision For Loan and Lease Losses",
+    ])
+    non_interest_expense = find_row(df_fin, [
+        "Non Interest Expense", "Non-Interest Expense", "Total Non-Interest Expense",
+        "Salaries and Employee Benefits",
+    ])
+    net_income = find_row(df_fin, ["Net Income", "NetIncome", "Net Income Common Stockholders"])
+    preferred_dividends = find_row(df_fin, ["Preferred Stock Dividends", "Preferred Dividends"])
+    diluted_shares = find_row(
+        df_fin, ["Diluted Average Shares", "Diluted Shares Outstanding", "Average Shares"],
+        default_val=float("nan"),
+    )
+
+    # ── Section 3.2: Balance sheet ──────────────────────────────────────
+    # Missing-row default is NaN (not 0.0) for every balance-sheet line that
+    # feeds a ratio or a critical check - yfinance's bank template genuinely
+    # omits some of these for large banks (e.g. no dedicated "Total Deposits"
+    # row for JPM/BAC), and a silent 0.0 would corrupt LTD/dead-cash math or
+    # falsely fire equity_negative. NaN propagates to "insufficient data,
+    # skip this check" everywhere below, never to an invented number.
+    cash_and_equiv = find_row(df_bal, [
+        "Cash and Cash Equivalents", "Cash Cash Equivalents and Short Term Investments",
+        "CashAndCashEquivalents",
+    ], default_val=float("nan"))
+    trading_assets = find_row(df_bal, ["Trading Assets", "Trading Securities", "Trading Securities Assets"], default_val=float("nan"))
+    htm_securities = find_row(df_bal, [
+        "Held-to-Maturity Securities", "Held To Maturity Securities", "Securities Held To Maturity",
+    ], default_val=float("nan"))
+    # "Net Loan" (singular) is what yfinance actually calls this row for
+    # diversified mega-banks (JPM, BAC) - not in the spec's literal keyword
+    # list, added after live verification against real yfinance data so the
+    # LTD/dead-cash checks and the structural table aren't needlessly N/A.
+    net_loans = find_row(df_bal, ["Net Loans", "Net Loan", "Loans and Leases", "Gross Loans"], default_val=float("nan"))
+    loan_loss_allowance = find_row(df_bal, [
+        "Allowance for Credit Losses", "Reserve for Bad Loans", "Allowance For Loan And Lease Losses",
+    ], default_val=float("nan"))
+    total_deposits = find_row(df_bal, ["Total Deposits", "Deposits", "Demand Deposits"], default_val=float("nan"))
+    total_borrowings = find_row(df_bal, ["Short Term Borrowings", "Long Term Debt", "Total Debt"], default_val=float("nan"))
+    shareholders_equity = find_row(df_bal, [
+        "Stockholders Equity", "Total Stockholders Equity", "Shareholders Equity",
+    ], default_val=float("nan"))
+
+    # ── Common dividends paid (for DDM DPS) ─────────────────────────────
+    # yfinance has no dedicated "Common Dividends Paid" line for banks - only
+    # a blended "Cash Dividends Paid" that includes preferred dividends.
+    # preferred_dividends (fetched above per spec Section 3.1, "вычитаются
+    # перед DDM") is subtracted here to isolate the common-only figure.
+    cash_dividends_paid = find_row(df_cf, [
+        "Common Stock Dividend Paid", "Cash Dividends Paid", "Payment Of Dividends",
+    ], default_val=float("nan"))
+    common_dividends_paid = cash_dividends_paid.abs() - preferred_dividends.abs()
+
+    # ── FX bridge (Step 1 Currency Bridge, spec Section 3 preamble) ─────
+    fx_rate = data.get("fx_rate", 1.0)
+    if fx_rate != 1.0:
+        interest_income = interest_income * fx_rate
+        interest_expense = interest_expense * fx_rate
+        net_interest_income = net_interest_income * fx_rate
+        commissions_income = commissions_income * fx_rate
+        trading_income = trading_income * fx_rate
+        credit_loss_provision = credit_loss_provision * fx_rate
+        non_interest_expense = non_interest_expense * fx_rate
+        net_income = net_income * fx_rate
+        preferred_dividends = preferred_dividends * fx_rate
+        cash_and_equiv = cash_and_equiv * fx_rate
+        trading_assets = trading_assets * fx_rate
+        htm_securities = htm_securities * fx_rate
+        net_loans = net_loans * fx_rate
+        loan_loss_allowance = loan_loss_allowance * fx_rate
+        total_deposits = total_deposits * fx_rate
+        total_borrowings = total_borrowings * fx_rate
+        shareholders_equity = shareholders_equity * fx_rate
+        common_dividends_paid = common_dividends_paid * fx_rate
+
+    latest_nii = net_interest_income.iloc[-1]
+    latest_equity = shareholders_equity.iloc[-1]
+
+    # ── Section 4.1: Critical sins (any one -> immediate SKIP) ──────────
+    sins = []
+    if not pd.isna(latest_nii) and latest_nii <= 0:
+        sins.append(Sin(
+            "nii_non_positive", "critical", 0.0,
+            f"Чистый процентный убыток: NII последнего года ({latest_nii / 1e6:,.0f} млн) ≤ 0 - "
+            "банк привлекает депозиты дороже, чем размещает кредиты.",
+        ))
+    if not pd.isna(latest_equity) and latest_equity <= 0:
+        sins.append(Sin(
+            "equity_negative", "critical", 0.0,
+            f"Отрицательный регуляторный капитал: Shareholders Equity ({latest_equity / 1e6:,.0f} млн) ≤ 0 - "
+            "угроза немедленного отзыва лицензии регулятором.",
+        ))
+    critical_sins = [s for s in sins if s.tier == "critical"]
+
+    # ── Section 4.2: Minor sins ──────────────────────────────────────────
+    # Per spec: any critical hit interrupts the detailed minor scoring, so
+    # minor sins are only evaluated when no critical sin fired.
+    ltd_ratio = None
+    debt_to_equity = None
+    if not critical_sins:
+        if len(net_interest_income) >= 2 and net_interest_income.iloc[-1] < net_interest_income.iloc[-2]:
+            sins.append(Sin(
+                "nii_declining", "minor", BANK_MINOR_SIN_WEIGHTS["nii_declining"],
+                f"Падение процентного дохода: NII с {net_interest_income.iloc[-2] / 1e6:,.0f} до "
+                f"{net_interest_income.iloc[-1] / 1e6:,.0f} млн.",
+            ))
+        if (
+            len(credit_loss_provision) >= 2
+            and credit_loss_provision.iloc[-1] > 1.15 * credit_loss_provision.iloc[-2]
+        ):
+            sins.append(Sin(
+                "provision_spike", "minor", BANK_MINOR_SIN_WEIGHTS["provision_spike"],
+                f"Опасный рост резервов: Provision for Credit Losses вырос с "
+                f"{credit_loss_provision.iloc[-2] / 1e6:,.0f} до {credit_loss_provision.iloc[-1] / 1e6:,.0f} млн "
+                "(YoY > 15%).",
+            ))
+        if (
+            not diluted_shares.isna().any()
+            and len(diluted_shares) >= 2
+            and diluted_shares.iloc[-2] != 0
+        ):
+            shares_ratio = diluted_shares.iloc[-1] / diluted_shares.iloc[-2]
+            if shares_ratio > 1.015:
+                sins.append(Sin(
+                    "dilution", "minor", BANK_MINOR_SIN_WEIGHTS["dilution"],
+                    f"Размытие долей акционеров: среднее число акций выросло с {diluted_shares.iloc[-2]:,.0f} "
+                    f"до {diluted_shares.iloc[-1]:,.0f} ({(shares_ratio - 1) * 100:.1f}%).",
+                ))
+            elif shares_ratio < (1 / 1.015):
+                sins.append(Sin(
+                    "buyback_bonus", "minor", BANK_BUYBACK_BONUS_WEIGHT,
+                    f"Бонус за байбэк: число акций сократилось с {diluted_shares.iloc[-2]:,.0f} "
+                    f"до {diluted_shares.iloc[-1]:,.0f} ({(1 - shares_ratio) * 100:.1f}%).",
+                ))
+        latest_loans = net_loans.iloc[-1] if len(net_loans) else float("nan")
+        latest_deposits = total_deposits.iloc[-1] if len(total_deposits) else float("nan")
+        if not pd.isna(latest_loans) and not pd.isna(latest_deposits) and latest_deposits != 0:
+            ltd_ratio = latest_loans / latest_deposits
+            if ltd_ratio > 1.0 or ltd_ratio < 0.6:
+                sins.append(Sin(
+                    "ltd_imbalance", "minor", BANK_MINOR_SIN_WEIGHTS["ltd_imbalance"],
+                    f"Дисбаланс Loan-to-Deposit: LTD = {ltd_ratio * 100:.1f}% "
+                    f"({'выше 100%, риск дефицита ликвидности' if ltd_ratio > 1.0 else 'ниже 60%, пассивная работа с депозитами'}).",
+                ))
+        if (
+            len(cash_and_equiv) >= 2 and len(net_loans) >= 2
+            and not pd.isna(cash_and_equiv.iloc[-1]) and not pd.isna(cash_and_equiv.iloc[-2])
+            and not pd.isna(net_loans.iloc[-1]) and not pd.isna(net_loans.iloc[-2])
+            and cash_and_equiv.iloc[-1] > 1.30 * cash_and_equiv.iloc[-2]
+            and net_loans.iloc[-1] < net_loans.iloc[-2]
+        ):
+            sins.append(Sin(
+                "dead_cash", "minor", BANK_MINOR_SIN_WEIGHTS["dead_cash"],
+                f"Накопление мёртвого кэша: денежные средства выросли с {cash_and_equiv.iloc[-2] / 1e6:,.0f} "
+                f"до {cash_and_equiv.iloc[-1] / 1e6:,.0f} млн (>+30%), при этом кредитный портфель сократился.",
+            ))
+        net_op_income = net_interest_income + commissions_income
+        if (
+            len(non_interest_expense) >= 2 and len(net_op_income) >= 2
+            and non_interest_expense.iloc[-2] != 0 and net_op_income.iloc[-2] != 0
+        ):
+            opex_growth = non_interest_expense.iloc[-1] / non_interest_expense.iloc[-2] - 1
+            net_op_income_growth = net_op_income.iloc[-1] / net_op_income.iloc[-2] - 1
+            if opex_growth > net_op_income_growth:
+                sins.append(Sin(
+                    "negative_jaws", "minor", BANK_MINOR_SIN_WEIGHTS["negative_jaws"],
+                    f"Отрицательный JAWS: операционные расходы выросли на {opex_growth * 100:.1f}%, "
+                    f"опережая рост NII+комиссий ({net_op_income_growth * 100:.1f}%).",
+                ))
+        if len(commissions_income) >= 2 and commissions_income.iloc[-1] < commissions_income.iloc[-2]:
+            sins.append(Sin(
+                "commissions_declining", "minor", BANK_MINOR_SIN_WEIGHTS["commissions_declining"],
+                f"Падение комиссионных доходов: с {commissions_income.iloc[-2] / 1e6:,.0f} до "
+                f"{commissions_income.iloc[-1] / 1e6:,.0f} млн.",
+            ))
+        if len(net_income) >= 2 and net_income.iloc[-1] < net_income.iloc[-2]:
+            sins.append(Sin(
+                "net_income_declining", "minor", BANK_MINOR_SIN_WEIGHTS["net_income_declining"],
+                f"Падение чистой прибыли: с {net_income.iloc[-2] / 1e6:,.0f} до "
+                f"{net_income.iloc[-1] / 1e6:,.0f} млн.",
+            ))
+        if not pd.isna(latest_equity) and latest_equity > 0 and not pd.isna(total_borrowings.iloc[-1]):
+            debt_to_equity = total_borrowings.iloc[-1] / latest_equity
+
+    minor_sins = [s for s in sins if s.tier == "minor"]
+    minor_score = max(0.0, sum(s.weight for s in minor_sins))
+
+    if critical_sins:
+        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
+        verdict_color_key = "danger"
+        crit_labels = ", ".join(s.id for s in critical_sins)
+        reasoning = (
+            f"Обнаружен(ы) критический(е) банковский(е) фактор(ы) риска ({crit_labels}). "
+            "Любой из них по отдельности делает инвестицию рискованной вне зависимости от прочих показателей."
+        )
+    elif minor_score <= 1.0:
+        verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
+        verdict_color_key = "success"
+        reasoning = "Банк демонстрирует устойчивую динамику процентного дохода, качества кредитного портфеля и структуры фондирования. Риски минимальны."
+    elif minor_score <= 2.5:
+        verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
+        verdict_color_key = "warning"
+        reasoning = "Банк сохраняет жизнеспособную бизнес-модель, однако в динамике процентной маржи, резервов или структуры баланса присутствуют умеренные погрешности."
+    else:
+        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
+        verdict_color_key = "danger"
+        reasoning = (
+            f"Взвешенный балл второстепенных банковских нарушений составил {minor_score:.1f} из "
+            f"{BANK_MAX_MINOR_SCORE:.1f}. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
+        )
+
+    # ── Section 5: Fair value (DDM or ROE/P-B) ──────────────────────────
+    def _cost_of_equity():
+        if required_return is not None:
+            return required_return
+        ke = 0.04 + beta * 0.05
+        return max(0.05, min(0.15, ke))
+
+    cost_of_equity = _cost_of_equity()
+    terminal_g = 0.025
+
+    dividend_yield = info.get("dividendYield") or 0.0
+    latest_common_div_paid = (
+        common_dividends_paid.iloc[-1] if len(common_dividends_paid) and not pd.isna(common_dividends_paid.iloc[-1])
+        else 0.0
+    )
+    pays_dividends = latest_common_div_paid > 0 or dividend_yield > 0
+
+    bvps = None
+    roe = None
+    cagr_div = None
+    dps_last = None
+    dps_series = None
+
+    if pays_dividends and not diluted_shares.isna().all():
+        dps_series = (common_dividends_paid / diluted_shares).dropna()
+        dps_window = dps_series.iloc[-4:] if len(dps_series) >= 2 else dps_series
+        if len(dps_window) < 2 or dps_window.iloc[0] <= 0 or dps_window.iloc[-1] <= 0:
+            cagr_div = 0.03
+        else:
+            n_periods = len(dps_window) - 1
+            cagr_div = (dps_window.iloc[-1] / dps_window.iloc[0]) ** (1.0 / n_periods) - 1
+            cagr_div = max(0.01, min(0.08, cagr_div))
+        dps_last = dps_window.iloc[-1] if len(dps_window) else 0.0
+
+        proj_years = list(range(1, 6))
+        proj_dps = [dps_last * ((1 + cagr_div) ** t) for t in proj_years]
+        pv_dividends = [proj_dps[t - 1] / ((1 + cost_of_equity) ** t) for t in proj_years]
+        sum_pv_dividends = sum(pv_dividends)
+        terminal_val = (
+            proj_dps[-1] * (1 + terminal_g) / (cost_of_equity - terminal_g)
+            if cost_of_equity > terminal_g else 0.0
+        )
+        pv_terminal_val = terminal_val / ((1 + cost_of_equity) ** 5)
+        fair_value_share = sum_pv_dividends + pv_terminal_val
+        valuation_model = "DDM"
+    else:
+        valuation_model = "ROE_PB"
+        if pd.isna(latest_equity) or latest_equity <= 0 or shares <= 0:
+            bvps = 0.0
+            roe = 0.0
+            fair_value_share = 0.0
+        else:
+            bvps = latest_equity / shares
+            latest_net_income = net_income.iloc[-1]
+            roe = latest_net_income / latest_equity
+            if roe <= 0:
+                fair_value_share = 0.1 * bvps
+            else:
+                fair_value_share = bvps * (roe / cost_of_equity)
+
+    over_under = (fair_value_share - price) / price * 100 if price else 0.0
+    if over_under > 10.0:
+        val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
+        val_color_key = "success"
+    elif over_under < -10.0:
+        val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
+        val_color_key = "danger"
+    else:
+        val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
+        val_color_key = "warning"
+
+    return {
+        "kind": "bank",
+        "year_labels": year_labels,
+        "interest_income": interest_income,
+        "interest_expense": interest_expense,
+        "net_interest_income": net_interest_income,
+        "commissions_income": commissions_income,
+        "trading_income": trading_income,
+        "credit_loss_provision": credit_loss_provision,
+        "non_interest_expense": non_interest_expense,
+        "net_income": net_income,
+        "preferred_dividends": preferred_dividends,
+        "cash_and_equiv": cash_and_equiv,
+        "trading_assets": trading_assets,
+        "htm_securities": htm_securities,
+        "net_loans": net_loans,
+        "loan_loss_allowance": loan_loss_allowance,
+        "total_deposits": total_deposits,
+        "total_borrowings": total_borrowings,
+        "shareholders_equity": shareholders_equity,
+        "diluted_shares": diluted_shares,
+        "ltd_ratio": ltd_ratio,
+        "debt_to_equity": debt_to_equity,
+        "sins": sins,
+        "critical_sins": critical_sins,
+        "minor_sins": minor_sins,
+        "minor_score": minor_score,
+        "max_minor_score": BANK_MAX_MINOR_SCORE,
+        "verdict": verdict,
+        "verdict_color_key": verdict_color_key,
+        "reasoning": reasoning,
+        "beta": beta,
+        "cost_of_equity": cost_of_equity,
+        "required_return_used": required_return is not None,
+        "valuation_model": valuation_model,
+        "cagr_div": cagr_div,
+        "dps_last": dps_last,
+        "bvps": bvps,
+        "roe": roe,
+        "price": price,
+        "fair_value_share": fair_value_share,
+        "over_under_pct": over_under,
+        "val_status": val_status,
+        "val_color_key": val_color_key,
+        "current_ratio": None,
+        "net_margin_pct": None,
+    }
+
+
 _EMPTY_FORWARD_OUTLOOK = {
     "forward_pe": None,
     "forward_pe_source": None,
@@ -1698,6 +2103,374 @@ def build_pdf_report(
         ticker, data, m, forward_outlook, catalysts_text, excluded_sector, excluded_industry,
     )
     print(f"Success! Markdown report saved to: {md_filename}")
+
+    return pdf_filename, md_filename
+
+
+# ── BANK REPORT RENDERERS (Step 2, spec Section 6) ──────────────────────
+# No WACC/Enterprise Value/Net Debt charts or tables here - the classical
+# DCF machinery above is simply not built for banks (spec Section 1).
+def generate_nii_chart(years, nii_values, ticker):
+    """Historical-only NII bar chart - unlike generate_fcf_chart() there is
+    no projected-NII bar: the DDM/ROE-P-B models forecast DPS or apply a
+    static ROE multiple, never a forward NII path, so a projection bar here
+    would be invented data.
+    """
+    fig, ax = plt.subplots(figsize=(7, 3))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#F8FAFC")
+    ax.bar(range(len(years)), [v / 1e9 for v in nii_values], color="#0F766E", width=0.4)
+    ax.set_title(
+        f"Чистый процентный доход (NII) банка {ticker} (в млрд. USD)",
+        fontsize=10, fontweight="bold", color="#1E293B",
+    )
+    ax.set_xticks(range(len(years)))
+    ax.set_xticklabels(years, fontsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#64748B")
+    ax.spines["bottom"].set_color("#64748B")
+    ax.tick_params(colors="#334155", labelsize=8)
+    ax.grid(axis="y", linestyle="--", alpha=0.3, color="#64748B")
+    plt.tight_layout()
+    chart_path = os.path.join(SCRATCH_DIR, f"{ticker}_nii_chart.png")
+    plt.savefig(chart_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    return chart_path
+
+
+def _bank_valuation_disclosure(m):
+    """Plain (label, value) pairs for the DDM/ROE-P-B model disclosure -
+    shared between the PDF and Markdown bank renderers (spec Section 6.2)."""
+    ke_line = (
+        f"Ke = задано инвестором (--required-return) = {m['cost_of_equity'] * 100:.2f}%"
+        if m["required_return_used"]
+        else f"Ke = Rf + β×ERP = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%"
+    )
+    if m["valuation_model"] == "DDM":
+        return "Модель дисконтирования дивидендов (DDM)", [
+            (ke_line, ""),
+            ("Темп роста дивидендов (CAGR_div, ограничен 1.0%-8.0%)", f"{m['cagr_div'] * 100:.2f}%"),
+            ("DPS последнего года (Common Dividends Paid / Diluted Shares)", f"{m['dps_last']:.2f} USD"),
+            ("Терминальный темп роста (Gordon Growth)", "2.5%"),
+        ]
+    return "Модель рентабельности капитала (ROE / P/B)", [
+        (ke_line, ""),
+        ("Балансовая стоимость на акцию (BVPS)", f"{m['bvps']:.2f} USD"),
+        ("Рентабельность капитала (ROE)", f"{m['roe'] * 100:.2f}%"),
+    ]
+
+
+def _bank_structural_rows(m, trading_ccy):
+    """Loan-portfolio / deposit-base YoY table (spec Section 6.3). 'N/A' for
+    any row yfinance doesn't expose for this bank - never a fabricated 0."""
+    def fmt(series):
+        return [
+            "N/A" if pd.isna(v) else f"{v / 1e6:,.1f}"
+            for v in series
+        ]
+
+    rows = [
+        ["Net Loans (млн.)"] + fmt(m["net_loans"]),
+        ["Allowance for Credit Losses (млн.)"] + fmt(m["loan_loss_allowance"]),
+        ["Total Deposits (млн.)"] + fmt(m["total_deposits"]),
+        ["LTD Ratio"] + [
+            "N/A" if pd.isna(l) or pd.isna(d) or d == 0 else f"{(l / d) * 100:.1f}%"
+            for l, d in zip(m["net_loans"], m["total_deposits"])
+        ],
+    ]
+    return rows
+
+
+def build_bank_markdown_report(ticker, data, m, catalysts_text=None):
+    """Bank twin of build_markdown_report() - NII/LTD in the header, DDM or
+    ROE/P-B valuation disclosure instead of WACC/DCF, loan/deposit
+    structural table instead of the Ordinary current-assets table."""
+    name = data["name"]
+    trading_ccy = data.get("trading_currency", "USD")
+    financial_ccy = data.get("financial_currency", "USD")
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
+    catalysts_block = "\n".join(
+        f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
+    )
+    fx_line = (
+        f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
+        f"{data.get('fx_rate', 1.0):.4f}\n\n"
+        if financial_ccy != trading_ccy else ""
+    )
+    year_labels = m["year_labels"]
+
+    def row(label, series, fmt="{:,.1f}"):
+        return f"| {label} | " + " | ".join(
+            "N/A" if pd.isna(v) else fmt.format(v) for v in series
+        ) + " |"
+
+    if m["sins"]:
+        sins_parts = []
+        if m["critical_sins"]:
+            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m["critical_sins"]))
+        if m["minor_sins"]:
+            sins_parts.append(
+                f"**Второстепенные (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):**\n"
+                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m["minor_sins"])
+            )
+        sins_block = "\n\n".join(sins_parts)
+    else:
+        sins_block = "- Грехов не обнаружено."
+
+    model_name, model_lines = _bank_valuation_disclosure(m)
+    model_block = "\n".join(f"- {label}{': ' + value if value else ''}" for label, value in model_lines)
+    ltd_txt = "N/A" if m["ltd_ratio"] is None else f"{m['ltd_ratio'] * 100:.1f}%"
+    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+    struct_rows = _bank_structural_rows(m, trading_ccy)
+
+    md = f"""# Фундаментальный анализ & оценка банка: {ticker.upper()}
+
+Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
+
+{fx_line}## 1. Экспресс-вердикт и оценка рисков (банковский чеклист)
+
+**{m['verdict']}**
+
+{m['reasoning']}
+
+**Выявленные риски:**
+
+{sins_block}
+
+## 2. Экспресс-анализ процентного дохода и баланса
+
+Показатели в млн. {trading_ccy}. Вместо Revenue/Current Ratio для банков используются NII и Loan-to-Deposit (LTD).
+
+| Показатель | {" | ".join(year_labels)} |
+|---|{"---|" * len(year_labels)}
+{row("Net Interest Income (NII)", m["net_interest_income"] / 1e6)}
+{row("Комиссионный доход", m["commissions_income"] / 1e6)}
+{row("Резервы под потери по кредитам (Provision)", m["credit_loss_provision"] / 1e6)}
+{row("Чистая прибыль (Net Income)", m["net_income"] / 1e6)}
+{row("Акционерный капитал (Shareholders Equity)", m["shareholders_equity"] / 1e6)}
+
+**Loan-to-Deposit Ratio (LTD, последний год): {ltd_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
+
+### Структура кредитного портфеля и депозитной базы (YoY)
+
+| Показатель | {" | ".join(year_labels)} |
+|---|{"---|" * len(year_labels)}
+{chr(10).join("| " + " | ".join(str(c) for c in r) + " |" for r in struct_rows)}
+
+## 3. Оценка справедливой стоимости: {model_name}
+
+{model_block}
+
+**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
+Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+
+## 4. Катализаторы и риски (качественная оценка)
+
+{catalysts_block}
+
+---
+У банков отсутствуют Enterprise Value и Net Debt в классическом виде - долговая нагрузка оценивается через Total Debt / Shareholders Equity.
+Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
+"""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.md")
+    with open(md_filename, "w") as f:
+        f.write(md)
+    return md_filename
+
+
+def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
+    data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
+    m = compute_bank_metrics(data, required_return=required_return)
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
+
+    name = data["name"]
+    price_kind = data["price_kind"]
+    quote_time_label = data["quote_time_label"]
+    financial_ccy = data.get("financial_currency", "USD")
+    trading_ccy = data.get("trading_currency", "USD")
+    fx_note = (
+        f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
+        if financial_ccy != trading_ccy else ""
+    )
+    price = m["price"]
+    year_labels = m["year_labels"]
+    verdict = m["verdict"]
+    verdict_color = COLORS[m["verdict_color_key"]]
+    reasoning = m["reasoning"]
+    val_color = COLORS[m["val_color_key"]]
+
+    chart_img_path = generate_nii_chart(year_labels, m["net_interest_income"].values, ticker)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
+
+    doc = BaseDocTemplate(
+        pdf_filename, pagesize=PAGE_SIZE,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN + 15, bottomMargin=MARGIN,
+    )
+    content_frame = Frame(
+        doc.leftMargin, doc.bottomMargin, USABLE_W,
+        PAGE_H - doc.topMargin - doc.bottomMargin, id="main",
+    )
+
+    def on_later_pages(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(COLORS["accent"])
+        canvas.setLineWidth(1.2)
+        y_rule = PAGE_H - MARGIN + 4
+        canvas.line(MARGIN, y_rule, PAGE_W - MARGIN, y_rule)
+        canvas.setFont(FONT_BOLD, 8)
+        canvas.setFillColor(COLORS["muted"])
+        canvas.drawString(MARGIN, y_rule + 4, f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ БАНКА: {ticker.upper()}")
+        canvas.drawRightString(PAGE_W - MARGIN, y_rule + 4, f"{name.upper()}")
+        y_footer = MARGIN - 24
+        canvas.setStrokeColor(COLORS["bg_alt"])
+        canvas.setLineWidth(0.4)
+        canvas.line(MARGIN, y_footer + 12, PAGE_W - MARGIN, y_footer + 12)
+        canvas.setFont(FONT_NAME, 8)
+        canvas.setFillColor(COLORS["muted"])
+        canvas.drawString(MARGIN, y_footer, "Подготовлено ИИ-помощником фундаментального анализа")
+        canvas.drawRightString(PAGE_W - MARGIN, y_footer, f"Страница {doc.page}")
+        canvas.restoreState()
+
+    doc.addPageTemplates([PageTemplate(id="content", frames=content_frame, onPage=on_later_pages)])
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("DocTitle", fontName=FONT_BOLD, fontSize=20, textColor=COLORS["heading"], leading=24, spaceAfter=8)
+    subtitle_style = ParagraphStyle("DocSub", fontName=FONT_NAME, fontSize=11, textColor=COLORS["muted"], leading=14, spaceAfter=15)
+    h1_style = ParagraphStyle("H1", fontName=FONT_BOLD, fontSize=12, textColor=COLORS["heading"], leading=15, spaceBefore=12, spaceAfter=6, keepWithNext=True)
+    body_style = ParagraphStyle("Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6, alignment=TA_JUSTIFY)
+    verdict_text_style = ParagraphStyle("VerdictText", fontName=FONT_BOLD, fontSize=12, textColor=verdict_color, leading=15, spaceAfter=6)
+    callout_text_style = ParagraphStyle("CalloutText", fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13)
+
+    story = [
+        Paragraph(f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ БАНКА: {ticker.upper()}", title_style),
+        Paragraph(
+            f"Полный отчет по банку: <b>{name}</b> | Цена: <b>{price:.2f} {trading_ccy}</b> "
+            f"({price_kind}, Yahoo Finance, {quote_time_label})",
+            subtitle_style,
+        ),
+        SectionDivider(USABLE_W, COLORS["accent"]),
+        Spacer(1, 10),
+    ]
+
+    # ── SECTION 1: EXECUTIVE VERDICT ────────────────────────────────────
+    story.append(Paragraph("1. Экспресс-вердикт и оценка рисков (банковский чеклист)", h1_style))
+    story.append(Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style))
+    story.append(Paragraph(verdict, verdict_text_style))
+    story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
+
+    if m["critical_sins"]:
+        crit_text = (
+            "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
+            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m["critical_sins"])
+        )
+        story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
+        story.append(Spacer(1, 6))
+    if m["minor_sins"]:
+        minor_text = (
+            f"<b>Второстепенные риски (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):</b><br/>"
+            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m["minor_sins"])
+        )
+        story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
+    if not m["sins"]:
+        story.append(CalloutBox(
+            "<b>Финансовые риски:</b> Грехов не обнаружено. Показатели банка в безупречной форме.",
+            USABLE_W, COLORS, callout_text_style, COLORS["success"],
+        ))
+    story.append(Spacer(1, 12))
+
+    # ── SECTION 2: NII / BALANCE TRENDS ─────────────────────────────────
+    story.append(Paragraph("2. Экспресс-анализ процентного дохода и баланса", h1_style))
+    story.append(Paragraph(
+        "Вместо Revenue/Current Ratio (неприменимых к банкам) используются Net Interest Income (NII) и "
+        f"Loan-to-Deposit Ratio (LTD).{fx_note}",
+        body_style,
+    ))
+
+    last4 = range(len(year_labels) - 4, len(year_labels))
+    fund_headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
+
+    def _fmt_last4(series):
+        return [
+            "N/A" if pd.isna(series.iloc[i]) else f"{series.iloc[i] / 1e6:,.1f}"
+            for i in last4
+        ]
+
+    fund_rows = [
+        ["Net Interest Income (NII)"] + _fmt_last4(m["net_interest_income"]),
+        ["Комиссионный доход"] + _fmt_last4(m["commissions_income"]),
+        ["Резервы под потери по кредитам"] + _fmt_last4(m["credit_loss_provision"]),
+        ["Чистая прибыль (Net Income)"] + _fmt_last4(m["net_income"]),
+        ["Акционерный капитал (Shareholders Equity)"] + _fmt_last4(m["shareholders_equity"]),
+    ]
+    story.append(create_reportlab_table(fund_headers, fund_rows, styles, COLORS, col_widths=[190, 70, 70, 70, 70]))
+    story.append(Spacer(1, 8))
+
+    ltd_txt = "N/A" if m["ltd_ratio"] is None else f"{m['ltd_ratio'] * 100:.1f}%"
+    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+    story.append(Paragraph(
+        f"<b>Loan-to-Deposit Ratio (LTD, последний год):</b> {ltd_txt} &nbsp;&nbsp; "
+        f"<b>Total Debt / Shareholders Equity:</b> {de_txt} "
+        "(у банков нет Enterprise Value/Net Debt в классическом смысле).",
+        body_style,
+    ))
+    story.append(Spacer(1, 8))
+    story.append(Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4))
+    story.append(Spacer(1, 10))
+
+    struct_headers = ["Показатель"] + list(year_labels)
+    struct_rows = _bank_structural_rows(m, trading_ccy)
+    story.append(Paragraph("<b>Структура кредитного портфеля и депозитной базы (YoY):</b>", body_style))
+    story.append(create_reportlab_table(struct_headers, struct_rows, styles, COLORS))
+    story.append(Spacer(1, 12))
+
+    # ── SECTION 3: FAIR VALUE (DDM / ROE-P-B) ───────────────────────────
+    model_name, model_lines = _bank_valuation_disclosure(m)
+    story.append(Paragraph(f"3. Оценка справедливой стоимости: {model_name}", h1_style))
+    model_html = "<br/>".join(
+        f"• <b>{escape_xml(label)}</b>{': ' + escape_xml(value) if value else ''}"
+        for label, value in model_lines
+    )
+    story.append(CalloutBox(model_html, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
+    story.append(Spacer(1, 8))
+
+    val_banner_text = (
+        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m['fair_value_share']:.2f} {trading_ccy}</b><br/>"
+        f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
+        f"| Статус: <font color='{val_color.hexval()}'><b>{m['val_status']}</b></font>"
+    )
+    story.append(CalloutBox(
+        val_banner_text, USABLE_W, COLORS,
+        ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
+        val_color,
+    ))
+    story.append(Spacer(1, 12))
+
+    # ── SECTION 4: QUALITATIVE CATALYSTS ────────────────────────────────
+    story.append(Paragraph("4. Катализаторы и риски (качественная оценка)", h1_style))
+    catalysts_html = "<br/>".join(escape_xml(line) for line in catalysts_text.splitlines())
+    story.append(CalloutBox(catalysts_html, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
+    story.append(Spacer(1, 12))
+
+    warning_text = (
+        "<b>Важное правило методики экспресс-анализа:</b><br/>"
+        "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
+        "наилучшего момента и цены входа, фундаментальный анализ <b>обязательно должен использоваться в связке с "
+        "техническим анализом</b>. Не пытайтесь применять их отдельно!<br/>"
+        "У банков отсутствуют Enterprise Value и Net Debt в классическом виде - долговая нагрузка оценивается "
+        "через Total Debt / Shareholders Equity, а не через WACC-дисконтирование FCF."
+    )
+    story.append(CalloutBox(warning_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
+
+    doc.build(story)
+    print(f"Success! Comprehensive bank report saved to: {pdf_filename}")
+
+    md_filename = build_bank_markdown_report(ticker, data, m, catalysts_text)
+    print(f"Success! Markdown bank report saved to: {md_filename}")
 
     return pdf_filename, md_filename
 

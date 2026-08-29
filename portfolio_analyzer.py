@@ -42,9 +42,43 @@ FORCE_WARNING_FOOTNOTE = (
 
 def _ticker_label(r):
     """Ticker label shared by the console table, PDF, and Markdown outputs -
-    flags a --force'd Financials/REIT holding so it can't blend in with a
-    normal, methodology-valid result (see check_sector_suitability)."""
+    flags a --force'd REIT holding so it can't blend in with a normal,
+    methodology-valid result (see check_sector_suitability). Banks are no
+    longer flagged here - Step 2 gave them a real, methodology-valid engine
+    (BankAnalyzer), so AnalyzerFactory never sets excluded_sector for them."""
     return f"{r['ticker']} ⚠️" if r.get("excluded_sector") else r["ticker"]
+
+
+def _is_bank(m):
+    return m.get("kind") == "bank"
+
+
+def _liquidity_label(m):
+    """Current Ratio for Ordinary, LTD (Loan-to-Deposit) for banks - spec
+    Section 2.2.2, since Current Ratio is meaningless for a bank's balance
+    sheet structure."""
+    if _is_bank(m):
+        return "N/A" if m["ltd_ratio"] is None else f"LTD {m['ltd_ratio'] * 100:.1f}%"
+    return f"CR {m['current_ratio']:.2f}" if m.get("current_ratio") is not None else "N/A"
+
+
+def _cashflow_label(m):
+    """FCF for Ordinary, Net Interest Income (NII) for banks - spec Section
+    2.2.2, since banks don't generate a classical Free Cash Flow figure."""
+    if _is_bank(m):
+        nii = m["net_interest_income"]
+        return f"NII {nii.iloc[-1] / 1e6:,.0f}M" if len(nii) else "N/A"
+    fcf = m["fcf"]
+    return f"FCF {fcf.iloc[-1] / 1e6:,.0f}M" if len(fcf) else "N/A"
+
+
+def _leverage_label(m):
+    """Net Debt for Ordinary, Total Debt/Shareholders Equity for banks - spec
+    Section 2.2.2, since banks have no Enterprise Value/Net Debt in the
+    classical DCF sense."""
+    if _is_bank(m):
+        return "N/A" if m["debt_to_equity"] is None else f"D/E {m['debt_to_equity']:.2f}x"
+    return f"ND {m['net_debt'] / 1e9:,.2f}B"
 
 
 def parse_holdings(args_list):
@@ -111,7 +145,10 @@ def analyze_holdings(holdings, retries=5, retry_delay=5, force=False, required_r
 
 def print_table(results):
     print("\n" + "=" * 100)
-    header = f"{'Тикер':<7}{'Вес':<6}{'Цена':<12}{'DCF fair':<12}{'Откл.':<12}{'Вердикт':<20}{'Грехи':<8}"
+    header = (
+        f"{'Тикер':<7}{'Вес':<6}{'Цена':<12}{'DCF fair':<12}{'Откл.':<12}{'Вердикт':<20}{'Грехи':<20}"
+        f"{'Ликвидность':<14}{'Ден.поток':<14}{'Долг.нагрузка':<14}"
+    )
     print(header)
     print("-" * 100)
     for r in results:
@@ -125,7 +162,8 @@ def print_table(results):
             f"{_ticker_label(r):<7}{r['weight']:>4.0f}% "
             f"${m['price']:<10.2f}${m['fair_value_share']:<10.2f}"
             f"{ou:+.1f}% ({label:<12}) "
-            f"{m['verdict']:<20}{_sins_label(m)}"
+            f"{m['verdict']:<20}{_sins_label(m):<20}"
+            f"{_liquidity_label(m):<14}{_cashflow_label(m):<14}{_leverage_label(m):<14}"
         )
     print("=" * 100)
     if any(r.get("excluded_sector") for r in results):
@@ -180,13 +218,16 @@ def build_comparative_pdf(results, name="Portfolio"):
         Paragraph("1. Сводная таблица", h1),
     ]
 
-    headers = ["Тикер", "Вес", "Цена", "DCF fair value", "Откл. от справ. цены", "Вердикт", "Грехи"]
+    headers = [
+        "Тикер", "Вес", "Цена", "DCF fair value", "Откл. от справ. цены", "Вердикт", "Грехи",
+        "Ликвидность (CR/LTD)", "Ден.поток (FCF/NII)", "Долг.нагрузка (ND/D-E)",
+    ]
     rows = []
     failed = []
     for r in results:
         w = f"{r['weight']:g}%"
         if not r["ok"]:
-            rows.append([r["ticker"], w, "н/д", "н/д", "нет данных (Yahoo)", "н/д", "н/д"])
+            rows.append([r["ticker"], w, "н/д", "н/д", "нет данных (Yahoo)", "н/д", "н/д", "н/д", "н/д", "н/д"])
             failed.append(r["ticker"])
             continue
         m = r["metrics"]
@@ -195,8 +236,9 @@ def build_comparative_pdf(results, name="Portfolio"):
         rows.append([
             _ticker_label(r), w, f"${m['price']:,.2f}", f"${m['fair_value_share']:,.2f}",
             ou_label, m["verdict"], _sins_label(m),
+            _liquidity_label(m), _cashflow_label(m), _leverage_label(m),
         ])
-    story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[42, 32, 55, 65, 120, 70, 70]))
+    story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[38, 26, 48, 55, 95, 60, 60, 55, 55, 60]))
     story.append(Spacer(1, 10))
 
     if failed:
@@ -238,14 +280,15 @@ def build_comparative_markdown(results, name="Portfolio"):
         "",
         "## 1. Сводная таблица",
         "",
-        "| Тикер | Вес | Цена | DCF fair value | Откл. от справ. цены | Вердикт | Грехи |",
-        "|---|---|---|---|---|---|---|",
+        "| Тикер | Вес | Цена | DCF fair value | Откл. от справ. цены | Вердикт | Грехи | "
+        "Ликвидность (CR/LTD) | Ден.поток (FCF/NII) | Долг.нагрузка (ND/D-E) |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     failed = []
     for r in results:
         w = f"{r['weight']:g}%"
         if not r["ok"]:
-            lines.append(f"| {r['ticker']} | {w} | н/д | н/д | нет данных (Yahoo) | н/д | н/д |")
+            lines.append(f"| {r['ticker']} | {w} | н/д | н/д | нет данных (Yahoo) | н/д | н/д | н/д | н/д | н/д |")
             failed.append(r["ticker"])
             continue
         m = r["metrics"]
@@ -253,7 +296,8 @@ def build_comparative_markdown(results, name="Portfolio"):
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         lines.append(
             f"| {_ticker_label(r)} | {w} | ${m['price']:,.2f} | ${m['fair_value_share']:,.2f} | "
-            f"{ou_label} | {m['verdict']} | {_sins_label(m)} |"
+            f"{ou_label} | {m['verdict']} | {_sins_label(m)} | "
+            f"{_liquidity_label(m)} | {_cashflow_label(m)} | {_leverage_label(m)} |"
         )
     lines.append("")
 
