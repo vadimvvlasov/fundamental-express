@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 # Resolve workspace root relative to this script file
@@ -42,13 +43,39 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-# The express "sins" checklist in compute_metrics() has 11 independent checks:
-# liquidity level, liquidity trend (only below CR 2.0), long-term solvency
-# (goodwill-adjusted), equity level-or-trend, FCF level-or-trend, revenue
-# trend, operating income trend, net income trend, gross/operating/net
-# margin trend. Kept as one named constant so "X out of N" displays never
-# drift from the actual check count.
-MAX_SINS = 11
+# The express "sins" checklist in compute_metrics() is a two-tier model
+# (see docs/spec/technical-implementation-spec.md Section 1):
+#   - CRITICAL sins (fcf_negative, cr_below_1, lt_insolvency, equity_negative):
+#     any single hit forces verdict = SKIP, regardless of everything else.
+#   - MINOR sins: weighted 1.0/0.5/0.3 by how directly they reflect real
+#     operating/cash health vs how noisy/paper-driven the metric is. Weights
+#     sum to MAX_MINOR_SCORE and decide BUY/WATCH/SKIP when no critical sin
+#     fired.
+
+
+@dataclass
+class Sin:
+    """One fired checklist violation. `weight` is 0.0 for critical sins -
+    weight is meaningless there since any single critical hit is decisive."""
+
+    id: str
+    tier: str  # "critical" | "minor"
+    weight: float
+    message: str
+
+
+MINOR_SIN_WEIGHTS = {
+    "equity_declining": 1.0,
+    "fcf_declining": 1.0,
+    "revenue_declining": 1.0,
+    "operating_income_declining": 1.0,
+    "cr_declining": 0.5,
+    "gross_margin_declining": 0.5,
+    "operating_margin_declining": 0.5,
+    "net_income_declining": 0.3,
+    "net_margin_declining": 0.3,
+}
+MAX_MINOR_SCORE = sum(MINOR_SIN_WEIGHTS.values())
 
 # ── DESIGN PALETTE (Corporate Slate & Teal Archetype) ──────────────────
 COLORS = {
@@ -144,6 +171,57 @@ class DataUnavailableError(Exception):
         self.attempts = attempts
 
 
+class UnsupportedSectorError(Exception):
+    """Raised when the ticker's sector makes the express checklist and standard
+    FCF-based DCF mathematically invalid (Financial Services, REITs) - see
+    docs/spec/technical-implementation-spec.md Section 4.
+
+    Unlike DataUnavailableError, this isn't a transient condition - retrying
+    won't help, so it's raised outside get_company_data()'s retry loop.
+    Callers pass --force to proceed anyway, which never raises this and
+    instead threads a warning banner into the generated report.
+    """
+
+    def __init__(self, ticker, sector, industry):
+        super().__init__(
+            f"Ошибка: Тикер {ticker} относится к сектору {sector} ({industry}). "
+            "Экспресс-методика и классический DCF не применимы к финансовым компаниям и REIT. "
+            "Используйте флаг --force для принудительного запуска."
+        )
+        self.ticker = ticker
+        self.sector = sector
+        self.industry = industry
+
+
+def check_sector_suitability(ticker, info, force):
+    """Detect Financial Services / REIT sectors where Current Ratio and
+    standard FCF-based DCF are mathematically invalid (see spec Section 4.3).
+
+    Returns (sector, industry) if the ticker is in a restricted sector -
+    callers use this truthy/falsy to decide whether to render a warning
+    banner. Raises UnsupportedSectorError if restricted and `force` is
+    False; with `force=True` it never raises, only reports the sector back.
+
+    The REIT rule is deliberately narrower than the whole "Real Estate"
+    sector - plain real estate developers/operators (e.g. industry
+    "Real Estate - Development") report conventional current assets/
+    liabilities and generate real FCF, so they pass through unaffected;
+    only the FFO-valued REIT subset is excluded.
+    """
+    info = info or {}
+    sector = info.get("sector") or ""
+    industry = info.get("industry") or ""
+    is_financial = sector == "Financial Services"
+    is_reit = sector == "Real Estate" and (
+        "REIT" in industry.upper() or industry == "Real Estate - REITs"
+    )
+    if not (is_financial or is_reit):
+        return None, None
+    if not force:
+        raise UnsupportedSectorError(ticker, sector, industry)
+    return sector, industry
+
+
 def _fx_rate(from_ccy, to_ccy):
     """USD-per-unit-of-from_ccy conversion rate, or None if it can't be fetched."""
     if from_ccy == to_ccy:
@@ -235,6 +313,10 @@ def _fetch_once(ticker):
             "fx_rate": fx_rate,
             "financial_currency": financial_ccy or trading_ccy,
             "trading_currency": trading_ccy,
+            # Raw info payload, kept only for the Forward Outlook section
+            # (forwardPE/pegRatio/earningsGrowth/revenueGrowth) - never used
+            # by compute_metrics()'s core sins/DCF logic.
+            "info": info,
         }
     except Exception as e:
         print(f"  [{ticker}] fetch attempt failed: {e}")
@@ -285,6 +367,11 @@ def _sample_data(ticker):
         "fx_rate": 1.0,
         "financial_currency": "USD",
         "trading_currency": "USD",
+        # No real consensus data for sample runs - compute_forward_outlook
+        # falls through its whole chain to the Trailing P/E / Historical FCF
+        # CAGR proxies (both computable from the sample data itself) rather
+        # than crashing on a missing info dict.
+        "info": {},
     }
 
 
@@ -359,6 +446,31 @@ class CalloutBox(Flowable):
         self.canv.setFillColor(self.bar_color)
         self.canv.rect(0, 0, self.bar_w, self._height, fill=1, stroke=0)
         self._para.drawOn(self.canv, self.bar_w + self.pad, self.pad)
+
+
+# ── FLOWABLE: SECTOR WARNING BANNER ─────────────────────────────────────
+class SectorWarningBanner(Flowable):
+    """Full-bleed solid-color banner - deliberately louder than CalloutBox's
+    bg_alt-plus-accent-bar style, since a sector-suitability warning (spec
+    Section 4.4) needs to read as urgent at a glance, not as routine context.
+    """
+
+    def __init__(self, text, width, colors, body_style, fill_color=None):
+        Flowable.__init__(self)
+        self._width = width
+        self.fill_color = fill_color or colors["danger"]
+        self.pad = 10
+        self._para = Paragraph(text, body_style)
+        self._para_w, self._para_h = self._para.wrap(self._width - 2 * self.pad, 10000)
+        self._height = self._para_h + 2 * self.pad
+
+    def wrap(self, availWidth, availHeight):
+        return self._width, self._height
+
+    def draw(self):
+        self.canv.setFillColor(self.fill_color)
+        self.canv.rect(0, 0, self._width, self._height, fill=1, stroke=0)
+        self._para.drawOn(self.canv, self.pad, self.pad)
 
 
 # ── GENERATE EXCEL-STYLE TABLES WITH PARAGRAPHCELLS ────────────────────
@@ -562,81 +674,123 @@ def compute_metrics(data):
     long_term_assets_adj = (total_assets - curr_assets) - goodwill
     long_term_liab = (total_liab - curr_liab) if not total_liab.isna().all() else None
 
-    # ── "Sins" checklist (express algorithm from the lecture) ──────────
+    # ── "Sins" checklist (express algorithm from the lecture, two-tier) ──
     sins = []
 
     latest_cr = curr_ratios.iloc[-1]
     if latest_cr < 1.0:
-        sins.append(
-            f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f})."
-        )
+        sins.append(Sin(
+            "cr_below_1", "critical", 0.0,
+            f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f}).",
+        ))
     # A CR decline is only flagged if the company also isn't comfortably
-    # liquid (CR < 2.0) after the decline - dropping from, say, 4.0 to 3.0
-    # isn't a red flag on its own.
-    if (
+    # liquid (CR >= 2.0) after the decline - dropping from, say, 4.0 to 3.0
+    # isn't a red flag on its own. Requiring latest_cr >= 1.0 here keeps this
+    # mutually exclusive with cr_below_1 above - a CR crash below 1.0 is
+    # already captured as the critical sin and must not also double-count
+    # as a minor "declining trend" sin on the same underlying fact.
+    elif (
         len(curr_ratios) >= 2
         and curr_ratios.iloc[-1] < curr_ratios.iloc[-2]
         and latest_cr < 2.0
     ):
-        sins.append(
-            f"Снижающийся тренд ликвидности: Current Ratio с {curr_ratios.iloc[-2]:.2f} до {curr_ratios.iloc[-1]:.2f}."
-        )
+        sins.append(Sin(
+            "cr_declining", "minor", MINOR_SIN_WEIGHTS["cr_declining"],
+            f"Снижающийся тренд ликвидности: Current Ratio с {curr_ratios.iloc[-2]:.2f} до {curr_ratios.iloc[-1]:.2f}.",
+        ))
 
     if long_term_liab is not None:
         latest_lt_assets = long_term_assets_adj.iloc[-1]
         latest_lt_liab = long_term_liab.iloc[-1]
         if latest_lt_assets < latest_lt_liab:
-            sins.append(
+            sins.append(Sin(
+                "lt_insolvency", "critical", 0.0,
                 f"Долгосрочная неплатёжеспособность: скорректированные (за вычетом Goodwill) "
                 f"долгосрочные активы ({latest_lt_assets / 1e6:,.0f} млн) меньше долгосрочных "
-                f"обязательств ({latest_lt_liab / 1e6:,.0f} млн)."
-            )
+                f"обязательств ({latest_lt_liab / 1e6:,.0f} млн).",
+            ))
 
     latest_equity = equity.iloc[-1]
     if latest_equity <= 0:
-        sins.append("Отрицательный акционерный капитал: обязательств больше, чем реальных активов.")
+        sins.append(Sin(
+            "equity_negative", "critical", 0.0,
+            "Отрицательный акционерный капитал: обязательств больше, чем реальных активов.",
+        ))
     elif len(equity) >= 2 and equity.iloc[-1] < equity.iloc[-2]:
-        sins.append("Тренд падения капитала: Shareholder Equity снизился за последний год.")
+        sins.append(Sin(
+            "equity_declining", "minor", MINOR_SIN_WEIGHTS["equity_declining"],
+            "Тренд падения капитала: Shareholder Equity снизился за последний год.",
+        ))
 
     latest_fcf = fcf.iloc[-1]
     if latest_fcf <= 0:
-        sins.append("Сжигание денежных средств: отрицательный Free Cash Flow.")
+        sins.append(Sin(
+            "fcf_negative", "critical", 0.0,
+            "Сжигание денежных средств: отрицательный Free Cash Flow.",
+        ))
     elif len(fcf) >= 2 and fcf.iloc[-1] < fcf.iloc[-2]:
-        sins.append("Падение денежного потока: снижение FCF за последний год.")
+        sins.append(Sin(
+            "fcf_declining", "minor", MINOR_SIN_WEIGHTS["fcf_declining"],
+            "Падение денежного потока: снижение FCF за последний год.",
+        ))
 
     if len(revenue) >= 2 and revenue.iloc[-1] < revenue.iloc[-2]:
-        sins.append("Снижение выручки за последний год.")
+        sins.append(Sin(
+            "revenue_declining", "minor", MINOR_SIN_WEIGHTS["revenue_declining"],
+            "Снижение выручки за последний год.",
+        ))
     if len(operating_income) >= 2 and operating_income.iloc[-1] < operating_income.iloc[-2]:
-        sins.append("Падение операционной прибыли за последний год.")
+        sins.append(Sin(
+            "operating_income_declining", "minor", MINOR_SIN_WEIGHTS["operating_income_declining"],
+            "Падение операционной прибыли за последний год.",
+        ))
     if len(net_income) >= 2 and net_income.iloc[-1] < net_income.iloc[-2]:
-        sins.append("Падение чистой прибыли за последний год.")
+        sins.append(Sin(
+            "net_income_declining", "minor", MINOR_SIN_WEIGHTS["net_income_declining"],
+            "Падение чистой прибыли за последний год.",
+        ))
     if gross_margin is not None and len(gross_margin) >= 2 and gross_margin.iloc[-1] < gross_margin.iloc[-2]:
-        sins.append(
-            f"Падение валовой маржи: Gross Margin с {gross_margin.iloc[-2]:.1f}% до {gross_margin.iloc[-1]:.1f}%."
-        )
+        sins.append(Sin(
+            "gross_margin_declining", "minor", MINOR_SIN_WEIGHTS["gross_margin_declining"],
+            f"Падение валовой маржи: Gross Margin с {gross_margin.iloc[-2]:.1f}% до {gross_margin.iloc[-1]:.1f}%.",
+        ))
     if len(operating_margin) >= 2 and operating_margin.iloc[-1] < operating_margin.iloc[-2]:
-        sins.append(
-            f"Падение операционной маржи: Operating Margin с {operating_margin.iloc[-2]:.1f}% до {operating_margin.iloc[-1]:.1f}%."
-        )
+        sins.append(Sin(
+            "operating_margin_declining", "minor", MINOR_SIN_WEIGHTS["operating_margin_declining"],
+            f"Падение операционной маржи: Operating Margin с {operating_margin.iloc[-2]:.1f}% до {operating_margin.iloc[-1]:.1f}%.",
+        ))
     if len(net_margin) >= 2 and net_margin.iloc[-1] < net_margin.iloc[-2]:
-        sins.append(
-            f"Падение рентабельности: чистая маржа с {net_margin.iloc[-2]:.1f}% до {net_margin.iloc[-1]:.1f}%."
-        )
+        sins.append(Sin(
+            "net_margin_declining", "minor", MINOR_SIN_WEIGHTS["net_margin_declining"],
+            f"Падение рентабельности: чистая маржа с {net_margin.iloc[-2]:.1f}% до {net_margin.iloc[-1]:.1f}%.",
+        ))
 
-    if len(sins) == 0:
+    critical_sins = [s for s in sins if s.tier == "critical"]
+    minor_sins = [s for s in sins if s.tier == "minor"]
+    minor_score = sum(s.weight for s in minor_sins)
+
+    if critical_sins:
+        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
+        verdict_color_key = "danger"
+        crit_labels = ", ".join(s.id for s in critical_sins)
+        reasoning = (
+            f"Обнаружен(ы) критический(е) фактор(ы) риска ({crit_labels}) — см. список ниже. "
+            "Любой из них по отдельности делает инвестицию рискованной вне зависимости от прочих показателей."
+        )
+    elif minor_score <= 1.0:
         verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
         verdict_color_key = "success"
         reasoning = "Компания демонстрирует эталонную финансовую устойчивость, растущую выручку, отличную маржинальность и растущий свободный денежный поток. Риски минимальны."
-    elif len(sins) <= 3:
+    elif minor_score <= 2.5:
         verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
         verdict_color_key = "warning"
-        reasoning = "Отличный сильный бизнес, однако в финансовых трендах или балансе присутствуют незначительные погрешности. Рекомендуется покупка только ограниченной долей."
+        reasoning = "Отличный сильный бизнес, однако в финансовых трендах присутствуют умеренные погрешности. Рекомендуется покупка только ограниченной долей."
     else:
         verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
         verdict_color_key = "danger"
         reasoning = (
-            f"Обнаружено {len(sins)} финансовых нарушений (грехов) — см. список ниже. "
-            "Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
+            f"Взвешенный балл второстепенных нарушений составил {minor_score:.1f} из {MAX_MINOR_SCORE:.1f} — "
+            "см. список ниже. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
         )
 
     # ── DCF valuation (CAPM WACC) ───────────────────────────────────────
@@ -759,6 +913,10 @@ def compute_metrics(data):
         "fcf": fcf,
         "net_margin": net_margin,
         "sins": sins,
+        "critical_sins": critical_sins,
+        "minor_sins": minor_sins,
+        "minor_score": minor_score,
+        "max_minor_score": MAX_MINOR_SCORE,
         "verdict": verdict,
         "verdict_color_key": verdict_color_key,
         "reasoning": reasoning,
@@ -790,6 +948,132 @@ def compute_metrics(data):
         "current_ratio": float(latest_cr),
         "net_margin_pct": float(net_margin.iloc[-1]) if not pd.isna(net_margin.iloc[-1]) else None,
     }
+
+
+_EMPTY_FORWARD_OUTLOOK = {
+    "forward_pe": None,
+    "forward_pe_source": None,
+    "growth_rate": None,
+    "growth_pct": None,
+    "growth_source": None,
+    "peg_ratio": None,
+    "peg_source": None,
+}
+
+
+def compute_forward_outlook(info, price, eps, historical_fcf_cagr):
+    """Forward P/E, consensus growth, and PEG - a purely informational
+    counterweight to the trailing-CAGR DCF, never fed into the Section 1
+    verdict score (see docs/spec/technical-implementation-spec.md Section 2).
+
+    yfinance's `.info` dict frequently has forwardPE/pegRatio/earningsGrowth/
+    revenueGrowth as None for a given ticker, so every field runs through a
+    fallback chain and is paired with a *_source label - the report must
+    never imply a proxy is the real analyst consensus. This function never
+    raises: any failure degrades to an all-N/A block, consistent with
+    DataUnavailableError being reserved for the core financials fetch only.
+    """
+    try:
+        info = info or {}
+        latest_eps = eps.iloc[-1] if len(eps) else None
+        trailing_pe = (
+            price / latest_eps if latest_eps and latest_eps > 0 and price else None
+        )
+
+        forward_pe = info.get("forwardPE")
+        forward_pe_source = "Forward P/E (Yahoo Finance)"
+        if not forward_pe or forward_pe <= 0:
+            forward_pe, forward_pe_source = trailing_pe, "Trailing P/E Proxy (форвардный P/E недоступен)"
+        if not forward_pe or forward_pe <= 0:
+            forward_pe, forward_pe_source = None, None
+
+        growth_rate = info.get("earningsGrowth")
+        growth_source = "Consensus Earnings Growth (Yahoo Finance)"
+        if not growth_rate:
+            growth_rate, growth_source = info.get("revenueGrowth"), "Consensus Revenue Growth (EPS growth недоступен)"
+        if not growth_rate:
+            growth_rate, growth_source = historical_fcf_cagr, "Historical FCF CAGR Proxy (консенсус недоступен)"
+        if not growth_rate:
+            growth_rate, growth_source = None, None
+
+        # Yahoo's earningsGrowth/revenueGrowth are fractional (0.12 = +12%).
+        # Known limitation: a >100% YoY growth fraction (e.g. 1.5 = +150%)
+        # reads identically to an already-converted percentage under this
+        # heuristic and would be mis-detected as "already a percent" -
+        # accepted, same tolerance for imperfect heuristics on noisy
+        # provider data as find_row's own exact-vs-partial matching.
+        growth_pct = (
+            growth_rate * 100 if growth_rate is not None and growth_rate < 1.0 else growth_rate
+        )
+
+        peg_ratio = info.get("pegRatio")
+        peg_source = "PEG Ratio (Yahoo Finance)"
+        if not peg_ratio or peg_ratio <= 0:
+            peg_ratio, peg_source = info.get("trailingPegRatio"), "Trailing PEG (Yahoo Finance, форвардный PEG недоступен)"
+        if (not peg_ratio or peg_ratio <= 0) and forward_pe and growth_pct:
+            peg_ratio = forward_pe / growth_pct
+            peg_source = "PEG Ratio (расчётный: Forward P/E ÷ Expected Growth %)"
+        if not peg_ratio or peg_ratio <= 0:
+            peg_ratio, peg_source = None, None
+
+        return {
+            "forward_pe": forward_pe,
+            "forward_pe_source": forward_pe_source,
+            "growth_rate": growth_rate,
+            "growth_pct": growth_pct,
+            "growth_source": growth_source,
+            "peg_ratio": peg_ratio,
+            "peg_source": peg_source,
+        }
+    except Exception as e:
+        print(f"  Warning: forward outlook computation failed ({e}) - rendering N/A block.")
+        return dict(_EMPTY_FORWARD_OUTLOOK)
+
+
+def _peg_assessment(peg_ratio):
+    """PEG color-coding for the Forward Outlook section (spec Section 2.4)."""
+    if peg_ratio is None:
+        return "muted", "Недостаточно данных"
+    if peg_ratio < 1.0:
+        return "success", "Недооценена с учетом роста"
+    if peg_ratio <= 2.0:
+        return "warning", "Оценена справедливо"
+    return "danger", "Переоценена относительно роста"
+
+
+def _fmt_or_na(value, fmt="{:.2f}"):
+    return fmt.format(value) if value is not None else "N/A"
+
+
+CATALYSTS_PLACEHOLDER = (
+    "Катализаторы не указаны — заполните вручную перед принятием решения. "
+    "Справедливая стоимость по DCF может не реализовываться рынком годами без триггера переоценки."
+)
+
+
+def resolve_catalysts_text(catalysts=None, catalysts_file=None):
+    """Resolve the qualitative catalysts/risks text for report Section 5.
+
+    Catalysts (product launches, regulatory shifts, reputational-crisis
+    recovery) aren't fetchable data - they're an analyst's judgment call, so
+    this never auto-generates or auto-fetches them. --catalysts and
+    --catalysts-file are mutually exclusive - checked here, before any
+    network call, so a bad CLI combo fails fast rather than after a slow
+    Yahoo Finance round-trip. Neither given -> the mandatory
+    methodology-reminder placeholder, never a fabricated catalyst.
+    """
+    if catalysts and catalysts_file:
+        raise SystemExit("--catalysts and --catalysts-file are mutually exclusive")
+    if catalysts_file:
+        try:
+            with open(catalysts_file, encoding="utf-8") as f:
+                text = f.read().strip()
+        except FileNotFoundError:
+            raise SystemExit(f"--catalysts-file not found: {catalysts_file}")
+        return text or CATALYSTS_PLACEHOLDER
+    if catalysts:
+        return catalysts.strip() or CATALYSTS_PLACEHOLDER
+    return CATALYSTS_PLACEHOLDER
 
 
 # ── MAIN PDF COMPILER ───────────────────────────────────────────────────
@@ -838,11 +1122,26 @@ def _debt_lines(m, trading_ccy):
     return lines
 
 
-def build_markdown_report(ticker, data, m):
+def build_markdown_report(
+    ticker, data, m, forward_outlook=None, catalysts_text=None,
+    excluded_sector=None, excluded_industry=None,
+):
     """Plain-text/Markdown twin of the PDF report - same numbers, no charts."""
     name = data["name"]
     trading_ccy = data.get("trading_currency", "USD")
     financial_ccy = data.get("financial_currency", "USD")
+    forward_outlook = forward_outlook or dict(_EMPTY_FORWARD_OUTLOOK)
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
+    catalysts_block = "\n".join(
+        f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
+    )
+    sector_warning_line = (
+        f"> ⚠️ **ВНИМАНИЕ (НЕПРИМЕНИМАЯ МЕТОДИКА):** Компания относится к сектору "
+        f"**{excluded_sector} ({excluded_industry})**. Экспресс-оценка ликвидности (Current Ratio) и "
+        "классический расчет справедливой цены по DCF для данного сектора могут быть некорректны и "
+        "давать ложные результаты!\n\n"
+        if excluded_sector else ""
+    )
     fx_line = (
         f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
         f"{data.get('fx_rate', 1.0):.4f}\n\n"
@@ -853,15 +1152,30 @@ def build_markdown_report(ticker, data, m):
     def row(label, series, fmt="{:,.1f}"):
         return f"| {label} | " + " | ".join(fmt.format(v) for v in series) + " |"
 
-    sins_block = (
-        "\n".join(f"- {s}" for s in m["sins"]) if m["sins"] else "- Грехов не обнаружено."
-    )
+    if m["sins"]:
+        sins_parts = []
+        if m["critical_sins"]:
+            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m["critical_sins"]))
+        if m["minor_sins"]:
+            sins_parts.append(
+                f"**Второстепенные (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):**\n"
+                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m["minor_sins"])
+            )
+        sins_block = "\n\n".join(sins_parts)
+    else:
+        sins_block = "- Грехов не обнаружено."
     debt_block = "\n".join(f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy))
     sens_header = "| " + " | ".join(m["sensitivity_headers"]) + " |"
     sens_sep = "|" + "---|" * len(m["sensitivity_headers"])
     sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m["sensitivity_rows"])
 
-    md = f"""# Фундаментальный анализ & оценка DCF: {ticker.upper()}
+    peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
+    peg_emoji = {"success": "🟢", "warning": "🟡", "danger": "🔴", "muted": "⚪"}[peg_color_key]
+    forward_pe_txt = _fmt_or_na(forward_outlook["forward_pe"])
+    growth_txt = _fmt_or_na(forward_outlook["growth_pct"], "{:.1f}%")
+    peg_txt = _fmt_or_na(forward_outlook["peg_ratio"])
+
+    md = f"""{sector_warning_line}# Фундаментальный анализ & оценка DCF: {ticker.upper()}
 
 Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
 
@@ -916,6 +1230,18 @@ def build_markdown_report(ticker, data, m):
 {sens_sep}
 {sens_rows}
 
+## 4. Форвардные мультипликаторы и консенсус-прогноз
+
+> Раздел носит справочный характер и не влияет на балл экспресс-чеклиста из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную на экстраполяции исторических 4 лет.
+
+- Forward P/E: **{forward_pe_txt}** [источник: {forward_outlook['forward_pe_source'] or 'N/A'}]
+- Ожидаемый рост (консенсус): **{growth_txt}** [источник: {forward_outlook['growth_source'] or 'N/A'}]
+- PEG Ratio: **{peg_txt}** {peg_emoji} — {peg_label} [источник: {forward_outlook['peg_source'] or 'N/A'}]
+
+## 5. Катализаторы и риски (качественная оценка)
+
+{catalysts_block}
+
 ---
 Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
 """
@@ -926,9 +1252,12 @@ def build_markdown_report(ticker, data, m):
     return md_filename
 
 
-def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
+def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, force=False):
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
+    excluded_sector, excluded_industry = check_sector_suitability(ticker, data.get("info", {}), force)
     m = compute_metrics(data)
+    forward_outlook = compute_forward_outlook(data.get("info", {}), m["price"], m["eps"], m["cagr"])
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
 
     name = data["name"]
     price_kind = data["price_kind"]
@@ -1059,6 +1388,19 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
 
     story = []
 
+    if excluded_sector:
+        sector_warning_style = ParagraphStyle(
+            "SectorWarning", fontName=FONT_BOLD, fontSize=10, textColor=COLORS["white"], leading=14,
+        )
+        sector_warning_text = (
+            "⚠ ВНИМАНИЕ (НЕПРИМЕНИМАЯ МЕТОДИКА): Компания относится к сектору "
+            f"<b>{escape_xml(excluded_sector)} ({escape_xml(excluded_industry)})</b>. Экспресс-оценка "
+            "ликвидности (Current Ratio) и классический расчет справедливой цены по DCF для данного "
+            "сектора могут быть некорректны и давать ложные результаты!"
+        )
+        story.append(SectorWarningBanner(sector_warning_text, USABLE_W, COLORS, sector_warning_style))
+        story.append(Spacer(1, 10))
+
     story.append(
         Paragraph(f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ &amp; ОЦЕНКА DCF: {ticker.upper()}", title_style)
     )
@@ -1078,13 +1420,20 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     story.append(Paragraph(verdict, verdict_text_style))
     story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
 
-    if sins:
-        sins_text = (
-            "<b>Выявленные финансовые риски («грехи» компании):</b><br/>"
-            + "<br/>".join([f"• {escape_xml(s)}" for s in sins])
+    if m["critical_sins"]:
+        crit_text = (
+            "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
+            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m["critical_sins"])
         )
-        story.append(CalloutBox(sins_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
-    else:
+        story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
+        story.append(Spacer(1, 6))
+    if m["minor_sins"]:
+        minor_text = (
+            f"<b>Второстепенные риски (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):</b><br/>"
+            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m["minor_sins"])
+        )
+        story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
+    if not sins:
         story.append(
             CalloutBox(
                 "<b>Финансовые риски:</b> Грехов не обнаружено. Финансовые показатели компании находятся в безупречной форме.",
@@ -1194,6 +1543,35 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     story.append(create_reportlab_table(sensitivity_headers, sensitivity_rows, styles, COLORS))
     story.append(Spacer(1, 12))
 
+    # ── SECTION 4: FORWARD OUTLOOK ──────────────────────────────────────
+    story.append(Paragraph("4. Форвардные мультипликаторы и консенсус-прогноз", h1_style))
+    story.append(
+        Paragraph(
+            "Раздел носит исключительно информационный характер и не влияет на балл экспресс-чеклиста "
+            "из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную "
+            "на экстраполяции исторических 4 лет.",
+            body_style,
+        )
+    )
+    peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
+    outlook_text = (
+        f"• <b>Forward P/E:</b> {_fmt_or_na(forward_outlook['forward_pe'])} "
+        f"[источник: {escape_xml(forward_outlook['forward_pe_source'] or 'N/A')}]<br/>"
+        f"• <b>Ожидаемый рост (консенсус):</b> {_fmt_or_na(forward_outlook['growth_pct'], '{:.1f}%')} "
+        f"[источник: {escape_xml(forward_outlook['growth_source'] or 'N/A')}]<br/>"
+        f"• <b>PEG Ratio:</b> {_fmt_or_na(forward_outlook['peg_ratio'])} — "
+        f"<font color='{COLORS[peg_color_key].hexval()}'><b>{escape_xml(peg_label)}</b></font> "
+        f"[источник: {escape_xml(forward_outlook['peg_source'] or 'N/A')}]<br/>"
+    )
+    story.append(CalloutBox(outlook_text, USABLE_W, COLORS, callout_text_style, COLORS[peg_color_key]))
+    story.append(Spacer(1, 12))
+
+    # ── SECTION 5: QUALITATIVE CATALYSTS ────────────────────────────────
+    story.append(Paragraph("5. Катализаторы и риски (качественная оценка)", h1_style))
+    catalysts_html = "<br/>".join(escape_xml(line) for line in catalysts_text.splitlines())
+    story.append(CalloutBox(catalysts_html, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
+    story.append(Spacer(1, 12))
+
     warning_text = (
         "<b>Важное правило методики экспресс-анализа:</b><br/>"
         "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
@@ -1206,7 +1584,9 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
     doc.build(story)
     print(f"Success! Comprehensive report saved to: {pdf_filename}")
 
-    md_filename = build_markdown_report(ticker, data, m)
+    md_filename = build_markdown_report(
+        ticker, data, m, forward_outlook, catalysts_text, excluded_sector, excluded_industry,
+    )
     print(f"Success! Markdown report saved to: {md_filename}")
 
     return pdf_filename, md_filename
@@ -1232,13 +1612,30 @@ if __name__ == "__main__":
         "--allow-sample", action="store_true",
         help="Fall back to labeled SAMPLE data if real data can't be fetched (demo only, off by default)",
     )
+    parser.add_argument(
+        "--catalysts", type=str, default=None,
+        help="Free-text note on catalysts/risks to embed in the report (e.g. product launch, regulatory event).",
+    )
+    parser.add_argument(
+        "--catalysts-file", type=str, default=None,
+        help="Path to a text file with the catalysts note (alternative to --catalysts).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Принудительно запустить анализ для несовместимых секторов (Финансы/REIT) под ответственность пользователя.",
+    )
     args = parser.parse_args()
+
+    catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
 
     try:
         build_pdf_report(
             args.ticker, retries=args.retries, retry_delay=args.retry_delay,
-            allow_sample=args.allow_sample,
+            allow_sample=args.allow_sample, catalysts_text=catalysts_text, force=args.force,
         )
     except DataUnavailableError as e:
         print(f"FAILED: {e}")
+        raise SystemExit(1)
+    except UnsupportedSectorError as e:
+        print(str(e))
         raise SystemExit(1)

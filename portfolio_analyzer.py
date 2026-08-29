@@ -12,7 +12,6 @@ from financial_analyzer import (
     PAGE_H,
     USABLE_W,
     OUTPUT_DIR,
-    MAX_SINS,
     SectionDivider,
     CalloutBox,
     create_reportlab_table,
@@ -25,6 +24,12 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer
 
 TICKER_RE = re.compile(r"^([A-Za-z.\-]+):([0-9]+(?:\.[0-9]+)?)$")
+
+
+def _sins_label(m):
+    """Tier-aware sins label shared by the console table, PDF, and Markdown
+    outputs - e.g. '1 крит. / 1.5 из 6.1' instead of a flat 'N/11' count."""
+    return f"{len(m['critical_sins'])} крит. / {m['minor_score']:.1f} из {m['max_minor_score']:.1f}"
 
 
 def parse_holdings(args_list):
@@ -77,7 +82,7 @@ def print_table(results):
             f"{r['ticker']:<7}{r['weight']:>4.0f}% "
             f"${m['price']:<10.2f}${m['fair_value_share']:<10.2f}"
             f"{ou:+.1f}% ({label:<12}) "
-            f"{m['verdict']:<20}{len(m['sins'])}/{MAX_SINS}"
+            f"{m['verdict']:<20}{_sins_label(m)}"
         )
     print("=" * 100)
 
@@ -144,9 +149,9 @@ def build_comparative_pdf(results, name="Portfolio"):
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         rows.append([
             r["ticker"], w, f"${m['price']:,.2f}", f"${m['fair_value_share']:,.2f}",
-            ou_label, m["verdict"], f"{len(m['sins'])}/{MAX_SINS}",
+            ou_label, m["verdict"], _sins_label(m),
         ])
-    story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[42, 32, 55, 65, 130, 90, 40]))
+    story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[42, 32, 55, 65, 120, 70, 70]))
     story.append(Spacer(1, 10))
 
     if failed:
@@ -162,8 +167,9 @@ def build_comparative_pdf(results, name="Portfolio"):
             continue
         m = r["metrics"]
         if m["sins"]:
-            text = f"<b>{r['ticker']}</b>: " + "; ".join(m["sins"])
-            story.append(CalloutBox(text, USABLE_W, COLORS, callout_text, COLORS["danger"]))
+            text = f"<b>{r['ticker']}</b>: " + "; ".join(s.message for s in m["sins"])
+            box_color = COLORS["danger"] if m["critical_sins"] else COLORS["warning"]
+            story.append(CalloutBox(text, USABLE_W, COLORS, callout_text, box_color))
         else:
             story.append(CalloutBox(f"<b>{r['ticker']}</b>: грехов не обнаружено.", USABLE_W, COLORS, callout_text, COLORS["success"]))
         story.append(Spacer(1, 4))
@@ -198,7 +204,7 @@ def build_comparative_markdown(results, name="Portfolio"):
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         lines.append(
             f"| {r['ticker']} | {w} | ${m['price']:,.2f} | ${m['fair_value_share']:,.2f} | "
-            f"{ou_label} | {m['verdict']} | {len(m['sins'])}/{MAX_SINS} |"
+            f"{ou_label} | {m['verdict']} | {_sins_label(m)} |"
         )
     lines.append("")
 
@@ -216,7 +222,7 @@ def build_comparative_markdown(results, name="Portfolio"):
             continue
         m = r["metrics"]
         if m["sins"]:
-            lines.append(f"- **{r['ticker']}**: " + "; ".join(m["sins"]))
+            lines.append(f"- **{r['ticker']}**: " + "; ".join(s.message for s in m["sins"]))
         else:
             lines.append(f"- **{r['ticker']}**: грехов не обнаружено.")
     lines.append("")
