@@ -33,7 +33,7 @@ pip install yfinance pandas numpy matplotlib reportlab
 ## Одна компания
 
 ```bash
-python financial_analyzer.py MCD
+uv run python financial_analyzer.py MCD
 ```
 
 Скачивает отчётность MCD за последние 4 года, считает чеклист «грехов», DCF fair value,
@@ -49,14 +49,14 @@ python financial_analyzer.py MCD
   `DataUnavailableError` (exit code 1), а не молча нарисует PDF на демо-цифрах Apple.
 
 ```bash
-python financial_analyzer.py MCD --retries 8 --retry-delay 8   # больше попыток и пауза при нестабильном Yahoo
-python financial_analyzer.py MCD --allow-sample                # демо-режим, если реальные данные недоступны
+uv run python financial_analyzer.py MCD --retries 8 --retry-delay 8   # больше попыток и пауза при нестабильном Yahoo
+uv run python financial_analyzer.py MCD --allow-sample                # демо-режим, если реальные данные недоступны
 ```
 
 ## Список компаний / портфель
 
 ```bash
-python portfolio_analyzer.py TSM:14 SAP:13 FICO:12 RELX:12 BR:12 VEEV:10 YUMC:8 NKE:7 SPGI:7 ACN:5
+uv run python portfolio_analyzer.py TSM:14 SAP:13 FICO:12 RELX:12 BR:12 VEEV:10 YUMC:8 NKE:7 SPGI:7 ACN:5
 ```
 
 Формат каждого аргумента — `ТИКЕР:ВЕС`. Вес — просто подпись в отчёте (не обязан суммироваться
@@ -64,8 +64,8 @@ python portfolio_analyzer.py TSM:14 SAP:13 FICO:12 RELX:12 BR:12 VEEV:10 YUMC:8 
 `output/Portfolio_Comparative_Report.pdf` и `.md` с деталями по каждому тикеру.
 
 ```bash
-python portfolio_analyzer.py AAPL:50 MSFT:50 --name TechDuo   # → output/TechDuo_Comparative_Report.pdf
-python portfolio_analyzer.py TSM:100 --retries 8 --retry-delay 8
+uv run python portfolio_analyzer.py AAPL:50 MSFT:50 --name TechDuo   # → output/TechDuo_Comparative_Report.pdf
+uv run python portfolio_analyzer.py TSM:100 --retries 8 --retry-delay 8
 ```
 
 Если для какого-то тикера данные не пришли — он попадёт в таблицу как «нет данных», отчёт
