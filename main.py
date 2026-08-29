@@ -1,5 +1,5 @@
 def main():
-    print("Hello from prompt-script!")
+    print("Hello from fundamental-express!")
 
 
 if __name__ == "__main__":

@@ -919,7 +919,8 @@ def build_markdown_report(ticker, data, m):
 ---
 Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
 """
-    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report.md")
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.md")
     with open(md_filename, "w") as f:
         f.write(md)
     return md_filename
@@ -977,7 +978,8 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
         year_labels, fcf.values, proj_years, projected_fcfs, ticker
     )
 
-    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report.pdf")
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
 
     doc = BaseDocTemplate(
         pdf_filename,
@@ -1102,17 +1104,18 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False):
         )
     )
 
-    fund_headers = [f"Показатель (в млн. {trading_ccy})", year_labels[0], year_labels[1], year_labels[2], year_labels[3]]
+    last4 = range(len(year_labels) - 4, len(year_labels))
+    fund_headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
     fund_rows = [
-        ["Выручка (Revenue)"] + [f"{revenue.iloc[i] / 1e6:,.1f}" for i in range(4)],
-        ["Операционная прибыль (Operating Income)"] + [f"{operating_income.iloc[i] / 1e6:,.1f}" for i in range(4)],
-        ["Чистая прибыль (Net Income)"] + [f"{net_income.iloc[i] / 1e6:,.1f}" for i in range(4)],
-        ["Разводненная прибыль на акцию (EPS, USD)"] + [f"{eps.iloc[i]:.2f}" for i in range(4)],
-        ["Оборотные активы (Current Assets)"] + [f"{curr_assets.iloc[i] / 1e6:,.1f}" for i in range(4)],
-        ["Краткосрочные обязательства (Current Liab)"] + [f"{curr_liab.iloc[i] / 1e6:,.1f}" for i in range(4)],
-        ["Текущая ликвидность (Current Ratio)"] + [f"{curr_ratios.iloc[i]:.2f}" for i in range(4)],
-        ["Акционерный капитал (Shareholders Equity)"] + [f"{equity.iloc[i] / 1e6:,.1f}" for i in range(4)],
-        ["Чистый Свободный кэш (Free Cash Flow)"] + [f"{fcf.iloc[i] / 1e6:,.1f}" for i in range(4)],
+        ["Выручка (Revenue)"] + [f"{revenue.iloc[i] / 1e6:,.1f}" for i in last4],
+        ["Операционная прибыль (Operating Income)"] + [f"{operating_income.iloc[i] / 1e6:,.1f}" for i in last4],
+        ["Чистая прибыль (Net Income)"] + [f"{net_income.iloc[i] / 1e6:,.1f}" for i in last4],
+        ["Разводненная прибыль на акцию (EPS, USD)"] + [f"{eps.iloc[i]:.2f}" for i in last4],
+        ["Оборотные активы (Current Assets)"] + [f"{curr_assets.iloc[i] / 1e6:,.1f}" for i in last4],
+        ["Краткосрочные обязательства (Current Liab)"] + [f"{curr_liab.iloc[i] / 1e6:,.1f}" for i in last4],
+        ["Текущая ликвидность (Current Ratio)"] + [f"{curr_ratios.iloc[i]:.2f}" for i in last4],
+        ["Акционерный капитал (Shareholders Equity)"] + [f"{equity.iloc[i] / 1e6:,.1f}" for i in last4],
+        ["Чистый Свободный кэш (Free Cash Flow)"] + [f"{fcf.iloc[i] / 1e6:,.1f}" for i in last4],
     ]
 
     story.append(

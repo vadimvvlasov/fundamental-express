@@ -1,5 +1,6 @@
 import argparse
 import re
+from datetime import datetime
 
 from financial_analyzer import (
     COLORS,
@@ -82,7 +83,8 @@ def print_table(results):
 
 
 def build_comparative_pdf(results, name="Portfolio"):
-    pdf_path = f"{OUTPUT_DIR}/{name}_Comparative_Report.pdf"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    pdf_path = f"{OUTPUT_DIR}/{name}_Comparative_Report_{date_str}.pdf"
     doc = BaseDocTemplate(
         pdf_path, pagesize=PAGE_SIZE,
         leftMargin=MARGIN, rightMargin=MARGIN,
@@ -172,7 +174,8 @@ def build_comparative_pdf(results, name="Portfolio"):
 
 
 def build_comparative_markdown(results, name="Portfolio"):
-    md_path = f"{OUTPUT_DIR}/{name}_Comparative_Report.md"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    md_path = f"{OUTPUT_DIR}/{name}_Comparative_Report_{date_str}.md"
     lines = [
         f"# Сравнительный анализ портфеля: {name}",
         "",
