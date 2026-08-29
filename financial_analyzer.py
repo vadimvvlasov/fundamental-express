@@ -82,6 +82,20 @@ MINOR_SIN_WEIGHTS = {
 BUYBACK_BONUS_WEIGHT = -0.5
 MAX_MINOR_SCORE = sum(MINOR_SIN_WEIGHTS.values())
 
+# Ordinary v3 (Step 4, docs/spec/step4-ordinary-v3-implementation-spec.md
+# Section 2.1/2.2.1) - technical_negative_equity/technical_lt_insolvency are
+# the minor sins substituted in when the matching CRITICAL sin is smart-
+# bypassed for a buyback-distorted balance sheet. Deliberately kept OUT of
+# MINOR_SIN_WEIGHTS/MAX_MINOR_SCORE (same reasoning as BUYBACK_BONUS_WEIGHT
+# above): each is mutually exclusive with its own critical sin AND with the
+# corresponding "*_declining" minor sin (equity_declining only fires when
+# equity > 0; these only fire when equity <= 0 / lt-insolvent), so folding
+# them into the theoretical worst-case ceiling would overstate a combination
+# that can never actually occur - and it would silently break the existing
+# test asserting MAX_MINOR_SCORE == 8.1.
+TECHNICAL_NEGATIVE_EQUITY_WEIGHT = 1.0
+TECHNICAL_LT_INSOLVENCY_WEIGHT = 1.0
+
 # ── DESIGN PALETTE (Corporate Slate & Teal Archetype) ──────────────────
 COLORS = {
     "heading": HexColor("#1E293B"),  # Deep Slate - titles & sections
@@ -646,6 +660,20 @@ def compute_metrics(data, required_return=None):
     current_debt = find_row(
         df_bal, ["current debt", "short term debt", "short long term debt"], default_val=float("nan")
     )
+    # Ordinary v3 (Step 4, spec Section 2.2 Scenario 2 / 2.3): Interest
+    # Expense for the Interest Coverage Ratio proxy (replaces an external
+    # credit rating - yfinance.info has no such field for ~all tickers,
+    # live-verified against MCD/AAPL), and dividend history for the DDM
+    # switch. Missing rows default to NaN, never 0.0 - a genuinely
+    # interest-free company is handled explicitly below (auto-pass on the
+    # ICR check), never conflated with "row not found".
+    interest_expense = find_row(
+        df_fin, ["interest expense", "interest expense non operating"], default_val=float("nan")
+    )
+    cash_dividends_paid = find_row(
+        df_cf, ["cash dividends paid", "common stock dividend paid", "payment of dividends"],
+        default_val=float("nan"),
+    )
 
     # Convert monetary rows to the trading currency (e.g. TWD -> USD for TSM's
     # ADR) so they're comparable to price/shares, which are always quoted in
@@ -673,6 +701,8 @@ def compute_metrics(data, required_return=None):
         lease_liabilities = lease_liabilities * fx_rate
         total_debt_incl_leases = total_debt_incl_leases * fx_rate
         current_debt = current_debt * fx_rate
+        interest_expense = interest_expense * fx_rate
+        cash_dividends_paid = cash_dividends_paid * fx_rate
 
     curr_ratios = curr_assets / curr_liab
     net_margin = net_income / revenue * 100
@@ -691,35 +721,127 @@ def compute_metrics(data, required_return=None):
     long_term_assets_adj = (total_assets - curr_assets) - goodwill
     long_term_liab = (total_liab - curr_liab) if not total_liab.isna().all() else None
 
+    # Net debt - moved ahead of the sins checklist (Ordinary v3, Step 4):
+    # the Current Ratio smart-bypass Scenario 2 needs it for the Net Debt /
+    # Operating Income leverage check. Formula/values are unchanged from
+    # the original DCF-section placement, just computed earlier so both
+    # the checklist and the DCF valuation below can reuse the same numbers.
+    latest_debt = debt.iloc[-1]
+    if pd.isna(latest_debt) or latest_debt < 0:
+        latest_debt = 0.0
+    latest_cash = cash.iloc[-1] if not pd.isna(cash.iloc[-1]) else 0.0
+    latest_net_debt_reported = (
+        net_debt_reported.iloc[-1] if len(net_debt_reported) else float("nan")
+    )
+    latest_lease_liabilities = (
+        lease_liabilities.iloc[-1] if len(lease_liabilities) else float("nan")
+    )
+    latest_total_debt_incl_leases = (
+        total_debt_incl_leases.iloc[-1] if len(total_debt_incl_leases) else float("nan")
+    )
+    if not pd.isna(latest_net_debt_reported):
+        # Use Yahoo Finance's own "Net Debt" line as-is - we never claim
+        # it equals our own interest-bearing-debt-minus-cash figure, since
+        # Yahoo's own methodology for that field isn't something we control
+        # or can fully audit. We just report it as its own source.
+        net_debt = latest_net_debt_reported
+        net_debt_source = "reported"
+    else:
+        net_debt = latest_debt - latest_cash
+        net_debt_source = "computed"
+
     # ── "Sins" checklist (express algorithm from the lecture, two-tier) ──
     sins = []
 
     latest_fcf = fcf.iloc[-1]
     latest_cr = curr_ratios.iloc[-1]
+    # Ordinary v3 (Step 4, spec Section 2.1/2.2.1): a stable, mature company
+    # can show negative book equity or "long-term insolvency" purely from
+    # decades of buybacks (Treasury Stock), not operating distress. Both
+    # the equity_negative and lt_insolvency critical sins below check this
+    # SAME three-condition proof before being smart-bypassed to a minor sin
+    # instead: positive Operating Income and FCF in every available year
+    # (up to 4), plus an actively shrinking share count (proof of buyback,
+    # not just an assertion).
+    buyback_distortion_bypass = (
+        len(operating_income) > 0 and bool((operating_income > 0).all())
+        and len(fcf) > 0 and bool((fcf > 0).all())
+        and not diluted_shares.isna().any()
+        and len(diluted_shares) >= 2
+        and diluted_shares.iloc[-1] < diluted_shares.iloc[-2]
+    )
     # Smart bypass: a Current Ratio below 1.0 driven by, say, deferred revenue
     # or accounts payable isn't the same red flag as an inability to service
-    # actual near-term debt. If the company is FCF-positive and its cash
-    # alone covers short-term debt, downgrade this from critical to a minor
-    # sin instead of an automatic SKIP. Never granted on missing current_debt
-    # data - leniency requires proof, not the absence of a red flag.
-    cr_bypass_eligible = (
+    # actual near-term debt. Two independent scenarios grant leniency
+    # (Ordinary v3, Step 4 Section 2.2 adds Scenario 2 alongside the
+    # original Scenario 1) - either is sufficient on its own:
+    #   Scenario 1: FCF-positive and cash alone covers short-term debt.
+    #     Never granted on missing current_debt data - leniency requires
+    #     proof, not the absence of a red flag.
+    #   Scenario 2: FCF-positive, overall leverage is safe (Net Debt /
+    #     Operating Income < 4.0 - the 3.0 spec default is raised to 4.0
+    #     since Operating Income/EBIT proxies EBITDA and over-penalizes
+    #     capital-intensive real-estate-heavy businesses), and interest
+    #     coverage is strong (Operating Income / Interest Expense > 4.0 -
+    #     an objective proxy for investment-grade debt, since yfinance.info
+    #     carries no credit-rating field for virtually any ticker). A
+    #     company with no interest-bearing debt at all (Interest Expense
+    #     missing/0/NaN) auto-passes the coverage leg - silence there is
+    #     never treated as a red flag. Requires a genuine net debt balance
+    #     (net_debt > 0): a net-CASH company isn't what this leverage-grade
+    #     scenario is for, and it belongs to Scenario 1's territory instead
+    #     if it wants credit for having more cash than short-term debt.
+    cr_bypass_scenario1 = (
         latest_cr < 1.0
         and latest_fcf > 0
         and not pd.isna(current_debt.iloc[-1])
         and not pd.isna(cash.iloc[-1])
         and cash.iloc[-1] > current_debt.iloc[-1]
     )
+    latest_op_inc = operating_income.iloc[-1]
+    latest_interest_expense = interest_expense.iloc[-1] if len(interest_expense) else float("nan")
+    icr_ok = (
+        pd.isna(latest_interest_expense)
+        or latest_interest_expense == 0
+        or (latest_op_inc / latest_interest_expense) > 4.0
+    )
+    cr_bypass_scenario2 = (
+        latest_cr < 1.0
+        and latest_fcf > 0
+        and latest_op_inc > 0
+        and not pd.isna(net_debt)
+        and net_debt > 0
+        and (net_debt / latest_op_inc) < 4.0
+        and icr_ok
+    )
+    cr_bypass_eligible = cr_bypass_scenario1 or cr_bypass_scenario2
     if latest_cr < 1.0 and not cr_bypass_eligible:
         sins.append(Sin(
             "cr_below_1", "critical", 0.0,
             f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f}).",
         ))
     elif latest_cr < 1.0 and cr_bypass_eligible:
+        reasons = []
+        if cr_bypass_scenario1:
+            reasons.append(
+                f"FCF положительный ({latest_fcf / 1e6:,.0f} млн) и денежные средства "
+                f"({cash.iloc[-1] / 1e6:,.0f} млн) превышают краткосрочный долг "
+                f"({current_debt.iloc[-1] / 1e6:,.0f} млн)"
+            )
+        if cr_bypass_scenario2:
+            icr_txt = (
+                "∞ (процентного долга нет)"
+                if pd.isna(latest_interest_expense) or latest_interest_expense == 0
+                else f"{latest_op_inc / latest_interest_expense:.2f}"
+            )
+            reasons.append(
+                f"безопасный уровень долговой нагрузки (Net Debt / Operating Income = "
+                f"{net_debt / latest_op_inc:.2f}, < 4.0) при сильном покрытии процентов "
+                f"(Interest Coverage Ratio = {icr_txt}, > 4.0)"
+            )
         sins.append(Sin(
             "cr_below_1_bypassed", "minor", MINOR_SIN_WEIGHTS["cr_below_1_bypassed"],
-            f"Ликвидность ниже 1.0 ({latest_cr:.2f}), но не критична: FCF положительный "
-            f"({latest_fcf / 1e6:,.0f} млн) и денежные средства ({cash.iloc[-1] / 1e6:,.0f} млн) "
-            f"превышают краткосрочный долг ({current_debt.iloc[-1] / 1e6:,.0f} млн).",
+            f"Ликвидность ниже 1.0 ({latest_cr:.2f}), но не критична: " + "; ".join(reasons) + ".",
         ))
     # A CR decline is only flagged if the company also isn't comfortably
     # liquid (CR >= 2.0) after the decline - dropping from, say, 4.0 to 3.0
@@ -740,7 +862,17 @@ def compute_metrics(data, required_return=None):
     if long_term_liab is not None:
         latest_lt_assets = long_term_assets_adj.iloc[-1]
         latest_lt_liab = long_term_liab.iloc[-1]
-        if latest_lt_assets < latest_lt_liab:
+        if latest_lt_assets < latest_lt_liab and buyback_distortion_bypass:
+            # Ordinary v3 (Step 4, Section 2.2.1): same buyback-distortion
+            # story as equity_negative below - book long-term assets fall
+            # under liabilities purely from accumulated Treasury Stock, not
+            # from operating distress (proven by the same 3 conditions).
+            sins.append(Sin(
+                "technical_lt_insolvency", "minor", TECHNICAL_LT_INSOLVENCY_WEIGHT,
+                "Техническая долгосрочная неплатежеспособность в результате активного выкупа акций "
+                "(Buyback) при сильной операционной рентабельности.",
+            ))
+        elif latest_lt_assets < latest_lt_liab:
             sins.append(Sin(
                 "lt_insolvency", "critical", 0.0,
                 f"Долгосрочная неплатёжеспособность: скорректированные (за вычетом Goodwill) "
@@ -749,7 +881,17 @@ def compute_metrics(data, required_return=None):
             ))
 
     latest_equity = equity.iloc[-1]
-    if latest_equity <= 0:
+    if latest_equity <= 0 and buyback_distortion_bypass:
+        # Ordinary v3 (Step 4, Section 2.1): negative book equity purely
+        # from decades of buybacks (Treasury Stock), not operating losses -
+        # proven by positive Operating Income/FCF every available year plus
+        # an actively shrinking share count (buyback_distortion_bypass).
+        sins.append(Sin(
+            "technical_negative_equity", "minor", TECHNICAL_NEGATIVE_EQUITY_WEIGHT,
+            "Технический отрицательный капитал в результате активного выкупа акций (Buyback) при "
+            "стабильно сильных операционных и денежных результатах.",
+        ))
+    elif latest_equity <= 0:
         sins.append(Sin(
             "equity_negative", "critical", 0.0,
             "Отрицательный акционерный капитал: обязательств больше, чем реальных активов.",
@@ -871,10 +1013,9 @@ def compute_metrics(data, required_return=None):
     tax_rate = 0.21
     after_tax_debt = cost_of_debt * (1 - tax_rate)
 
-    latest_debt = debt.iloc[-1]
-    if pd.isna(latest_debt) or latest_debt < 0:
-        latest_debt = 0.0
-
+    # latest_debt/net_debt (and its cash/lease/reported-vs-computed
+    # breakdown) are computed earlier now, ahead of the sins checklist -
+    # see the "Net debt - moved ahead..." comment above.
     market_cap = price * shares
     total_cap = market_cap + latest_debt
     if total_cap > 0:
@@ -906,26 +1047,6 @@ def compute_metrics(data, required_return=None):
     pv_terminal_val = terminal_val / ((1 + wacc) ** 5)
 
     enterprise_value = sum_pv_fcfs + pv_terminal_val
-    latest_cash = cash.iloc[-1] if not pd.isna(cash.iloc[-1]) else 0.0
-    latest_net_debt_reported = (
-        net_debt_reported.iloc[-1] if len(net_debt_reported) else float("nan")
-    )
-    latest_lease_liabilities = (
-        lease_liabilities.iloc[-1] if len(lease_liabilities) else float("nan")
-    )
-    latest_total_debt_incl_leases = (
-        total_debt_incl_leases.iloc[-1] if len(total_debt_incl_leases) else float("nan")
-    )
-    if not pd.isna(latest_net_debt_reported):
-        # Use Yahoo Finance's own "Net Debt" line as-is - we never claim
-        # it equals our own interest-bearing-debt-minus-cash figure, since
-        # Yahoo's own methodology for that field isn't something we control
-        # or can fully audit. We just report it as its own source.
-        net_debt = latest_net_debt_reported
-        net_debt_source = "reported"
-    else:
-        net_debt = latest_debt - latest_cash
-        net_debt_source = "computed"
     equity_value = enterprise_value - net_debt
     fair_value_share = equity_value / shares if shares > 0 else 0.0
 
@@ -939,6 +1060,63 @@ def compute_metrics(data, required_return=None):
     else:
         val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
         val_color_key = "warning"
+
+    # ── Ordinary v3 (Step 4, spec Section 2.3): auto-switch DCF -> DDM ───
+    # A dividend-paying company with a distorted capital structure (equity
+    # <= 0, or leveraged past D/E 200%) gets a FCF-DCF fair value that's
+    # artificially depressed by lease/debt obligations swallowing the WACC.
+    # For that specific combination, switch to discounting the dividend
+    # stream instead - overrides fair_value_share/over_under/val_status/
+    # val_color_key in place so every existing consumer (portfolio_analyzer,
+    # build_markdown_report, build_pdf_report) keeps reading the same keys
+    # transparently; valuation_model tells the report renderers which
+    # section to draw. Never triggers without diluted_shares data (no
+    # fabricated near-zero DPS from a missing share count).
+    valuation_model = "DCF"
+    cagr_div = None
+    dps_last = None
+    info = data.get("info") or {}
+    dividend_yield = info.get("dividendYield") or 0.0
+    dividend_rate = info.get("dividendRate") or 0.0
+    pays_dividends = dividend_yield > 0 or dividend_rate > 0
+    debt_to_equity_ratio = (
+        latest_debt / latest_equity if latest_equity > 0 and not pd.isna(latest_debt) else None
+    )
+    capital_distorted = latest_equity <= 0 or (debt_to_equity_ratio is not None and debt_to_equity_ratio > 2.0)
+    use_ddm = pays_dividends and capital_distorted and not diluted_shares.isna().all()
+
+    if use_ddm:
+        dps_series = (cash_dividends_paid.abs() / diluted_shares).dropna()
+        dps_window = dps_series.iloc[-4:] if len(dps_series) >= 2 else dps_series
+        if len(dps_window) < 2 or dps_window.iloc[0] <= 0 or dps_window.iloc[-1] <= 0:
+            cagr_div = 0.05
+        else:
+            n_periods = len(dps_window) - 1
+            cagr_div = (dps_window.iloc[-1] / dps_window.iloc[0]) ** (1.0 / n_periods) - 1
+            cagr_div = max(0.02, min(0.10, cagr_div))
+        dps_last = dps_window.iloc[-1] if len(dps_window) else 0.0
+
+        ddm_proj_dps = [dps_last * ((1 + cagr_div) ** t) for t in proj_years]
+        ddm_pv_dividends = [ddm_proj_dps[t - 1] / ((1 + cost_of_equity) ** t) for t in proj_years]
+        ddm_sum_pv = sum(ddm_pv_dividends)
+        ddm_terminal_val = (
+            ddm_proj_dps[-1] * (1 + terminal_g) / (cost_of_equity - terminal_g)
+            if cost_of_equity > terminal_g else 0.0
+        )
+        ddm_pv_terminal = ddm_terminal_val / ((1 + cost_of_equity) ** 5)
+
+        valuation_model = "DDM"
+        fair_value_share = ddm_sum_pv + ddm_pv_terminal
+        over_under = (fair_value_share - price) / price * 100 if price else 0.0
+        if over_under > 10.0:
+            val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
+            val_color_key = "success"
+        elif over_under < -10.0:
+            val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
+            val_color_key = "danger"
+        else:
+            val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
+            val_color_key = "warning"
 
     wacc_variations = [wacc - 0.015, wacc - 0.0075, wacc, wacc + 0.0075, wacc + 0.015]
     growth_variations = [cagr - 0.02, cagr - 0.01, cagr, cagr + 0.01, cagr + 0.02]
@@ -1011,6 +1189,11 @@ def compute_metrics(data, required_return=None):
         "sensitivity_rows": sensitivity_rows,
         "current_ratio": float(latest_cr),
         "net_margin_pct": float(net_margin.iloc[-1]) if not pd.isna(net_margin.iloc[-1]) else None,
+        # Ordinary v3 (Step 4): "DCF" unless the auto-switch above fired.
+        "valuation_model": valuation_model,
+        "cagr_div": cagr_div,
+        "dps_last": dps_last,
+        "debt_to_equity_ratio": debt_to_equity_ratio,
     }
 
 
@@ -2026,6 +2209,52 @@ def build_markdown_report(
         else f"Ke = Rf + β×ERP = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%"
     )
 
+    # Ordinary v3 (Step 4): a dividend-paying company with a distorted
+    # capital structure (equity<=0 or D/E>200%) gets valued by DDM instead
+    # of DCF - see compute_metrics()'s "Ordinary v3" section. m["fair_value_share"]/
+    # over_under_pct/val_status already reflect whichever model ran; only the
+    # disclosure text below needs to branch, since the DCF-only concepts
+    # (WACC, Enterprise Value, sensitivity matrix) don't apply to DDM.
+    if m.get("valuation_model") == "DDM":
+        section3_md = f"""## 3. Оценка справедливой стоимости (Модель DDM)
+
+⚠️ **Внимание:** Применена модель дисконтирования дивидендов (DDM) вместо классического DCF - у компании искажена структура капитала (отрицательный или "перегруженный" долгом акционерный капитал) на фоне стабильной истории дивидендных выплат. Классический FCF-DCF в этом случае занижает стоимость (лизинговые/долговые обязательства искажают WACC).
+
+- {ke_disclosure}
+- Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%): {m['cagr_div'] * 100:.2f}%
+- DPS последнего года (Dividends Paid / Diluted Shares): {m['dps_last']:.2f} {trading_ccy}
+- Терминальный темп роста (Gordon Growth): 2.5%
+
+**Справедливая стоимость по DDM: {m['fair_value_share']:.2f} {trading_ccy}**
+Текущая рыночная цена: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+"""
+    else:
+        section3_md = f"""## 3. Модель дисконтирования денежных потоков (DCF)
+
+- Стоимость собственного капитала: {ke_disclosure}
+- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m['cost_of_debt_after_tax'] * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
+- Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m['equity_weight'] * 100:.1f}%, D/(D+E) = {m['debt_weight'] * 100:.1f}%
+- **WACC:** {m['equity_weight'] * 100:.1f}%×{m['cost_of_equity'] * 100:.2f}% + {m['debt_weight'] * 100:.1f}%×{m['cost_of_debt_after_tax'] * 100:.2f}% = **{m['wacc'] * 100:.2f}%**
+- CAGR роста FCF: {m['cagr'] * 100:.2f}% (историческая, ограничена 2-15%)
+- Терминальный темп роста: 2.5%
+
+{debt_block}
+
+> {LEASE_ASSUMPTION_NOTE}
+
+- Enterprise Value: {m['enterprise_value'] / 1e9:,.2f} млрд. {trading_ccy}
+- Equity Value: {m['equity_value'] / 1e9:,.2f} млрд. {trading_ccy}
+
+**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
+Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+
+### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на 2.5% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
+
+{sens_header}
+{sens_sep}
+{sens_rows}
+"""
+
     md = f"""{sector_warning_line}# Фундаментальный анализ & оценка DCF: {ticker.upper()}
 
 Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
@@ -2056,31 +2285,7 @@ def build_markdown_report(
 {row("Акционерный капитал", [v / 1e6 for v in m["equity"]])}
 {row("Free Cash Flow", [v / 1e6 for v in m["fcf"]])}
 
-## 3. Модель дисконтирования денежных потоков (DCF)
-
-- Стоимость собственного капитала: {ke_disclosure}
-- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m['cost_of_debt_after_tax'] * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
-- Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m['equity_weight'] * 100:.1f}%, D/(D+E) = {m['debt_weight'] * 100:.1f}%
-- **WACC:** {m['equity_weight'] * 100:.1f}%×{m['cost_of_equity'] * 100:.2f}% + {m['debt_weight'] * 100:.1f}%×{m['cost_of_debt_after_tax'] * 100:.2f}% = **{m['wacc'] * 100:.2f}%**
-- CAGR роста FCF: {m['cagr'] * 100:.2f}% (историческая, ограничена 2-15%)
-- Терминальный темп роста: 2.5%
-
-{debt_block}
-
-> {LEASE_ASSUMPTION_NOTE}
-
-- Enterprise Value: {m['enterprise_value'] / 1e9:,.2f} млрд. {trading_ccy}
-- Equity Value: {m['equity_value'] / 1e9:,.2f} млрд. {trading_ccy}
-
-**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
-
-### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на 2.5% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
-
-{sens_header}
-{sens_sep}
-{sens_rows}
-
+{section3_md}
 ## 4. Форвардные мультипликаторы и консенсус-прогноз
 
 > Раздел носит справочный характер и не влияет на балл экспресс-чеклиста из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную на экстраполяции исторических 4 лет.
@@ -2329,78 +2534,120 @@ def build_pdf_report(
     story.append(Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4))
     story.append(Spacer(1, 12))
 
-    # ── SECTION 3: DCF DETAILED MODEL ───────────────────────────────────
-    story.append(Paragraph("3. Модель дисконтирования денежных потоков (DCF)", h1_style))
-    story.append(
-        Paragraph(
-            "Расчет справедливой стоимости на основе темпов роста FCF и средневзвешенной стоимости капитала (WACC):",
-            body_style,
+    # ── SECTION 3: FAIR VALUE (DCF, or DDM for Ordinary v3 - Step 4) ─────
+    # See build_markdown_report()'s twin branch and compute_metrics()'s
+    # "Ordinary v3" section for why/when DDM replaces DCF here - m["fair_
+    # value_share"]/val_status already reflect whichever model ran.
+    if m.get("valuation_model") == "DDM":
+        story.append(Paragraph("3. Оценка справедливой стоимости (Модель DDM)", h1_style))
+        story.append(
+            Paragraph(
+                "⚠️ Применена модель дисконтирования дивидендов (DDM) вместо классического DCF - у компании "
+                "искажена структура капитала (отрицательный или «перегруженный» долгом акционерный капитал) на фоне "
+                "стабильной истории дивидендных выплат. Классический FCF-DCF в этом случае занижает стоимость "
+                "(лизинговые/долговые обязательства искажают WACC).",
+                body_style,
+            )
         )
-    )
-
-    debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in debt_lines)
-    ke_disclosure = (
-        f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
-        if m["required_return_used"]
-        else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
-    )
-    dcf_info_text = (
-        f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
-        f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {cost_of_debt_after_tax * 100:.2f}% "
-        f"(Kd=4.5%, T=21% — фиксированные допущения методики, не эффективная налоговая ставка компании)<br/>"
-        f"• <b>Веса структуры капитала:</b> E/(D+E) = {equity_weight * 100:.1f}%, D/(D+E) = {debt_weight * 100:.1f}% "
-        f"(по рыночной капитализации, не по балансовому капиталу — у компаний с отрицательным book equity вес по балансу был бы недействителен)<br/>"
-        f"• <b>Итоговый WACC:</b> {equity_weight * 100:.1f}%×{cost_of_equity * 100:.2f}% + {debt_weight * 100:.1f}%×{cost_of_debt_after_tax * 100:.2f}% = <b>{wacc * 100:.2f}%</b><br/>"
-        f"• <b>Расчетный CAGR роста потока:</b> {cagr * 100:.2f}% (среднеисторический темп роста, ограничен консервативной границей)<br/>"
-        f"• <b>Терминальный темп роста:</b> 2.5% (пожизненный темп роста компании в постпрогнозный период)<br/>"
-        f"{debt_html}<br/>"
-        f"• <b>Справедливая оценка акционерного капитала:</b> {equity_value / 1e9:,.2f} млрд. {trading_ccy} (Enterprise Value = {enterprise_value / 1e9:,.2f} млрд. {trading_ccy})<br/>"
-    )
-    story.append(CalloutBox(dcf_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
-    story.append(CalloutBox(LEASE_ASSUMPTION_NOTE, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
-    story.append(Spacer(1, 8))
-
-    val_banner_text = (
-        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {fair_value_share:.2f} {trading_ccy}</b><br/>"
-        f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
-        f"| Статус: <font color='{val_color.hexval()}'><b>{val_status}</b></font>"
-    )
-    story.append(
-        CalloutBox(
-            val_banner_text, USABLE_W, COLORS,
-            ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
-            val_color,
+        ke_disclosure = (
+            f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
+            if m["required_return_used"]
+            else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
         )
-    )
-    story.append(Spacer(1, 10))
-
-    proj_headers = ["Прогнозный показатель", "Год 1", "Год 2", "Год 3", "Год 4", "Год 5"]
-    proj_rows = [
-        ["Прогнозный FCF (млн. USD)"] + [f"{v / 1e6:,.1f}" for v in projected_fcfs],
-        ["Дисконтированный FCF (PV, млн.)"] + [f"{v / 1e6:,.1f}" for v in pv_fcfs],
-    ]
-    story.append(
-        create_reportlab_table(proj_headers, proj_rows, styles, COLORS, col_widths=[170, 60, 60, 60, 60, 60])
-    )
-    story.append(Spacer(1, 12))
-
-    story.append(
-        Paragraph(
-            "<b>Матрица чувствительности цены акции (WACC vs Рост g):</b>",
-            ParagraphStyle("SensT", fontName=FONT_BOLD, fontSize=9.5, textColor=COLORS["heading"], spaceAfter=4),
+        ddm_info_text = (
+            f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
+            f"• <b>Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%):</b> {m['cagr_div'] * 100:.2f}%<br/>"
+            f"• <b>DPS последнего года (Dividends Paid / Diluted Shares):</b> {m['dps_last']:.2f} {trading_ccy}<br/>"
+            f"• <b>Терминальный темп роста (Gordon Growth):</b> 2.5%<br/>"
         )
-    )
-    story.append(
-        Paragraph(
-            "Таблица показывает, как меняется внутренняя стоимость одной акции при изменении ставки дисконтирования и темпов роста FCF. Позволяет оценить диапазон цен при различных сценариях развития рынка. "
-            "<b>Важно:</b> g в этой матрице — темп роста явного 5-летнего прогноза FCF, а не терминальный рост. "
-            "Терминальный рост зафиксирован отдельно на 2.5% и используется только в формуле Гордона для стоимости после 5-го года — "
-            "условие WACC &gt; g в этой матрице не требуется, оно требуется только для WACC &gt; терминальный рост (2.5%), что и проверяется отдельно.",
-            body_style,
+        story.append(CalloutBox(ddm_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
+        story.append(Spacer(1, 8))
+
+        val_banner_text = (
+            f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ ПО DDM: {fair_value_share:.2f} {trading_ccy}</b><br/>"
+            f"Текущая рыночная цена: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
+            f"| Статус: <font color='{val_color.hexval()}'><b>{val_status}</b></font>"
         )
-    )
-    story.append(create_reportlab_table(sensitivity_headers, sensitivity_rows, styles, COLORS))
-    story.append(Spacer(1, 12))
+        story.append(
+            CalloutBox(
+                val_banner_text, USABLE_W, COLORS,
+                ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
+                val_color,
+            )
+        )
+        story.append(Spacer(1, 12))
+    else:
+        story.append(Paragraph("3. Модель дисконтирования денежных потоков (DCF)", h1_style))
+        story.append(
+            Paragraph(
+                "Расчет справедливой стоимости на основе темпов роста FCF и средневзвешенной стоимости капитала (WACC):",
+                body_style,
+            )
+        )
+
+        debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in debt_lines)
+        ke_disclosure = (
+            f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
+            if m["required_return_used"]
+            else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
+        )
+        dcf_info_text = (
+            f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
+            f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {cost_of_debt_after_tax * 100:.2f}% "
+            f"(Kd=4.5%, T=21% — фиксированные допущения методики, не эффективная налоговая ставка компании)<br/>"
+            f"• <b>Веса структуры капитала:</b> E/(D+E) = {equity_weight * 100:.1f}%, D/(D+E) = {debt_weight * 100:.1f}% "
+            f"(по рыночной капитализации, не по балансовому капиталу — у компаний с отрицательным book equity вес по балансу был бы недействителен)<br/>"
+            f"• <b>Итоговый WACC:</b> {equity_weight * 100:.1f}%×{cost_of_equity * 100:.2f}% + {debt_weight * 100:.1f}%×{cost_of_debt_after_tax * 100:.2f}% = <b>{wacc * 100:.2f}%</b><br/>"
+            f"• <b>Расчетный CAGR роста потока:</b> {cagr * 100:.2f}% (среднеисторический темп роста, ограничен консервативной границей)<br/>"
+            f"• <b>Терминальный темп роста:</b> 2.5% (пожизненный темп роста компании в постпрогнозный период)<br/>"
+            f"{debt_html}<br/>"
+            f"• <b>Справедливая оценка акционерного капитала:</b> {equity_value / 1e9:,.2f} млрд. {trading_ccy} (Enterprise Value = {enterprise_value / 1e9:,.2f} млрд. {trading_ccy})<br/>"
+        )
+        story.append(CalloutBox(dcf_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
+        story.append(CalloutBox(LEASE_ASSUMPTION_NOTE, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
+        story.append(Spacer(1, 8))
+
+        val_banner_text = (
+            f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {fair_value_share:.2f} {trading_ccy}</b><br/>"
+            f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
+            f"| Статус: <font color='{val_color.hexval()}'><b>{val_status}</b></font>"
+        )
+        story.append(
+            CalloutBox(
+                val_banner_text, USABLE_W, COLORS,
+                ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
+                val_color,
+            )
+        )
+        story.append(Spacer(1, 10))
+
+        proj_headers = ["Прогнозный показатель", "Год 1", "Год 2", "Год 3", "Год 4", "Год 5"]
+        proj_rows = [
+            ["Прогнозный FCF (млн. USD)"] + [f"{v / 1e6:,.1f}" for v in projected_fcfs],
+            ["Дисконтированный FCF (PV, млн.)"] + [f"{v / 1e6:,.1f}" for v in pv_fcfs],
+        ]
+        story.append(
+            create_reportlab_table(proj_headers, proj_rows, styles, COLORS, col_widths=[170, 60, 60, 60, 60, 60])
+        )
+        story.append(Spacer(1, 12))
+
+        story.append(
+            Paragraph(
+                "<b>Матрица чувствительности цены акции (WACC vs Рост g):</b>",
+                ParagraphStyle("SensT", fontName=FONT_BOLD, fontSize=9.5, textColor=COLORS["heading"], spaceAfter=4),
+            )
+        )
+        story.append(
+            Paragraph(
+                "Таблица показывает, как меняется внутренняя стоимость одной акции при изменении ставки дисконтирования и темпов роста FCF. Позволяет оценить диапазон цен при различных сценариях развития рынка. "
+                "<b>Важно:</b> g в этой матрице — темп роста явного 5-летнего прогноза FCF, а не терминальный рост. "
+                "Терминальный рост зафиксирован отдельно на 2.5% и используется только в формуле Гордона для стоимости после 5-го года — "
+                "условие WACC &gt; g в этой матрице не требуется, оно требуется только для WACC &gt; терминальный рост (2.5%), что и проверяется отдельно.",
+                body_style,
+            )
+        )
+        story.append(create_reportlab_table(sensitivity_headers, sensitivity_rows, styles, COLORS))
+        story.append(Spacer(1, 12))
 
     # ── SECTION 4: FORWARD OUTLOOK ──────────────────────────────────────
     story.append(Paragraph("4. Форвардные мультипликаторы и консенсус-прогноз", h1_style))
