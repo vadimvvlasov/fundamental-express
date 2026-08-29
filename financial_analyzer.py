@@ -69,12 +69,17 @@ MINOR_SIN_WEIGHTS = {
     "fcf_declining": 1.0,
     "revenue_declining": 1.0,
     "operating_income_declining": 1.0,
+    "dilution": 1.0,
+    "cr_below_1_bypassed": 1.0,
     "cr_declining": 0.5,
     "gross_margin_declining": 0.5,
     "operating_margin_declining": 0.5,
     "net_income_declining": 0.3,
     "net_margin_declining": 0.3,
 }
+# Buyback bonus is a reduction, not a badness ceiling - deliberately excluded
+# from MAX_MINOR_SCORE (which sums only the positive weights above).
+BUYBACK_BONUS_WEIGHT = -0.5
 MAX_MINOR_SCORE = sum(MINOR_SIN_WEIGHTS.values())
 
 # ── DESIGN PALETTE (Corporate Slate & Teal Archetype) ──────────────────
@@ -570,12 +575,16 @@ def generate_fcf_chart(years, hist_fcf, proj_years, proj_fcf, ticker):
 
 
 # ── CORE ANALYSIS: EXPRESS "SINS" CHECKLIST + DCF ───────────────────────
-def compute_metrics(data):
+def compute_metrics(data, required_return=None):
     """Run the express sins-checklist and the CAPM/DCF valuation on `data`.
 
     This is the single source of truth for both the per-company PDF report
     and the multi-company comparative tool - the two must never compute
     this differently.
+
+    `required_return`, if given, overrides the CAPM-derived cost of equity
+    (Ke) with the investor's own required rate of return - see
+    docs/spec/step1-ordinary-router-implementation-spec.md Section 2.4.
     """
     df_fin = data["financials"]
     df_bal = data["balance"]
@@ -631,6 +640,21 @@ def compute_metrics(data):
 
     fcf = find_row(df_cf, ["free cash flow", "fcf"])
 
+    # Diluted share count (income statement, historical per-year) - used for
+    # the Dilution/Buyback sins. This is a share COUNT, not a monetary
+    # figure, so it's never FX-converted below (unlike current_debt).
+    diluted_shares = find_row(
+        df_fin, ["diluted average shares", "basic average shares"], default_val=float("nan")
+    )
+    # Short-term interest-bearing debt (the portion due within a year) - used
+    # only by the Current Ratio smart-bypass (Section 2.3): if a company's
+    # cash comfortably covers this, a CR < 1.0 driven by non-debt current
+    # liabilities is a much smaller red flag than an inability to service
+    # near-term debt.
+    current_debt = find_row(
+        df_bal, ["current debt", "short term debt", "short long term debt"], default_val=float("nan")
+    )
+
     # Convert monetary rows to the trading currency (e.g. TWD -> USD for TSM's
     # ADR) so they're comparable to price/shares, which are always quoted in
     # the trading currency. Ratio-based figures (current ratio, margins, share
@@ -656,6 +680,7 @@ def compute_metrics(data):
         net_debt_reported = net_debt_reported * fx_rate
         lease_liabilities = lease_liabilities * fx_rate
         total_debt_incl_leases = total_debt_incl_leases * fx_rate
+        current_debt = current_debt * fx_rate
 
     curr_ratios = curr_assets / curr_liab
     net_margin = net_income / revenue * 100
@@ -677,18 +702,39 @@ def compute_metrics(data):
     # ── "Sins" checklist (express algorithm from the lecture, two-tier) ──
     sins = []
 
+    latest_fcf = fcf.iloc[-1]
     latest_cr = curr_ratios.iloc[-1]
-    if latest_cr < 1.0:
+    # Smart bypass: a Current Ratio below 1.0 driven by, say, deferred revenue
+    # or accounts payable isn't the same red flag as an inability to service
+    # actual near-term debt. If the company is FCF-positive and its cash
+    # alone covers short-term debt, downgrade this from critical to a minor
+    # sin instead of an automatic SKIP. Never granted on missing current_debt
+    # data - leniency requires proof, not the absence of a red flag.
+    cr_bypass_eligible = (
+        latest_cr < 1.0
+        and latest_fcf > 0
+        and not pd.isna(current_debt.iloc[-1])
+        and not pd.isna(cash.iloc[-1])
+        and cash.iloc[-1] > current_debt.iloc[-1]
+    )
+    if latest_cr < 1.0 and not cr_bypass_eligible:
         sins.append(Sin(
             "cr_below_1", "critical", 0.0,
             f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f}).",
         ))
+    elif latest_cr < 1.0 and cr_bypass_eligible:
+        sins.append(Sin(
+            "cr_below_1_bypassed", "minor", MINOR_SIN_WEIGHTS["cr_below_1_bypassed"],
+            f"Ликвидность ниже 1.0 ({latest_cr:.2f}), но не критична: FCF положительный "
+            f"({latest_fcf / 1e6:,.0f} млн) и денежные средства ({cash.iloc[-1] / 1e6:,.0f} млн) "
+            f"превышают краткосрочный долг ({current_debt.iloc[-1] / 1e6:,.0f} млн).",
+        ))
     # A CR decline is only flagged if the company also isn't comfortably
     # liquid (CR >= 2.0) after the decline - dropping from, say, 4.0 to 3.0
     # isn't a red flag on its own. Requiring latest_cr >= 1.0 here keeps this
-    # mutually exclusive with cr_below_1 above - a CR crash below 1.0 is
-    # already captured as the critical sin and must not also double-count
-    # as a minor "declining trend" sin on the same underlying fact.
+    # mutually exclusive with the two branches above - a CR crash below 1.0
+    # is already captured (critical or bypassed) and must not also
+    # double-count as a minor "declining trend" sin on the same fact.
     elif (
         len(curr_ratios) >= 2
         and curr_ratios.iloc[-1] < curr_ratios.iloc[-2]
@@ -722,7 +768,6 @@ def compute_metrics(data):
             "Тренд падения капитала: Shareholder Equity снизился за последний год.",
         ))
 
-    latest_fcf = fcf.iloc[-1]
     if latest_fcf <= 0:
         sins.append(Sin(
             "fcf_negative", "critical", 0.0,
@@ -765,9 +810,33 @@ def compute_metrics(data):
             f"Падение рентабельности: чистая маржа с {net_margin.iloc[-2]:.1f}% до {net_margin.iloc[-1]:.1f}%.",
         ))
 
+    # Dilution / buyback bonus: share-count changes economically equivalent
+    # to a per-share earnings cut (dilution) or a shareholder-friendly boost
+    # (buyback), mutually exclusive since a >1.5% YoY move can only go one
+    # direction. Skipped silently if diluted_shares wasn't found for this
+    # ticker's statements (default_val=NaN) - never guessed from a partial row.
+    if (
+        not diluted_shares.isna().any()
+        and len(diluted_shares) >= 2
+        and diluted_shares.iloc[-2] != 0
+    ):
+        shares_ratio = diluted_shares.iloc[-1] / diluted_shares.iloc[-2]
+        if shares_ratio > 1.015:
+            sins.append(Sin(
+                "dilution", "minor", MINOR_SIN_WEIGHTS["dilution"],
+                f"Размытие долей: средневзвешенное число акций выросло с {diluted_shares.iloc[-2]:,.0f} "
+                f"до {diluted_shares.iloc[-1]:,.0f} ({(shares_ratio - 1) * 100:.1f}%).",
+            ))
+        elif shares_ratio < (1 / 1.015):
+            sins.append(Sin(
+                "buyback_bonus", "minor", BUYBACK_BONUS_WEIGHT,
+                f"Бонус за байбэк: число акций сократилось с {diluted_shares.iloc[-2]:,.0f} "
+                f"до {diluted_shares.iloc[-1]:,.0f} ({(1 - shares_ratio) * 100:.1f}%).",
+            ))
+
     critical_sins = [s for s in sins if s.tier == "critical"]
     minor_sins = [s for s in sins if s.tier == "minor"]
-    minor_score = sum(s.weight for s in minor_sins)
+    minor_score = max(0.0, sum(s.weight for s in minor_sins))
 
     if critical_sins:
         verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
@@ -803,7 +872,9 @@ def compute_metrics(data):
 
     rf_rate = 0.04
     erp = 0.05
-    cost_of_equity = rf_rate + beta * erp
+    # --required-return lets the investor override CAPM entirely with their
+    # own required rate of return, bypassing the beta-driven Ke formula.
+    cost_of_equity = required_return if required_return is not None else rf_rate + beta * erp
     cost_of_debt = 0.045
     tax_rate = 0.21
     after_tax_debt = cost_of_debt * (1 - tax_rate)
@@ -923,6 +994,7 @@ def compute_metrics(data):
         "beta": beta,
         "wacc": wacc,
         "cost_of_equity": cost_of_equity,
+        "required_return_used": required_return is not None,
         "cost_of_debt_after_tax": after_tax_debt,
         "equity_weight": w_equity,
         "debt_weight": w_debt,
@@ -1076,6 +1148,31 @@ def resolve_catalysts_text(catalysts=None, catalysts_file=None):
     return CATALYSTS_PLACEHOLDER
 
 
+def required_return_type(value):
+    """argparse `type=` for --required-return. Fails fast (during parse_args(),
+    before any network call) rather than silently clamping - a clamped
+    out-of-range value (e.g. a `15` typo instead of `0.15`) would produce a
+    plausible-looking but silently wrong fair value with no indication
+    anything went wrong. Shared by financial_analyzer.py and
+    portfolio_analyzer.py so the validation behavior never drifts between them.
+    """
+    try:
+        fvalue = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Требуемая доходность должна быть числом. Получено: '{value}'")
+    if fvalue > 1.0:
+        suggested = fvalue / 100.0
+        raise argparse.ArgumentTypeError(
+            f"Некорректное значение: {value}. Параметр --required-return должен быть долей от единицы "
+            f"(например, 0.15, а не 15). Возможно, вы имели в виду {suggested:.3f}?"
+        )
+    if not (0.05 <= fvalue <= 0.25):
+        raise argparse.ArgumentTypeError(
+            f"Требуемая доходность должна быть в диапазоне 0.05-0.25 (5%-25%). Получено: {fvalue}."
+        )
+    return fvalue
+
+
 # ── MAIN PDF COMPILER ───────────────────────────────────────────────────
 LEASE_ASSUMPTION_NOTE = (
     "Допущение по лизингу: в базовом DCF обязательства по аренде исключены из net debt, "
@@ -1174,6 +1271,11 @@ def build_markdown_report(
     forward_pe_txt = _fmt_or_na(forward_outlook["forward_pe"])
     growth_txt = _fmt_or_na(forward_outlook["growth_pct"], "{:.1f}%")
     peg_txt = _fmt_or_na(forward_outlook["peg_ratio"])
+    ke_disclosure = (
+        f"Ke = задано инвестором (--required-return) = {m['cost_of_equity'] * 100:.2f}%"
+        if m["required_return_used"]
+        else f"Ke = Rf + β×ERP = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%"
+    )
 
     md = f"""{sector_warning_line}# Фундаментальный анализ & оценка DCF: {ticker.upper()}
 
@@ -1207,7 +1309,7 @@ def build_markdown_report(
 
 ## 3. Модель дисконтирования денежных потоков (DCF)
 
-- Стоимость собственного капитала (CAPM): Ke = 4% + β×5% = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%
+- Стоимость собственного капитала: {ke_disclosure}
 - Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m['cost_of_debt_after_tax'] * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
 - Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m['equity_weight'] * 100:.1f}%, D/(D+E) = {m['debt_weight'] * 100:.1f}%
 - **WACC:** {m['equity_weight'] * 100:.1f}%×{m['cost_of_equity'] * 100:.2f}% + {m['debt_weight'] * 100:.1f}%×{m['cost_of_debt_after_tax'] * 100:.2f}% = **{m['wacc'] * 100:.2f}%**
@@ -1252,10 +1354,13 @@ def build_markdown_report(
     return md_filename
 
 
-def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, force=False):
+def build_pdf_report(
+    ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, force=False,
+    required_return=None,
+):
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
     excluded_sector, excluded_industry = check_sector_suitability(ticker, data.get("info", {}), force)
-    m = compute_metrics(data)
+    m = compute_metrics(data, required_return=required_return)
     forward_outlook = compute_forward_outlook(data.get("info", {}), m["price"], m["eps"], m["cagr"])
     catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
 
@@ -1485,8 +1590,13 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catal
     )
 
     debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in debt_lines)
+    ke_disclosure = (
+        f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
+        if m["required_return_used"]
+        else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
+    )
     dcf_info_text = (
-        f"• <b>Стоимость собственного капитала (CAPM):</b> Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%<br/>"
+        f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
         f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {cost_of_debt_after_tax * 100:.2f}% "
         f"(Kd=4.5%, T=21% — фиксированные допущения методики, не эффективная налоговая ставка компании)<br/>"
         f"• <b>Веса структуры капитала:</b> E/(D+E) = {equity_weight * 100:.1f}%, D/(D+E) = {debt_weight * 100:.1f}% "
@@ -1624,6 +1734,10 @@ if __name__ == "__main__":
         "--force", action="store_true",
         help="Принудительно запустить анализ для несовместимых секторов (Финансы/REIT) под ответственность пользователя.",
     )
+    parser.add_argument(
+        "--required-return", type=required_return_type, default=None,
+        help="Персональная требуемая доходность инвестора (0.05-0.25), заменяет CAPM-расчёт Ke.",
+    )
     args = parser.parse_args()
 
     catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
@@ -1632,6 +1746,7 @@ if __name__ == "__main__":
         build_pdf_report(
             args.ticker, retries=args.retries, retry_delay=args.retry_delay,
             allow_sample=args.allow_sample, catalysts_text=catalysts_text, force=args.force,
+            required_return=args.required_return,
         )
     except DataUnavailableError as e:
         print(f"FAILED: {e}")
