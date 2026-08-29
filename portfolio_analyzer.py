@@ -2,6 +2,7 @@ import argparse
 import re
 from datetime import datetime
 
+from analyzers import AnalyzerFactory
 from financial_analyzer import (
     COLORS,
     FONT_NAME,
@@ -16,8 +17,7 @@ from financial_analyzer import (
     CalloutBox,
     create_reportlab_table,
     get_company_data,
-    compute_metrics,
-    check_sector_suitability,
+    required_return_type,
     UnsupportedSectorError,
     DataUnavailableError,
 )
@@ -59,9 +59,17 @@ def parse_holdings(args_list):
     return holdings
 
 
-def analyze_holdings(holdings, retries=5, retry_delay=5, force=False):
-    """Fetch + analyze each ticker. Real data only - failures are reported,
-    never silently swapped for mock numbers.
+def analyze_holdings(holdings, retries=5, retry_delay=5, force=False, required_return=None):
+    """Fetch + analyze each ticker via AnalyzerFactory. Real data only -
+    failures are reported, never silently swapped for mock numbers.
+
+    Routes through the same AnalyzerFactory/OrdinaryAnalyzer/BankAnalyzer/
+    ReitAnalyzer hierarchy as the single-ticker path (analyzers.py) - this
+    is what keeps this comparative tool computing identical numbers to
+    financial_analyzer.py once Bank/REIT get real sector-specific logic in
+    Step 2/3 (today, in Step 1, all three routes are behaviorally identical
+    anyway - see the spec's decision log for why this is done now rather
+    than deferred).
 
     A Financials/REIT ticker without --force raises UnsupportedSectorError
     straight out of this function (not caught here, unlike
@@ -73,21 +81,30 @@ def analyze_holdings(holdings, retries=5, retry_delay=5, force=False):
     for ticker, weight in holdings:
         print(f"\n=== {ticker} ({weight}%) ===")
         try:
-            data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=False)
+            # One fetch to get `info` for AnalyzerFactory's routing decision.
+            # analyzer.data is set directly from this below instead of
+            # calling analyzer.fetch_data(), which would otherwise trigger a
+            # wasteful second full fetch of the same ticker.
+            probe_data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=False)
         except DataUnavailableError as e:
             print(f"  SKIPPED: {e}")
             results.append({"ticker": ticker, "weight": weight, "ok": False, "error": str(e)})
             continue
-        excluded_sector, excluded_industry = check_sector_suitability(ticker, data.get("info", {}), force)
-        m = compute_metrics(data)
+        args = argparse.Namespace(
+            retries=retries, retry_delay=retry_delay, allow_sample=False,
+            force=force, required_return=required_return,
+        )
+        analyzer = AnalyzerFactory.get_analyzer(ticker, args, probe_data.get("info", {}))
+        analyzer.data = probe_data
+        m = analyzer.calculate_metrics()
         results.append({
             "ticker": ticker,
             "weight": weight,
-            "name": data["name"],
+            "name": probe_data["name"],
             "ok": True,
             "metrics": m,
-            "excluded_sector": excluded_sector,
-            "excluded_industry": excluded_industry,
+            "excluded_sector": args.excluded_sector,
+            "excluded_industry": args.excluded_industry,
         })
     return results
 
@@ -284,11 +301,18 @@ if __name__ == "__main__":
         "--force", action="store_true",
         help="Принудительно запустить анализ для несовместимых секторов (Финансы/REIT) под ответственность пользователя.",
     )
+    parser.add_argument(
+        "--required-return", type=required_return_type, default=None,
+        help="Персональная требуемая доходность инвестора (0.05-0.25), заменяет CAPM-расчёт Ke для всех holdings.",
+    )
     args = parser.parse_args()
 
     holdings = parse_holdings(args.holdings)
     try:
-        results = analyze_holdings(holdings, retries=args.retries, retry_delay=args.retry_delay, force=args.force)
+        results = analyze_holdings(
+            holdings, retries=args.retries, retry_delay=args.retry_delay,
+            force=args.force, required_return=args.required_return,
+        )
     except UnsupportedSectorError as e:
         print(str(e))
         raise SystemExit(1)
