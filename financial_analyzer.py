@@ -171,6 +171,57 @@ class DataUnavailableError(Exception):
         self.attempts = attempts
 
 
+class UnsupportedSectorError(Exception):
+    """Raised when the ticker's sector makes the express checklist and standard
+    FCF-based DCF mathematically invalid (Financial Services, REITs) - see
+    docs/spec/technical-implementation-spec.md Section 4.
+
+    Unlike DataUnavailableError, this isn't a transient condition - retrying
+    won't help, so it's raised outside get_company_data()'s retry loop.
+    Callers pass --force to proceed anyway, which never raises this and
+    instead threads a warning banner into the generated report.
+    """
+
+    def __init__(self, ticker, sector, industry):
+        super().__init__(
+            f"Ошибка: Тикер {ticker} относится к сектору {sector} ({industry}). "
+            "Экспресс-методика и классический DCF не применимы к финансовым компаниям и REIT. "
+            "Используйте флаг --force для принудительного запуска."
+        )
+        self.ticker = ticker
+        self.sector = sector
+        self.industry = industry
+
+
+def check_sector_suitability(ticker, info, force):
+    """Detect Financial Services / REIT sectors where Current Ratio and
+    standard FCF-based DCF are mathematically invalid (see spec Section 4.3).
+
+    Returns (sector, industry) if the ticker is in a restricted sector -
+    callers use this truthy/falsy to decide whether to render a warning
+    banner. Raises UnsupportedSectorError if restricted and `force` is
+    False; with `force=True` it never raises, only reports the sector back.
+
+    The REIT rule is deliberately narrower than the whole "Real Estate"
+    sector - plain real estate developers/operators (e.g. industry
+    "Real Estate - Development") report conventional current assets/
+    liabilities and generate real FCF, so they pass through unaffected;
+    only the FFO-valued REIT subset is excluded.
+    """
+    info = info or {}
+    sector = info.get("sector") or ""
+    industry = info.get("industry") or ""
+    is_financial = sector == "Financial Services"
+    is_reit = sector == "Real Estate" and (
+        "REIT" in industry.upper() or industry == "Real Estate - REITs"
+    )
+    if not (is_financial or is_reit):
+        return None, None
+    if not force:
+        raise UnsupportedSectorError(ticker, sector, industry)
+    return sector, industry
+
+
 def _fx_rate(from_ccy, to_ccy):
     """USD-per-unit-of-from_ccy conversion rate, or None if it can't be fetched."""
     if from_ccy == to_ccy:
@@ -395,6 +446,31 @@ class CalloutBox(Flowable):
         self.canv.setFillColor(self.bar_color)
         self.canv.rect(0, 0, self.bar_w, self._height, fill=1, stroke=0)
         self._para.drawOn(self.canv, self.bar_w + self.pad, self.pad)
+
+
+# ── FLOWABLE: SECTOR WARNING BANNER ─────────────────────────────────────
+class SectorWarningBanner(Flowable):
+    """Full-bleed solid-color banner - deliberately louder than CalloutBox's
+    bg_alt-plus-accent-bar style, since a sector-suitability warning (spec
+    Section 4.4) needs to read as urgent at a glance, not as routine context.
+    """
+
+    def __init__(self, text, width, colors, body_style, fill_color=None):
+        Flowable.__init__(self)
+        self._width = width
+        self.fill_color = fill_color or colors["danger"]
+        self.pad = 10
+        self._para = Paragraph(text, body_style)
+        self._para_w, self._para_h = self._para.wrap(self._width - 2 * self.pad, 10000)
+        self._height = self._para_h + 2 * self.pad
+
+    def wrap(self, availWidth, availHeight):
+        return self._width, self._height
+
+    def draw(self):
+        self.canv.setFillColor(self.fill_color)
+        self.canv.rect(0, 0, self._width, self._height, fill=1, stroke=0)
+        self._para.drawOn(self.canv, self.pad, self.pad)
 
 
 # ── GENERATE EXCEL-STYLE TABLES WITH PARAGRAPHCELLS ────────────────────
@@ -1046,7 +1122,10 @@ def _debt_lines(m, trading_ccy):
     return lines
 
 
-def build_markdown_report(ticker, data, m, forward_outlook=None, catalysts_text=None):
+def build_markdown_report(
+    ticker, data, m, forward_outlook=None, catalysts_text=None,
+    excluded_sector=None, excluded_industry=None,
+):
     """Plain-text/Markdown twin of the PDF report - same numbers, no charts."""
     name = data["name"]
     trading_ccy = data.get("trading_currency", "USD")
@@ -1055,6 +1134,13 @@ def build_markdown_report(ticker, data, m, forward_outlook=None, catalysts_text=
     catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
     catalysts_block = "\n".join(
         f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
+    )
+    sector_warning_line = (
+        f"> ⚠️ **ВНИМАНИЕ (НЕПРИМЕНИМАЯ МЕТОДИКА):** Компания относится к сектору "
+        f"**{excluded_sector} ({excluded_industry})**. Экспресс-оценка ликвидности (Current Ratio) и "
+        "классический расчет справедливой цены по DCF для данного сектора могут быть некорректны и "
+        "давать ложные результаты!\n\n"
+        if excluded_sector else ""
     )
     fx_line = (
         f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
@@ -1089,7 +1175,7 @@ def build_markdown_report(ticker, data, m, forward_outlook=None, catalysts_text=
     growth_txt = _fmt_or_na(forward_outlook["growth_pct"], "{:.1f}%")
     peg_txt = _fmt_or_na(forward_outlook["peg_ratio"])
 
-    md = f"""# Фундаментальный анализ & оценка DCF: {ticker.upper()}
+    md = f"""{sector_warning_line}# Фундаментальный анализ & оценка DCF: {ticker.upper()}
 
 Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
 
@@ -1166,8 +1252,9 @@ def build_markdown_report(ticker, data, m, forward_outlook=None, catalysts_text=
     return md_filename
 
 
-def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None):
+def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, force=False):
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
+    excluded_sector, excluded_industry = check_sector_suitability(ticker, data.get("info", {}), force)
     m = compute_metrics(data)
     forward_outlook = compute_forward_outlook(data.get("info", {}), m["price"], m["eps"], m["cagr"])
     catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
@@ -1300,6 +1387,19 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catal
     )
 
     story = []
+
+    if excluded_sector:
+        sector_warning_style = ParagraphStyle(
+            "SectorWarning", fontName=FONT_BOLD, fontSize=10, textColor=COLORS["white"], leading=14,
+        )
+        sector_warning_text = (
+            "⚠ ВНИМАНИЕ (НЕПРИМЕНИМАЯ МЕТОДИКА): Компания относится к сектору "
+            f"<b>{escape_xml(excluded_sector)} ({escape_xml(excluded_industry)})</b>. Экспресс-оценка "
+            "ликвидности (Current Ratio) и классический расчет справедливой цены по DCF для данного "
+            "сектора могут быть некорректны и давать ложные результаты!"
+        )
+        story.append(SectorWarningBanner(sector_warning_text, USABLE_W, COLORS, sector_warning_style))
+        story.append(Spacer(1, 10))
 
     story.append(
         Paragraph(f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ &amp; ОЦЕНКА DCF: {ticker.upper()}", title_style)
@@ -1484,7 +1584,9 @@ def build_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catal
     doc.build(story)
     print(f"Success! Comprehensive report saved to: {pdf_filename}")
 
-    md_filename = build_markdown_report(ticker, data, m, forward_outlook, catalysts_text)
+    md_filename = build_markdown_report(
+        ticker, data, m, forward_outlook, catalysts_text, excluded_sector, excluded_industry,
+    )
     print(f"Success! Markdown report saved to: {md_filename}")
 
     return pdf_filename, md_filename
@@ -1518,6 +1620,10 @@ if __name__ == "__main__":
         "--catalysts-file", type=str, default=None,
         help="Path to a text file with the catalysts note (alternative to --catalysts).",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Принудительно запустить анализ для несовместимых секторов (Финансы/REIT) под ответственность пользователя.",
+    )
     args = parser.parse_args()
 
     catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
@@ -1525,8 +1631,11 @@ if __name__ == "__main__":
     try:
         build_pdf_report(
             args.ticker, retries=args.retries, retry_delay=args.retry_delay,
-            allow_sample=args.allow_sample, catalysts_text=catalysts_text,
+            allow_sample=args.allow_sample, catalysts_text=catalysts_text, force=args.force,
         )
     except DataUnavailableError as e:
         print(f"FAILED: {e}")
+        raise SystemExit(1)
+    except UnsupportedSectorError as e:
+        print(str(e))
         raise SystemExit(1)
