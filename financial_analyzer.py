@@ -203,38 +203,20 @@ class UnsupportedSectorError(Exception):
 
 
 def check_sector_suitability(ticker, info, force):
-    """Detect REIT sectors where Current Ratio and standard FCF-based DCF
-    are mathematically invalid (see spec Section 4.3).
+    """No sector is restricted anymore - Financial Services (banks, Step 2)
+    and REIT industries (Step 3) both got their own real specialized
+    engines (compute_bank_metrics()/compute_reit_metrics()) and are routed
+    to them natively by AnalyzerFactory before this function is ever called
+    for that ticker (see its docstring). This always returns (None, None).
 
-    Financial Services (banks) is deliberately NOT restricted here anymore -
-    as of Step 2 it has its own real BankAnalyzer engine (NII/LTD checklist,
-    DDM/ROE-P-B valuation - see compute_bank_metrics()), so it no longer
-    needs the Ordinary-methodology warning-banner path this function guards.
-    AnalyzerFactory routes "Financial Services" straight to BankAnalyzer
-    before this function is ever called for that ticker (see its docstring).
-
-    Returns (sector, industry) if the ticker is in a restricted sector -
-    callers use this truthy/falsy to decide whether to render a warning
-    banner. Raises UnsupportedSectorError if restricted and `force` is
-    False; with `force=True` it never raises, only reports the sector back.
-
-    The REIT rule is deliberately narrower than the whole "Real Estate"
-    sector - plain real estate developers/operators (e.g. industry
-    "Real Estate - Development") report conventional current assets/
-    liabilities and generate real FCF, so they pass through unaffected;
-    only the FFO-valued REIT subset is excluded.
+    Kept in place - rather than deleted - for two reasons: it's the hook a
+    future restricted sector would reuse (raise UnsupportedSectorError as
+    before), and OrdinaryAnalyzer's warning-banner rendering path in
+    build_markdown_report()/build_pdf_report() stays reachable code (even
+    though no live sector currently triggers it) without touching that
+    tested Ordinary rendering.
     """
-    info = info or {}
-    sector = info.get("sector") or ""
-    industry = info.get("industry") or ""
-    is_reit = sector == "Real Estate" and (
-        "REIT" in industry.upper() or industry == "Real Estate - REITs"
-    )
-    if not is_reit:
-        return None, None
-    if not force:
-        raise UnsupportedSectorError(ticker, sector, industry)
-    return sector, industry
+    return None, None
 
 
 def _fx_rate(from_ccy, to_ccy):
@@ -1053,6 +1035,44 @@ BANK_BUYBACK_BONUS_WEIGHT = -0.5
 BANK_MAX_MINOR_SCORE = sum(BANK_MINOR_SIN_WEIGHTS.values())
 
 
+def _align_statement_years(df_fin, df_bal, df_cf):
+    """Sort financials/balance/cashflow by year and restrict all three to
+    the years common to all of them.
+
+    compute_metrics() (Ordinary, untouched) uses a simpler pattern: sort by
+    the income statement's own years, then reindex balance/cashflow to that
+    same list. That silently breaks whenever a bank or REIT's balance sheet
+    or cashflow statement reports one fewer year than its income statement
+    (observed live for JPM - financials has 4 years, cashflow 5; and for
+    PLD - financials has 5 years, balance only 4): reindexing with a column
+    that doesn't exist raises KeyError, the bare except swallows it, and
+    financials ends up sorted while balance/cashflow silently stay in their
+    original most-recent-first order - every .iloc[-1]/.iloc[-2] YoY
+    comparison sourced from balance/cashflow then reads the wrong year
+    without any visible error. Restricting to the common intersection
+    avoids that failure mode entirely, at the cost of dropping a year that
+    only one of the three statements reports (unusable for YoY math anyway
+    since the other two statements have nothing to compare it against).
+    """
+    common = set(df_fin.columns) & set(df_bal.columns) & set(df_cf.columns)
+    try:
+        years_sorted = sorted(common, key=lambda x: int(str(x).split("-")[0]))
+    except Exception:
+        years_sorted = sorted(common, key=str)
+    if not years_sorted:
+        # No shared years at all (pathological data) - fall back to the
+        # income statement's own columns rather than producing empty frames.
+        years_sorted = list(df_fin.columns)
+    year_labels = [str(y).split("-")[0] for y in years_sorted]
+    try:
+        return df_fin[years_sorted], df_bal[years_sorted], df_cf[years_sorted], year_labels
+    except KeyError:
+        # Pathological fallback above still didn't line up with bal/cf -
+        # return the frames completely unsorted rather than crashing; every
+        # find_row() default/NaN-guard downstream still applies.
+        return df_fin, df_bal, df_cf, [str(y).split("-")[0] for y in df_fin.columns]
+
+
 def compute_bank_metrics(data, required_return=None):
     """Bank sins-checklist (spec Section 4) + DDM/ROE-P-B fair value (spec
     Section 5). Mirrors compute_metrics()'s output shape for the keys
@@ -1070,16 +1090,7 @@ def compute_bank_metrics(data, required_return=None):
     beta = data["beta"]
     info = data.get("info") or {}
 
-    years = list(df_fin.columns)
-    try:
-        years_sorted = sorted(years, key=lambda x: int(str(x).split("-")[0]))
-        df_fin = df_fin[years_sorted]
-        df_bal = df_bal[years_sorted]
-        df_cf = df_cf[years_sorted]
-        years = years_sorted
-    except Exception:
-        pass
-    year_labels = [str(y).split("-")[0] for y in years]
+    df_fin, df_bal, df_cf, year_labels = _align_statement_years(df_fin, df_bal, df_cf)
 
     # ── Section 3.1: Income statement ───────────────────────────────────
     interest_income = find_row(df_fin, ["Interest Income", "InterestIncome", "Interest Income Bank"])
@@ -1417,6 +1428,339 @@ def compute_bank_metrics(data, required_return=None):
         "dps_last": dps_last,
         "bvps": bvps,
         "roe": roe,
+        "price": price,
+        "fair_value_share": fair_value_share,
+        "over_under_pct": over_under,
+        "val_status": val_status,
+        "val_color_key": val_color_key,
+        "current_ratio": None,
+        "net_margin_pct": None,
+    }
+
+
+# ── REIT-SPECIFIC ENGINE (Step 3, docs/spec/step3-reit-analyzer-implementation-spec.md) ──
+# REITs' Net Income is artificially depressed by real-estate depreciation
+# (a paper charge that doesn't reflect actual cash economics), and standard
+# FCF-based DCF is meaningless for a business that's structurally a pass-
+# through of rental cash flow - see spec Section 0/2. This is a third
+# parallel engine (after Ordinary/Bank): FFO/AFFO/NOI checklist, NAV
+# (Net Asset Value) fair value instead of DCF.
+REIT_MINOR_SIN_WEIGHTS = {
+    "affo_declining": 1.0,
+    "occupancy_declining": 1.0,
+    "dilution": 1.0,
+    "high_leverage": 0.5,
+    "noi_declining": 0.5,
+    "capex_ratio_growth": 0.3,
+}
+REIT_BUYBACK_BONUS_WEIGHT = -0.5
+REIT_MAX_MINOR_SCORE = sum(REIT_MINOR_SIN_WEIGHTS.values())
+
+REIT_CAP_RATE_MATRIX = [
+    (("industrial", "logistic", "warehouse"), 0.055, "Industrial / Logistics"),
+    (("residential", "apartment"), 0.060, "Residential"),
+    (("healthcare", "medical", "health care"), 0.065, "Healthcare / Medical"),
+    (("office", "retail", "mall"), 0.070, "Office / Retail / Malls"),
+]
+REIT_DEFAULT_CAP_RATE = 0.065
+REIT_DEFAULT_CAP_RATE_LABEL = "Default"
+
+
+def _reit_cap_rate(info):
+    """Cap Rate lookup (spec Section 5.1) - an explicit info['capRate'] first
+    (yfinance never actually populates this, but the spec asks to check),
+    then a conservative median-by-specialization matrix keyed off industry/
+    sector keywords, first match wins. Never invents a company-specific
+    rate beyond this - real REITs report their own portfolio cap rate in
+    investor materials, not through yfinance."""
+    info = info or {}
+    explicit = info.get("capRate")
+    if explicit:
+        return float(explicit), "Explicit (info.capRate)"
+    haystack = " ".join(str(info.get(k) or "") for k in ("industry", "sector", "longBusinessSummary")).lower()
+    for keywords, rate, label in REIT_CAP_RATE_MATRIX:
+        if any(kw in haystack for kw in keywords):
+            return rate, label
+    return REIT_DEFAULT_CAP_RATE, REIT_DEFAULT_CAP_RATE_LABEL
+
+
+def compute_reit_metrics(data, required_return=None):
+    """REIT sins-checklist (spec Section 4) + NAV fair value (spec Section
+    5). Mirrors compute_bank_metrics()'s output shape for the keys
+    portfolio_analyzer.py and the report renderers read in common
+    (sins/critical_sins/minor_sins/minor_score/max_minor_score/verdict/
+    verdict_color_key/reasoning/price/fair_value_share/over_under_pct/
+    val_status/val_color_key); everything else is REIT-specific (FFO/AFFO/
+    NOI, Occupancy, Cap Rate, NAV bridge).
+
+    Unlike compute_bank_metrics(), a critical sin here does NOT skip minor
+    scoring - spec Section 4 has no "interrupts detailed scoring" language
+    for REIT (unlike Bank's Section 4.1), so minor sins are always computed
+    in full, same as Ordinary's compute_metrics().
+    """
+    df_fin = data["financials"]
+    df_bal = data["balance"]
+    df_cf = data["cashflow"]
+    price = data["price"]
+    shares = data["shares"]
+    beta = data["beta"]
+    info = data.get("info") or {}
+
+    df_fin, df_bal, df_cf, year_labels = _align_statement_years(df_fin, df_bal, df_cf)
+
+    # ── Section 3: yfinance row mapping ─────────────────────────────────
+    d_and_a = find_row(df_cf, ["Depreciation And Amortization", "Depreciation & Amortization", "Depreciation"])
+    gain_on_sale = find_row(df_cf, [
+        "Gain on Sale of Real Estate", "Gain on Sale of Investment Property", "Gain on Sale of Business",
+    ])
+    capex = find_row(df_cf, ["Capital Expenditure", "Capital Expenditures", "CapEx"])
+    net_income = find_row(df_fin, ["Net Income", "NetIncome", "Net Income Common Stockholders"])
+    rental_revenue = find_row(df_fin, ["Rental Revenue", "Total Revenue", "Revenue"])
+    property_opex = find_row(df_fin, [
+        "Property Operating Expense", "Property Expenses", "Operating Expense", "Operating Expenses",
+    ])
+    re_taxes = find_row(df_fin, ["Real Estate Taxes", "Property Taxes", "Taxes Other Than Income Taxes"])
+    diluted_shares = find_row(
+        df_fin, ["Diluted Average Shares", "Diluted Shares Outstanding", "Average Shares"],
+        default_val=float("nan"),
+    )
+    construction_in_progress = find_row(df_bal, ["Construction In Progress", "Capital Work In Progress", "CIP"])
+    receivables = find_row(df_bal, ["Receivables", "Accounts Receivable", "Net Receivables"])
+    cash = find_row(df_bal, [
+        "Cash and Cash Equivalents", "Cash Cash Equivalents and Short Term Investments", "CashAndCashEquivalents",
+    ])
+    total_liab = find_row(df_bal, ["Total Liabilities Net Minority Interest", "Total Liabilities"], default_val=float("nan"))
+    total_debt = find_row(df_bal, ["Total Debt", "Long Term Debt"], default_val=float("nan"))
+    shareholders_equity = find_row(df_bal, [
+        "Stockholders Equity", "Total Stockholders Equity", "Shareholders Equity",
+    ], default_val=float("nan"))
+    # "Cash Dividends Paid" preferred over "Common Stock Dividend Paid" -
+    # live-verified against SPG, where yfinance's "Common Stock Dividend
+    # Paid" line (-$439M) is a small fraction of the real total ($3.23B,
+    # matching dividendRate x shares) with the rest oddly bucketed under
+    # "Preferred Stock Dividend Paid" (SPG has no preferred stock anywhere
+    # near that size - an OP-unit/UPREIT structure quirk in yfinance's
+    # generic template, not an actual preferred dividend). "Cash Dividends
+    # Paid" matched dividendRate x shares correctly for all three of O/SPG/
+    # PLD tested in Step 3, so it's the more reliable primary source here.
+    dividends_paid = find_row(df_cf, [
+        "Cash Dividends Paid", "Common Stock Dividend Paid", "Payment Of Dividends",
+    ], default_val=float("nan")).abs()
+
+    occupancy_rate = info.get("occupancy") or info.get("occupancyRate")
+    if occupancy_rate is None:
+        print(
+            f"  [{data.get('ticker', '?')}] Occupancy Rate недоступен в yfinance.info - "
+            "используется консервативный дефолт 95.0%."
+        )
+        occupancy_rate = 0.95
+    else:
+        occupancy_rate = float(occupancy_rate)
+
+    # ── FX bridge ────────────────────────────────────────────────────────
+    fx_rate = data.get("fx_rate", 1.0)
+    if fx_rate != 1.0:
+        d_and_a = d_and_a * fx_rate
+        gain_on_sale = gain_on_sale * fx_rate
+        capex = capex * fx_rate
+        net_income = net_income * fx_rate
+        rental_revenue = rental_revenue * fx_rate
+        property_opex = property_opex * fx_rate
+        re_taxes = re_taxes * fx_rate
+        construction_in_progress = construction_in_progress * fx_rate
+        receivables = receivables * fx_rate
+        cash = cash * fx_rate
+        total_liab = total_liab * fx_rate
+        total_debt = total_debt * fx_rate
+        shareholders_equity = shareholders_equity * fx_rate
+        dividends_paid = dividends_paid * fx_rate
+
+    # ── Section 2: FFO / AFFO / NOI ──────────────────────────────────────
+    ffo = net_income + d_and_a - gain_on_sale
+    affo = ffo - capex.abs()
+    noi = rental_revenue - property_opex - re_taxes
+
+    latest_equity = shareholders_equity.iloc[-1]
+    latest_affo = affo.iloc[-1]
+    latest_dividends = dividends_paid.iloc[-1] if not pd.isna(dividends_paid.iloc[-1]) else 0.0
+
+    # ── Section 4.1: Critical sins ───────────────────────────────────────
+    sins = []
+    affo_payout_ratio = None
+    if latest_dividends > 0:
+        if latest_affo <= 0:
+            affo_payout_ratio = float("inf")
+            sins.append(Sin(
+                "affo_payout_over_100", "critical", 0.0,
+                f"Дивиденды «в долг»: выплачены дивиденды ({latest_dividends / 1e6:,.0f} млн) при "
+                f"AFFO ≤ 0 ({latest_affo / 1e6:,.0f} млн) - выплата не обеспечена денежным потоком.",
+            ))
+        else:
+            affo_payout_ratio = latest_dividends / latest_affo
+            if affo_payout_ratio > 1.0:
+                sins.append(Sin(
+                    "affo_payout_over_100", "critical", 0.0,
+                    f"Дивиденды «в долг»: AFFO Payout Ratio = {affo_payout_ratio * 100:.1f}% (> 100%) - "
+                    "траст выплачивает больше, чем зарабатывает по AFFO.",
+                ))
+    if occupancy_rate < 0.80:
+        sins.append(Sin(
+            "occupancy_below_80", "critical", 0.0,
+            f"Низкая заполняемость объектов: Occupancy Rate = {occupancy_rate * 100:.1f}% (< 80%).",
+        ))
+    if not pd.isna(latest_equity) and latest_equity <= 0:
+        sins.append(Sin(
+            "equity_negative", "critical", 0.0,
+            f"Отрицательный акционерный капитал: Shareholders Equity ({latest_equity / 1e6:,.0f} млн) ≤ 0.",
+        ))
+    critical_sins = [s for s in sins if s.tier == "critical"]
+
+    # ── Section 4.2: Minor sins (always computed - no interruption here) ─
+    if len(affo) >= 2 and affo.iloc[-2] > 0 and affo.iloc[-1] > 0 and affo.iloc[-1] < affo.iloc[-2]:
+        sins.append(Sin(
+            "affo_declining", "minor", REIT_MINOR_SIN_WEIGHTS["affo_declining"],
+            f"Падение AFFO: с {affo.iloc[-2] / 1e6:,.0f} до {affo.iloc[-1] / 1e6:,.0f} млн.",
+        ))
+    # Note: occupancy_declining (spec Section 4.2) is not evaluated here -
+    # occupancy_rate above is a single current-snapshot value (yfinance
+    # carries no historical Occupancy Rate time series), so there is no
+    # prior-year figure to compare against without inventing one.
+    debt_to_equity = None
+    if (
+        not diluted_shares.isna().any()
+        and len(diluted_shares) >= 2
+        and diluted_shares.iloc[-2] != 0
+    ):
+        shares_ratio = diluted_shares.iloc[-1] / diluted_shares.iloc[-2]
+        if shares_ratio > 1.025:
+            sins.append(Sin(
+                "dilution", "minor", REIT_MINOR_SIN_WEIGHTS["dilution"],
+                f"Размытие капитала через SPO: среднее число акций выросло с {diluted_shares.iloc[-2]:,.0f} "
+                f"до {diluted_shares.iloc[-1]:,.0f} ({(shares_ratio - 1) * 100:.1f}%).",
+            ))
+        elif shares_ratio < (1 / 1.015):
+            sins.append(Sin(
+                "buyback_bonus", "minor", REIT_BUYBACK_BONUS_WEIGHT,
+                f"Бонус за байбэк: число акций сократилось с {diluted_shares.iloc[-2]:,.0f} "
+                f"до {diluted_shares.iloc[-1]:,.0f} ({(1 - shares_ratio) * 100:.1f}%).",
+            ))
+    if not pd.isna(latest_equity) and latest_equity > 0 and not pd.isna(total_debt.iloc[-1]):
+        debt_to_equity = total_debt.iloc[-1] / latest_equity
+        if debt_to_equity > 2.0:
+            sins.append(Sin(
+                "high_leverage", "minor", REIT_MINOR_SIN_WEIGHTS["high_leverage"],
+                f"Критический долг: Total Debt / Shareholders Equity = {debt_to_equity * 100:.1f}% (> 200%).",
+            ))
+    if len(noi) >= 2 and noi.iloc[-1] < noi.iloc[-2]:
+        sins.append(Sin(
+            "noi_declining", "minor", REIT_MINOR_SIN_WEIGHTS["noi_declining"],
+            f"Падение NOI: с {noi.iloc[-2] / 1e6:,.0f} до {noi.iloc[-1] / 1e6:,.0f} млн.",
+        ))
+    if len(capex) >= 2 and len(ffo) >= 2 and ffo.iloc[-2] > 0 and ffo.iloc[-1] > 0:
+        capex_ratio_prior = capex.iloc[-2].__abs__() / ffo.iloc[-2]
+        capex_ratio_current = capex.iloc[-1].__abs__() / ffo.iloc[-1]
+        if capex_ratio_prior > 0 and (capex_ratio_current / capex_ratio_prior - 1) > 0.05:
+            sins.append(Sin(
+                "capex_ratio_growth", "minor", REIT_MINOR_SIN_WEIGHTS["capex_ratio_growth"],
+                f"Рост доли капинвестиций: CapEx/FFO вырос с {capex_ratio_prior * 100:.1f}% до "
+                f"{capex_ratio_current * 100:.1f}% (YoY > 5%).",
+            ))
+
+    minor_sins = [s for s in sins if s.tier == "minor"]
+    minor_score = max(0.0, sum(s.weight for s in minor_sins))
+
+    if critical_sins:
+        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
+        verdict_color_key = "danger"
+        crit_labels = ", ".join(s.id for s in critical_sins)
+        reasoning = (
+            f"Обнаружен(ы) критический(е) фактор(ы) риска REIT ({crit_labels}). "
+            "Любой из них по отдельности делает инвестицию рискованной вне зависимости от прочих показателей."
+        )
+    elif minor_score <= 1.0:
+        verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
+        verdict_color_key = "success"
+        reasoning = "Траст демонстрирует устойчивый рост AFFO/NOI, комфортную заполняемость объектов и разумную долговую нагрузку. Риски минимальны."
+    elif minor_score <= 2.5:
+        verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
+        verdict_color_key = "warning"
+        reasoning = "Портфель недвижимости остаётся жизнеспособным, однако в динамике AFFO, NOI или долговой нагрузки присутствуют умеренные погрешности."
+    else:
+        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
+        verdict_color_key = "danger"
+        reasoning = (
+            f"Взвешенный балл второстепенных нарушений REIT составил {minor_score:.1f} из "
+            f"{REIT_MAX_MINOR_SCORE:.1f}. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
+        )
+
+    # ── Section 5: NAV fair value ────────────────────────────────────────
+    cap_rate, cap_rate_label = _reit_cap_rate(info)
+    latest_noi = noi.iloc[-1]
+    property_value = latest_noi / cap_rate if cap_rate else 0.0
+    latest_cash = cash.iloc[-1] if not pd.isna(cash.iloc[-1]) else 0.0
+    latest_receivables = receivables.iloc[-1] if not pd.isna(receivables.iloc[-1]) else 0.0
+    latest_cip = construction_in_progress.iloc[-1] if not pd.isna(construction_in_progress.iloc[-1]) else 0.0
+    latest_total_liab = total_liab.iloc[-1] if not pd.isna(total_liab.iloc[-1]) else 0.0
+    nav = property_value + latest_cash + latest_receivables + latest_cip - latest_total_liab
+    fair_value_share = nav / shares if shares > 0 else 0.0
+
+    over_under = (fair_value_share - price) / price * 100 if price else 0.0
+    if over_under > 10.0:
+        val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
+        val_color_key = "success"
+    elif over_under < -10.0:
+        val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
+        val_color_key = "danger"
+    else:
+        val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
+        val_color_key = "warning"
+
+    latest_ffo = ffo.iloc[-1]
+    latest_diluted_shares = (
+        diluted_shares.iloc[-1] if len(diluted_shares) and not pd.isna(diluted_shares.iloc[-1]) else shares
+    )
+    ffo_per_share = latest_ffo / latest_diluted_shares if latest_diluted_shares else None
+    p_ffo = price / ffo_per_share if ffo_per_share and ffo_per_share > 0 else None
+
+    return {
+        "kind": "reit",
+        "year_labels": year_labels,
+        "d_and_a": d_and_a,
+        "gain_on_sale": gain_on_sale,
+        "capex": capex,
+        "net_income": net_income,
+        "rental_revenue": rental_revenue,
+        "property_opex": property_opex,
+        "re_taxes": re_taxes,
+        "construction_in_progress": construction_in_progress,
+        "receivables": receivables,
+        "cash": cash,
+        "total_liab": total_liab,
+        "total_debt": total_debt,
+        "shareholders_equity": shareholders_equity,
+        "diluted_shares": diluted_shares,
+        "dividends_paid": dividends_paid,
+        "ffo": ffo,
+        "affo": affo,
+        "noi": noi,
+        "occupancy_rate": occupancy_rate,
+        "affo_payout_ratio": affo_payout_ratio,
+        "debt_to_equity": debt_to_equity,
+        "cap_rate": cap_rate,
+        "cap_rate_label": cap_rate_label,
+        "property_value": property_value,
+        "nav": nav,
+        "ffo_per_share": ffo_per_share,
+        "p_ffo": p_ffo,
+        "sins": sins,
+        "critical_sins": critical_sins,
+        "minor_sins": minor_sins,
+        "minor_score": minor_score,
+        "max_minor_score": REIT_MAX_MINOR_SCORE,
+        "verdict": verdict,
+        "verdict_color_key": verdict_color_key,
+        "reasoning": reasoning,
+        "beta": beta,
         "price": price,
         "fair_value_share": fair_value_share,
         "over_under_pct": over_under,
@@ -2471,6 +2815,336 @@ def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
 
     md_filename = build_bank_markdown_report(ticker, data, m, catalysts_text)
     print(f"Success! Markdown bank report saved to: {md_filename}")
+
+    return pdf_filename, md_filename
+
+
+# ── REIT REPORT RENDERERS (Step 3, spec Section 6.1) ────────────────────
+# No "Operating Cash Flow"/DCF sections here - FFO/AFFO/NOI and the NAV
+# bridge replace them entirely (spec Section 0: classical DCF is
+# meaningless for REITs).
+def generate_ffo_chart(years, ffo_values, affo_values, ticker):
+    """Historical-only FFO/AFFO bar chart - like generate_nii_chart(), no
+    projection bar: the NAV model doesn't forecast a forward FFO/AFFO path,
+    it capitalizes the latest NOI at a static Cap Rate."""
+    fig, ax = plt.subplots(figsize=(7, 3))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#F8FAFC")
+    x = range(len(years))
+    width = 0.35
+    ax.bar([i - width / 2 for i in x], [v / 1e9 for v in ffo_values], width=width, color="#0F766E", label="FFO")
+    ax.bar([i + width / 2 for i in x], [v / 1e9 for v in affo_values], width=width, color="#0284C7", label="AFFO")
+    ax.set_title(f"FFO / AFFO REIT {ticker} (в млрд. USD)", fontsize=10, fontweight="bold", color="#1E293B")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(years, fontsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#64748B")
+    ax.spines["bottom"].set_color("#64748B")
+    ax.tick_params(colors="#334155", labelsize=8)
+    ax.legend(frameon=True, facecolor="white", edgecolor="none", fontsize=8)
+    ax.grid(axis="y", linestyle="--", alpha=0.3, color="#64748B")
+    plt.tight_layout()
+    chart_path = os.path.join(SCRATCH_DIR, f"{ticker}_ffo_chart.png")
+    plt.savefig(chart_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    return chart_path
+
+
+def _reit_nav_bridge_rows(m, trading_ccy):
+    """Plain (label, value) pairs for the NAV bridge - shared between the
+    PDF and Markdown REIT renderers (spec Section 6.1)."""
+    return [
+        (f"NOI (последний год)", f"{m['noi'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Применённый Cap Rate", f"{m['cap_rate'] * 100:.2f}% ({m['cap_rate_label']})"),
+        ("Property Value = NOI / Cap Rate", f"{m['property_value'] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Плюс: Cash", f"{m['cash'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Плюс: Receivables", f"{m['receivables'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Плюс: Construction in Progress", f"{m['construction_in_progress'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Минус: Total Liabilities", f"{m['total_liab'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}" if not pd.isna(m["total_liab"].iloc[-1]) else "N/A"),
+        ("= Net Asset Value (NAV)", f"{m['nav'] / 1e6:,.1f} млн. {trading_ccy}"),
+    ]
+
+
+def _reit_operating_rows(m):
+    def fmt(series):
+        return ["N/A" if pd.isna(v) else f"{v / 1e6:,.1f}" for v in series]
+
+    return [
+        ["FFO (млн.)"] + fmt(m["ffo"]),
+        ["AFFO (млн.)"] + fmt(m["affo"]),
+        ["NOI (млн.)"] + fmt(m["noi"]),
+        ["CapEx (млн.)"] + fmt(m["capex"].abs()),
+        ["Dividends Paid (млн.)"] + fmt(m["dividends_paid"]),
+    ]
+
+
+def build_reit_markdown_report(ticker, data, m, catalysts_text=None):
+    """REIT twin of build_markdown_report()/build_bank_markdown_report() -
+    FFO/AFFO/NOI/Occupancy in the header, NAV valuation bridge instead of
+    WACC/DCF, loan/deposit-style operating-performance table."""
+    name = data["name"]
+    trading_ccy = data.get("trading_currency", "USD")
+    financial_ccy = data.get("financial_currency", "USD")
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
+    catalysts_block = "\n".join(
+        f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
+    )
+    fx_line = (
+        f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
+        f"{data.get('fx_rate', 1.0):.4f}\n\n"
+        if financial_ccy != trading_ccy else ""
+    )
+    year_labels = m["year_labels"]
+
+    if m["sins"]:
+        sins_parts = []
+        if m["critical_sins"]:
+            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m["critical_sins"]))
+        if m["minor_sins"]:
+            sins_parts.append(
+                f"**Второстепенные (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):**\n"
+                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m["minor_sins"])
+            )
+        sins_block = "\n\n".join(sins_parts)
+    else:
+        sins_block = "- Грехов не обнаружено."
+
+    op_rows = _reit_operating_rows(m)
+    nav_rows = _reit_nav_bridge_rows(m, trading_ccy)
+    nav_block = "\n".join(f"- {label}: {value}" for label, value in nav_rows)
+    payout_txt = "N/A (дивиденды не выплачиваются)" if m["affo_payout_ratio"] is None else (
+        "∞ (AFFO ≤ 0)" if m["affo_payout_ratio"] == float("inf") else f"{m['affo_payout_ratio'] * 100:.1f}%"
+    )
+    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+
+    md = f"""# Фундаментальный анализ & оценка REIT: {ticker.upper()}
+
+Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
+
+{fx_line}## 1. Экспресс-вердикт и оценка рисков (чеклист REIT)
+
+**{m['verdict']}**
+
+{m['reasoning']}
+
+**Выявленные риски:**
+
+{sins_block}
+
+## 2. REIT Operating Performance (FFO / AFFO / NOI)
+
+Показатели в млн. {trading_ccy}. Вместо Net Income/операционного кэш-флоу для REIT используются FFO, AFFO и NOI.
+
+| Показатель | {" | ".join(year_labels)} |
+|---|{"---|" * len(year_labels)}
+{chr(10).join("| " + " | ".join(str(c) for c in r) + " |" for r in op_rows)}
+
+**Occupancy Rate: {m['occupancy_rate'] * 100:.1f}%** | **AFFO Payout Ratio: {payout_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
+
+## 3. NAV Valuation Bridge
+
+{nav_block}
+
+**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
+Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+
+## 4. Катализаторы и риски (качественная оценка)
+
+{catalysts_block}
+
+---
+Классический DCF неприменим к REIT (искажение денежного потока операциями с недвижимостью) - справедливая стоимость оценивается по методу NAV (Net Asset Value) на базе NOI и отраслевой ставки капитализации (Cap Rate).
+Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
+"""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.md")
+    with open(md_filename, "w") as f:
+        f.write(md)
+    return md_filename
+
+
+def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
+    data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
+    m = compute_reit_metrics(data, required_return=required_return)
+    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
+
+    name = data["name"]
+    price_kind = data["price_kind"]
+    quote_time_label = data["quote_time_label"]
+    financial_ccy = data.get("financial_currency", "USD")
+    trading_ccy = data.get("trading_currency", "USD")
+    fx_note = (
+        f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
+        if financial_ccy != trading_ccy else ""
+    )
+    price = m["price"]
+    year_labels = m["year_labels"]
+    verdict = m["verdict"]
+    verdict_color = COLORS[m["verdict_color_key"]]
+    reasoning = m["reasoning"]
+    val_color = COLORS[m["val_color_key"]]
+
+    chart_img_path = generate_ffo_chart(year_labels, m["ffo"].values, m["affo"].values, ticker)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
+
+    doc = BaseDocTemplate(
+        pdf_filename, pagesize=PAGE_SIZE,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN + 15, bottomMargin=MARGIN,
+    )
+    content_frame = Frame(
+        doc.leftMargin, doc.bottomMargin, USABLE_W,
+        PAGE_H - doc.topMargin - doc.bottomMargin, id="main",
+    )
+
+    def on_later_pages(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(COLORS["accent"])
+        canvas.setLineWidth(1.2)
+        y_rule = PAGE_H - MARGIN + 4
+        canvas.line(MARGIN, y_rule, PAGE_W - MARGIN, y_rule)
+        canvas.setFont(FONT_BOLD, 8)
+        canvas.setFillColor(COLORS["muted"])
+        canvas.drawString(MARGIN, y_rule + 4, f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ REIT: {ticker.upper()}")
+        canvas.drawRightString(PAGE_W - MARGIN, y_rule + 4, f"{name.upper()}")
+        y_footer = MARGIN - 24
+        canvas.setStrokeColor(COLORS["bg_alt"])
+        canvas.setLineWidth(0.4)
+        canvas.line(MARGIN, y_footer + 12, PAGE_W - MARGIN, y_footer + 12)
+        canvas.setFont(FONT_NAME, 8)
+        canvas.setFillColor(COLORS["muted"])
+        canvas.drawString(MARGIN, y_footer, "Подготовлено ИИ-помощником фундаментального анализа")
+        canvas.drawRightString(PAGE_W - MARGIN, y_footer, f"Страница {doc.page}")
+        canvas.restoreState()
+
+    doc.addPageTemplates([PageTemplate(id="content", frames=content_frame, onPage=on_later_pages)])
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("DocTitle", fontName=FONT_BOLD, fontSize=20, textColor=COLORS["heading"], leading=24, spaceAfter=8)
+    subtitle_style = ParagraphStyle("DocSub", fontName=FONT_NAME, fontSize=11, textColor=COLORS["muted"], leading=14, spaceAfter=15)
+    h1_style = ParagraphStyle("H1", fontName=FONT_BOLD, fontSize=12, textColor=COLORS["heading"], leading=15, spaceBefore=12, spaceAfter=6, keepWithNext=True)
+    body_style = ParagraphStyle("Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6, alignment=TA_JUSTIFY)
+    verdict_text_style = ParagraphStyle("VerdictText", fontName=FONT_BOLD, fontSize=12, textColor=verdict_color, leading=15, spaceAfter=6)
+    callout_text_style = ParagraphStyle("CalloutText", fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13)
+
+    story = [
+        Paragraph(f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ REIT: {ticker.upper()}", title_style),
+        Paragraph(
+            f"Полный отчет по REIT: <b>{name}</b> | Цена: <b>{price:.2f} {trading_ccy}</b> "
+            f"({price_kind}, Yahoo Finance, {quote_time_label})",
+            subtitle_style,
+        ),
+        SectionDivider(USABLE_W, COLORS["accent"]),
+        Spacer(1, 10),
+    ]
+
+    # ── SECTION 1: EXECUTIVE VERDICT ────────────────────────────────────
+    story.append(Paragraph("1. Экспресс-вердикт и оценка рисков (чеклист REIT)", h1_style))
+    story.append(Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style))
+    story.append(Paragraph(verdict, verdict_text_style))
+    story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
+
+    if m["critical_sins"]:
+        crit_text = (
+            "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
+            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m["critical_sins"])
+        )
+        story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
+        story.append(Spacer(1, 6))
+    if m["minor_sins"]:
+        minor_text = (
+            f"<b>Второстепенные риски (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):</b><br/>"
+            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m["minor_sins"])
+        )
+        story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
+    if not m["sins"]:
+        story.append(CalloutBox(
+            "<b>Финансовые риски:</b> Грехов не обнаружено. Показатели REIT в безупречной форме.",
+            USABLE_W, COLORS, callout_text_style, COLORS["success"],
+        ))
+    story.append(Spacer(1, 12))
+
+    # ── SECTION 2: FFO/AFFO/NOI TRENDS ──────────────────────────────────
+    story.append(Paragraph("2. REIT Operating Performance (FFO / AFFO / NOI)", h1_style))
+    story.append(Paragraph(
+        "Net Income искажён бумажной амортизацией недвижимости - вместо него используются FFO, AFFO и NOI."
+        f"{fx_note}",
+        body_style,
+    ))
+
+    last4 = range(len(year_labels) - 4, len(year_labels))
+    fund_headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
+
+    def _fmt_last4(series):
+        return ["N/A" if pd.isna(series.iloc[i]) else f"{series.iloc[i] / 1e6:,.1f}" for i in last4]
+
+    fund_rows = [
+        ["FFO"] + _fmt_last4(m["ffo"]),
+        ["AFFO"] + _fmt_last4(m["affo"]),
+        ["NOI"] + _fmt_last4(m["noi"]),
+        ["CapEx"] + _fmt_last4(m["capex"].abs()),
+        ["Dividends Paid"] + _fmt_last4(m["dividends_paid"]),
+    ]
+    story.append(create_reportlab_table(fund_headers, fund_rows, styles, COLORS, col_widths=[190, 70, 70, 70, 70]))
+    story.append(Spacer(1, 8))
+
+    payout_txt = "N/A (дивиденды не выплачиваются)" if m["affo_payout_ratio"] is None else (
+        "∞ (AFFO ≤ 0)" if m["affo_payout_ratio"] == float("inf") else f"{m['affo_payout_ratio'] * 100:.1f}%"
+    )
+    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+    story.append(Paragraph(
+        f"<b>Occupancy Rate:</b> {m['occupancy_rate'] * 100:.1f}% &nbsp;&nbsp; "
+        f"<b>AFFO Payout Ratio:</b> {payout_txt} &nbsp;&nbsp; "
+        f"<b>Total Debt / Shareholders Equity:</b> {de_txt}",
+        body_style,
+    ))
+    story.append(Spacer(1, 8))
+    story.append(Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4))
+    story.append(Spacer(1, 12))
+
+    # ── SECTION 3: NAV VALUATION BRIDGE ─────────────────────────────────
+    story.append(Paragraph("3. NAV Valuation Bridge", h1_style))
+    nav_rows = _reit_nav_bridge_rows(m, trading_ccy)
+    nav_html = "<br/>".join(f"• <b>{escape_xml(label)}:</b> {escape_xml(value)}" for label, value in nav_rows)
+    story.append(CalloutBox(nav_html, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
+    story.append(Spacer(1, 8))
+
+    val_banner_text = (
+        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m['fair_value_share']:.2f} {trading_ccy}</b><br/>"
+        f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
+        f"| Статус: <font color='{val_color.hexval()}'><b>{m['val_status']}</b></font>"
+    )
+    story.append(CalloutBox(
+        val_banner_text, USABLE_W, COLORS,
+        ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
+        val_color,
+    ))
+    story.append(Spacer(1, 12))
+
+    # ── SECTION 4: QUALITATIVE CATALYSTS ────────────────────────────────
+    story.append(Paragraph("4. Катализаторы и риски (качественная оценка)", h1_style))
+    catalysts_html = "<br/>".join(escape_xml(line) for line in catalysts_text.splitlines())
+    story.append(CalloutBox(catalysts_html, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
+    story.append(Spacer(1, 12))
+
+    warning_text = (
+        "<b>Важное правило методики экспресс-анализа:</b><br/>"
+        "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
+        "наилучшего момента и цены входа, фундаментальный анализ <b>обязательно должен использоваться в связке с "
+        "техническим анализом</b>. Не пытайтесь применять их отдельно!<br/>"
+        "Классический DCF неприменим к REIT - справедливая стоимость оценивается по методу NAV на базе NOI и "
+        "отраслевой ставки капитализации (Cap Rate), а не через WACC-дисконтирование FCF."
+    )
+    story.append(CalloutBox(warning_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
+
+    doc.build(story)
+    print(f"Success! Comprehensive REIT report saved to: {pdf_filename}")
+
+    md_filename = build_reit_markdown_report(ticker, data, m, catalysts_text)
+    print(f"Success! Markdown REIT report saved to: {md_filename}")
 
     return pdf_filename, md_filename
 

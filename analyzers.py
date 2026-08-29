@@ -1,15 +1,13 @@
-"""Analyzer routing (Step 1 skeleton + Step 2 real BankAnalyzer - see
-docs/spec/step1-ordinary-router-implementation-spec.md and
-docs/spec/step2-bank-analyzer-implementation-spec.md).
+"""Analyzer routing (Steps 1-3 - see docs/spec/step1-ordinary-router-
+implementation-spec.md, docs/spec/step2-bank-analyzer-implementation-spec.md,
+docs/spec/step3-reit-analyzer-implementation-spec.md).
 
 Adapter pattern: OrdinaryAnalyzer wraps the existing, tested function-based
 engine in financial_analyzer.py (get_company_data/compute_metrics/
 build_pdf_report/build_markdown_report) rather than reimplementing it.
-BankAnalyzer (Step 2) is a real implementation on top of
-compute_bank_metrics()/build_bank_pdf_report()/build_bank_markdown_report() -
-NII/LTD checklist, DDM/ROE-P-B valuation, no more delegation to Ordinary.
-ReitAnalyzer is still the Step-1 stub delegating to OrdinaryAnalyzer under
---force (Step 3 scope).
+BankAnalyzer (Step 2) and ReitAnalyzer (Step 3) are both real, independent
+implementations on top of their own compute_*_metrics()/build_*_report()
+engines - neither delegates to OrdinaryAnalyzer anymore.
 """
 
 from abc import ABC, abstractmethod
@@ -19,10 +17,13 @@ from financial_analyzer import (
     build_bank_pdf_report,
     build_markdown_report,
     build_pdf_report,
+    build_reit_markdown_report,
+    build_reit_pdf_report,
     check_sector_suitability,
     compute_bank_metrics,
     compute_forward_outlook,
     compute_metrics,
+    compute_reit_metrics,
     get_company_data,
 )
 
@@ -119,56 +120,6 @@ class OrdinaryAnalyzer(BaseAnalyzer):
         )
 
 
-class _DelegatingStubAnalyzer(BaseAnalyzer):
-    """Delegates every call to an internal OrdinaryAnalyzer, unchanged from
-    today's shipped --force behavior - the shared base for sectors that
-    still lack a real specialized engine (REIT, Step 3 scope). BankAnalyzer
-    used to be built this way (Step 1); it now has real NII/DDM/ROE-P-B
-    logic of its own (Step 2) and no longer subclasses this.
-
-    `data`/`metrics` are properties proxying the delegate's own attributes,
-    not separate storage - a caller that does `analyzer.data = probe_data`
-    (the portfolio_analyzer.py double-fetch optimization, see AnalyzerFactory
-    callers) must reach the same object compute_metrics() will actually read
-    inside calculate_metrics(), which runs on the delegate, not on self.
-    """
-
-    def __init__(self, ticker, args):
-        self._delegate = OrdinaryAnalyzer(ticker, args)
-        super().__init__(ticker, args)
-
-    @property
-    def data(self):
-        return self._delegate.data
-
-    @data.setter
-    def data(self, value):
-        self._delegate.data = value
-
-    @property
-    def metrics(self):
-        return self._delegate.metrics
-
-    @metrics.setter
-    def metrics(self, value):
-        self._delegate.metrics = value
-
-    def fetch_data(self):
-        return self._delegate.fetch_data()
-
-    def calculate_metrics(self):
-        return self._delegate.calculate_metrics()
-
-    def calculate_fair_value(self):
-        return self._delegate.calculate_fair_value()
-
-    def generate_markdown_report(self):
-        return self._delegate.generate_markdown_report()
-
-    def generate_pdf_report(self):
-        return self._delegate.generate_pdf_report()
-
-
 class BankAnalyzer(BaseAnalyzer):
     """Step 2 real implementation - NII/LTD sins checklist and DDM/ROE-P-B
     fair value (compute_bank_metrics()), rendered by the dedicated
@@ -219,8 +170,64 @@ class BankAnalyzer(BaseAnalyzer):
         )
 
 
-class ReitAnalyzer(_DelegatingStubAnalyzer):
-    """Step 1 stub, unchanged - real NAV/FFO logic is Step 3 scope."""
+class ReitAnalyzer(BaseAnalyzer):
+    """Step 3 real implementation - FFO/AFFO/NOI sins checklist and NAV fair
+    value (compute_reit_metrics()), rendered by the dedicated
+    build_reit_pdf_report()/build_reit_markdown_report() (spec Section 6).
+    No longer delegates to OrdinaryAnalyzer: check_sector_suitability() no
+    longer restricts any sector at all (see its docstring), and
+    AnalyzerFactory routes REIT industries here unconditionally, with or
+    without --force (spec Section 7.1.4 - the flag is accepted but has no
+    effect on this class), mirroring BankAnalyzer's Step 2 routing.
+    """
+
+    def calculate_fair_value(self):
+        # compute_reit_metrics() already computed the NAV fair value
+        # alongside the sins checklist in one pass - nothing further to do.
+        return self.metrics
+
+    def fetch_data(self):
+        self.data = get_company_data(
+            self.ticker,
+            retries=getattr(self.args, "retries", 5),
+            retry_delay=getattr(self.args, "retry_delay", 5),
+            allow_sample=getattr(self.args, "allow_sample", False),
+        )
+        return self.data
+
+    def calculate_metrics(self):
+        self.metrics = compute_reit_metrics(
+            self.data, required_return=getattr(self.args, "required_return", None)
+        )
+        return self.metrics
+
+    def generate_markdown_report(self):
+        return build_reit_markdown_report(
+            self.ticker, self.data, self.metrics,
+            getattr(self.args, "catalysts_text", None),
+        )
+
+    def generate_pdf_report(self):
+        # Re-fetches and re-computes internally, same accepted seam as
+        # OrdinaryAnalyzer.generate_pdf_report() (see its docstring).
+        return build_reit_pdf_report(
+            self.ticker,
+            retries=getattr(self.args, "retries", 5),
+            retry_delay=getattr(self.args, "retry_delay", 5),
+            allow_sample=getattr(self.args, "allow_sample", False),
+            catalysts_text=getattr(self.args, "catalysts_text", None),
+            required_return=getattr(self.args, "required_return", None),
+        )
+
+
+def _is_reit(info):
+    """Spec Section 1.1 routing marker - industry/sector text containing a
+    REIT keyword, independent of check_sector_suitability()'s old
+    sector-gated rule (kept only for the now-dormant warning-banner path,
+    see that function's docstring)."""
+    industry = str(info.get("industry") or "").lower()
+    sector = str(info.get("sector") or "").lower()
+    return "reit" in industry or "real estate investment trust" in industry or "real estate investment trust" in sector
 
 
 class AnalyzerFactory:
@@ -230,24 +237,25 @@ class AnalyzerFactory:
         dict for `ticker` - callers fetch this once and pass it in; this
         function never fetches data itself, it only routes).
 
-        Financial Services (banks) is routed to BankAnalyzer unconditionally,
-        before check_sector_suitability() is even called - Step 2 gave banks
-        a real specialized engine, so there is no --force gate and no
-        warning-banner path for them anymore (spec Section 2.1: "Снятие
-        блокировки"). --force is still accepted for a bank ticker (backward
-        compatibility, spec Section 2.1.2) but has no effect on this branch.
+        Financial Services (banks, Step 2) and REIT industries (Step 3) are
+        both routed to their real analyzers unconditionally, before
+        check_sector_suitability() is even called - neither needs a --force
+        gate or a warning-banner path anymore, since both got dedicated
+        specialized engines. --force is still accepted for either (backward
+        compatibility) but has no effect on these two branches.
 
-        For every other sector, reuses check_sector_suitability() as-is for
-        both the routing decision and the fail-fast-without---force
-        behavior (REIT only, as of Step 2) - raises UnsupportedSectorError
-        (from financial_analyzer.py, unchanged) when the sector is restricted
-        and args.force is falsy. Callers catch it exactly as they do today.
+        Every remaining ticker falls through to check_sector_suitability(),
+        which as of Step 3 never restricts anything (see its docstring) -
+        kept in place only so a future sector can reuse the same mechanism,
+        and so OrdinaryAnalyzer's warning-banner rendering path in
+        build_markdown_report()/build_pdf_report() stays exercised by its
+        existing tests even though no live sector currently triggers it.
 
         Stashes excluded_sector/excluded_industry onto `args` so
-        OrdinaryAnalyzer.generate_markdown_report() (and, via delegation,
-        ReitAnalyzer) can thread them into the warning-banner rendering
-        without another signature change to build_markdown_report(). Set to
-        None for the bank branch, which never carries that warning banner.
+        OrdinaryAnalyzer.generate_markdown_report() can thread them into the
+        warning-banner rendering without another signature change to
+        build_markdown_report(). Set to None for the bank/REIT branches,
+        which never carry that warning banner.
         """
         sector = info.get("sector") or ""
         if sector == "Financial Services":
@@ -255,10 +263,13 @@ class AnalyzerFactory:
             args.excluded_industry = None
             return BankAnalyzer(ticker, args)
 
+        if _is_reit(info):
+            args.excluded_sector = None
+            args.excluded_industry = None
+            return ReitAnalyzer(ticker, args)
+
         force = getattr(args, "force", False)
         excluded_sector, excluded_industry = check_sector_suitability(ticker, info, force)
         args.excluded_sector = excluded_sector
         args.excluded_industry = excluded_industry
-        if excluded_sector is None:
-            return OrdinaryAnalyzer(ticker, args)
-        return ReitAnalyzer(ticker, args)
+        return OrdinaryAnalyzer(ticker, args)

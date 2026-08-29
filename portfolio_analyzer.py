@@ -42,41 +42,60 @@ FORCE_WARNING_FOOTNOTE = (
 
 def _ticker_label(r):
     """Ticker label shared by the console table, PDF, and Markdown outputs -
-    flags a --force'd REIT holding so it can't blend in with a normal,
-    methodology-valid result (see check_sector_suitability). Banks are no
-    longer flagged here - Step 2 gave them a real, methodology-valid engine
-    (BankAnalyzer), so AnalyzerFactory never sets excluded_sector for them."""
-    return f"{r['ticker']} ⚠️" if r.get("excluded_sector") else r["ticker"]
+    flags a --force'd holding in a still-restricted sector so it can't blend
+    in with a normal, methodology-valid result (see check_sector_suitability -
+    currently never fires, kept for a future restricted sector). Banks and
+    REIT are never flagged this way - both have a real, methodology-valid
+    engine (BankAnalyzer/ReitAnalyzer), so AnalyzerFactory never sets
+    excluded_sector for them. REIT rows instead get a "(REIT)" suffix (spec
+    Section 6.2) so they're visually distinguishable in the same table."""
+    label = f"{r['ticker']} ⚠️" if r.get("excluded_sector") else r["ticker"]
+    if r.get("ok") and r.get("metrics", {}).get("kind") == "reit":
+        label = f"{label} (REIT)"
+    return label
 
 
 def _is_bank(m):
     return m.get("kind") == "bank"
 
 
+def _is_reit(m):
+    return m.get("kind") == "reit"
+
+
 def _liquidity_label(m):
-    """Current Ratio for Ordinary, LTD (Loan-to-Deposit) for banks - spec
-    Section 2.2.2, since Current Ratio is meaningless for a bank's balance
-    sheet structure."""
+    """Current Ratio for Ordinary, LTD (Loan-to-Deposit) for banks, P/FFO
+    for REIT (spec Section 6.2 - replaces P/E) - Current Ratio is meaningless
+    for a bank's balance sheet structure or a REIT's depreciation-distorted
+    earnings."""
     if _is_bank(m):
         return "N/A" if m["ltd_ratio"] is None else f"LTD {m['ltd_ratio'] * 100:.1f}%"
+    if _is_reit(m):
+        return "N/A" if m["p_ffo"] is None else f"P/FFO {m['p_ffo']:.1f}x"
     return f"CR {m['current_ratio']:.2f}" if m.get("current_ratio") is not None else "N/A"
 
 
 def _cashflow_label(m):
-    """FCF for Ordinary, Net Interest Income (NII) for banks - spec Section
-    2.2.2, since banks don't generate a classical Free Cash Flow figure."""
+    """FCF for Ordinary, Net Interest Income (NII) for banks, AFFO Payout
+    Ratio for REIT (spec Section 6.2 - replaces Payout) - banks and REITs
+    don't generate a classical Free Cash Flow figure."""
     if _is_bank(m):
         nii = m["net_interest_income"]
         return f"NII {nii.iloc[-1] / 1e6:,.0f}M" if len(nii) else "N/A"
+    if _is_reit(m):
+        ratio = m["affo_payout_ratio"]
+        if ratio is None:
+            return "N/A (no div.)"
+        return "Payout ∞" if ratio == float("inf") else f"Payout {ratio * 100:.0f}%"
     fcf = m["fcf"]
     return f"FCF {fcf.iloc[-1] / 1e6:,.0f}M" if len(fcf) else "N/A"
 
 
 def _leverage_label(m):
-    """Net Debt for Ordinary, Total Debt/Shareholders Equity for banks - spec
-    Section 2.2.2, since banks have no Enterprise Value/Net Debt in the
-    classical DCF sense."""
-    if _is_bank(m):
+    """Net Debt for Ordinary, Total Debt/Shareholders Equity for banks and
+    REIT - neither bank nor REIT has an Enterprise Value/Net Debt figure in
+    the classical DCF sense (spec Section 2.2.2 / Step 3 Section 4.2)."""
+    if _is_bank(m) or _is_reit(m):
         return "N/A" if m["debt_to_equity"] is None else f"D/E {m['debt_to_equity']:.2f}x"
     return f"ND {m['net_debt'] / 1e9:,.2f}B"
 
@@ -146,20 +165,20 @@ def analyze_holdings(holdings, retries=5, retry_delay=5, force=False, required_r
 def print_table(results):
     print("\n" + "=" * 100)
     header = (
-        f"{'Тикер':<7}{'Вес':<6}{'Цена':<12}{'DCF fair':<12}{'Откл.':<12}{'Вердикт':<20}{'Грехи':<20}"
+        f"{'Тикер':<14}{'Вес':<6}{'Цена':<12}{'DCF fair':<12}{'Откл.':<12}{'Вердикт':<20}{'Грехи':<20}"
         f"{'Ликвидность':<14}{'Ден.поток':<14}{'Долг.нагрузка':<14}"
     )
     print(header)
     print("-" * 100)
     for r in results:
         if not r["ok"]:
-            print(f"{r['ticker']:<7}{r['weight']:>4.0f}% {'НЕТ ДАННЫХ (Yahoo)':<50}")
+            print(f"{r['ticker']:<14}{r['weight']:>4.0f}% {'НЕТ ДАННЫХ (Yahoo)':<50}")
             continue
         m = r["metrics"]
         ou = m["over_under_pct"]
         label = "недооценена" if ou > 10 else "переоценена" if ou < -10 else "справедливо"
         print(
-            f"{_ticker_label(r):<7}{r['weight']:>4.0f}% "
+            f"{_ticker_label(r):<14}{r['weight']:>4.0f}% "
             f"${m['price']:<10.2f}${m['fair_value_share']:<10.2f}"
             f"{ou:+.1f}% ({label:<12}) "
             f"{m['verdict']:<20}{_sins_label(m):<20}"
@@ -220,7 +239,7 @@ def build_comparative_pdf(results, name="Portfolio"):
 
     headers = [
         "Тикер", "Вес", "Цена", "DCF fair value", "Откл. от справ. цены", "Вердикт", "Грехи",
-        "Ликвидность (CR/LTD)", "Ден.поток (FCF/NII)", "Долг.нагрузка (ND/D-E)",
+        "Ликвидность (CR/LTD/P-FFO)", "Ден.поток (FCF/NII/Payout)", "Долг.нагрузка (ND/D-E)",
     ]
     rows = []
     failed = []
@@ -281,7 +300,7 @@ def build_comparative_markdown(results, name="Portfolio"):
         "## 1. Сводная таблица",
         "",
         "| Тикер | Вес | Цена | DCF fair value | Откл. от справ. цены | Вердикт | Грехи | "
-        "Ликвидность (CR/LTD) | Ден.поток (FCF/NII) | Долг.нагрузка (ND/D-E) |",
+        "Ликвидность (CR/LTD/P-FFO) | Ден.поток (FCF/NII/Payout) | Долг.нагрузка (ND/D-E) |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     failed = []
