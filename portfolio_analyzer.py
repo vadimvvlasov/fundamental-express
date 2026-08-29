@@ -17,6 +17,8 @@ from financial_analyzer import (
     create_reportlab_table,
     get_company_data,
     compute_metrics,
+    check_sector_suitability,
+    UnsupportedSectorError,
     DataUnavailableError,
 )
 from reportlab.lib.enums import TA_JUSTIFY
@@ -32,6 +34,19 @@ def _sins_label(m):
     return f"{len(m['critical_sins'])} крит. / {m['minor_score']:.1f} из {m['max_minor_score']:.1f}"
 
 
+FORCE_WARNING_FOOTNOTE = (
+    "⚠️ — Компания из несовместимого сектора (Финансы/REIT). "
+    "Экспресс-метрики и DCF-оценка могут быть некорректны."
+)
+
+
+def _ticker_label(r):
+    """Ticker label shared by the console table, PDF, and Markdown outputs -
+    flags a --force'd Financials/REIT holding so it can't blend in with a
+    normal, methodology-valid result (see check_sector_suitability)."""
+    return f"{r['ticker']} ⚠️" if r.get("excluded_sector") else r["ticker"]
+
+
 def parse_holdings(args_list):
     holdings = []
     for item in args_list:
@@ -44,25 +59,36 @@ def parse_holdings(args_list):
     return holdings
 
 
-def analyze_holdings(holdings, retries=5, retry_delay=5):
+def analyze_holdings(holdings, retries=5, retry_delay=5, force=False):
     """Fetch + analyze each ticker. Real data only - failures are reported,
-    never silently swapped for mock numbers."""
+    never silently swapped for mock numbers.
+
+    A Financials/REIT ticker without --force raises UnsupportedSectorError
+    straight out of this function (not caught here, unlike
+    DataUnavailableError) - a bad sector isn't a per-ticker fetch hiccup to
+    skip past, it's a reason to abort the whole run before any more Yahoo
+    Finance calls or a comparative report gets built on invalid numbers.
+    """
     results = []
     for ticker, weight in holdings:
         print(f"\n=== {ticker} ({weight}%) ===")
         try:
             data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=False)
-            m = compute_metrics(data)
-            results.append({
-                "ticker": ticker,
-                "weight": weight,
-                "name": data["name"],
-                "ok": True,
-                "metrics": m,
-            })
         except DataUnavailableError as e:
             print(f"  SKIPPED: {e}")
             results.append({"ticker": ticker, "weight": weight, "ok": False, "error": str(e)})
+            continue
+        excluded_sector, excluded_industry = check_sector_suitability(ticker, data.get("info", {}), force)
+        m = compute_metrics(data)
+        results.append({
+            "ticker": ticker,
+            "weight": weight,
+            "name": data["name"],
+            "ok": True,
+            "metrics": m,
+            "excluded_sector": excluded_sector,
+            "excluded_industry": excluded_industry,
+        })
     return results
 
 
@@ -79,12 +105,14 @@ def print_table(results):
         ou = m["over_under_pct"]
         label = "недооценена" if ou > 10 else "переоценена" if ou < -10 else "справедливо"
         print(
-            f"{r['ticker']:<7}{r['weight']:>4.0f}% "
+            f"{_ticker_label(r):<7}{r['weight']:>4.0f}% "
             f"${m['price']:<10.2f}${m['fair_value_share']:<10.2f}"
             f"{ou:+.1f}% ({label:<12}) "
             f"{m['verdict']:<20}{_sins_label(m)}"
         )
     print("=" * 100)
+    if any(r.get("excluded_sector") for r in results):
+        print(f"* {FORCE_WARNING_FOOTNOTE}")
 
 
 def build_comparative_pdf(results, name="Portfolio"):
@@ -148,7 +176,7 @@ def build_comparative_pdf(results, name="Portfolio"):
         ou = m["over_under_pct"]
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         rows.append([
-            r["ticker"], w, f"${m['price']:,.2f}", f"${m['fair_value_share']:,.2f}",
+            _ticker_label(r), w, f"${m['price']:,.2f}", f"${m['fair_value_share']:,.2f}",
             ou_label, m["verdict"], _sins_label(m),
         ])
     story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[42, 32, 55, 65, 120, 70, 70]))
@@ -161,17 +189,21 @@ def build_comparative_pdf(results, name="Portfolio"):
             USABLE_W, COLORS, callout_text, COLORS["warning"]))
         story.append(Spacer(1, 8))
 
+    if any(r.get("excluded_sector") for r in results):
+        story.append(CalloutBox(FORCE_WARNING_FOOTNOTE, USABLE_W, COLORS, callout_text, COLORS["muted"]))
+        story.append(Spacer(1, 8))
+
     story.append(Paragraph("2. Детали по «грехам»", h1))
     for r in results:
         if not r["ok"]:
             continue
         m = r["metrics"]
         if m["sins"]:
-            text = f"<b>{r['ticker']}</b>: " + "; ".join(s.message for s in m["sins"])
+            text = f"<b>{_ticker_label(r)}</b>: " + "; ".join(s.message for s in m["sins"])
             box_color = COLORS["danger"] if m["critical_sins"] else COLORS["warning"]
             story.append(CalloutBox(text, USABLE_W, COLORS, callout_text, box_color))
         else:
-            story.append(CalloutBox(f"<b>{r['ticker']}</b>: грехов не обнаружено.", USABLE_W, COLORS, callout_text, COLORS["success"]))
+            story.append(CalloutBox(f"<b>{_ticker_label(r)}</b>: грехов не обнаружено.", USABLE_W, COLORS, callout_text, COLORS["success"]))
         story.append(Spacer(1, 4))
 
     doc.build(story)
@@ -203,7 +235,7 @@ def build_comparative_markdown(results, name="Portfolio"):
         ou = m["over_under_pct"]
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         lines.append(
-            f"| {r['ticker']} | {w} | ${m['price']:,.2f} | ${m['fair_value_share']:,.2f} | "
+            f"| {_ticker_label(r)} | {w} | ${m['price']:,.2f} | ${m['fair_value_share']:,.2f} | "
             f"{ou_label} | {m['verdict']} | {_sins_label(m)} |"
         )
     lines.append("")
@@ -215,6 +247,9 @@ def build_comparative_markdown(results, name="Portfolio"):
             "",
         ]
 
+    if any(r.get("excluded_sector") for r in results):
+        lines += [f"> {FORCE_WARNING_FOOTNOTE}", ""]
+
     lines.append("## 2. Детали по «грехам»")
     lines.append("")
     for r in results:
@@ -222,9 +257,9 @@ def build_comparative_markdown(results, name="Portfolio"):
             continue
         m = r["metrics"]
         if m["sins"]:
-            lines.append(f"- **{r['ticker']}**: " + "; ".join(s.message for s in m["sins"]))
+            lines.append(f"- **{_ticker_label(r)}**: " + "; ".join(s.message for s in m["sins"]))
         else:
-            lines.append(f"- **{r['ticker']}**: грехов не обнаружено.")
+            lines.append(f"- **{_ticker_label(r)}**: грехов не обнаружено.")
     lines.append("")
 
     with open(md_path, "w") as f:
@@ -245,10 +280,18 @@ if __name__ == "__main__":
     parser.add_argument("--name", default="Portfolio", help="Report name (used in the PDF filename/title)")
     parser.add_argument("--retries", type=int, default=5, help="Retries per ticker before giving up (default 5)")
     parser.add_argument("--retry-delay", type=int, default=5, help="Seconds to wait between retries (default 5)")
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Принудительно запустить анализ для несовместимых секторов (Финансы/REIT) под ответственность пользователя.",
+    )
     args = parser.parse_args()
 
     holdings = parse_holdings(args.holdings)
-    results = analyze_holdings(holdings, retries=args.retries, retry_delay=args.retry_delay)
+    try:
+        results = analyze_holdings(holdings, retries=args.retries, retry_delay=args.retry_delay, force=args.force)
+    except UnsupportedSectorError as e:
+        print(str(e))
+        raise SystemExit(1)
     print_table(results)
     build_comparative_pdf(results, name=args.name)
     build_comparative_markdown(results, name=args.name)
