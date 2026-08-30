@@ -1,21 +1,26 @@
-import argparse
 import os
 import sys
 from datetime import datetime
 
-# Resolve workspace root relative to this script file
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRATCH_DIR = os.path.join(SCRIPT_DIR, "scratch")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
-os.makedirs(SCRATCH_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Resolve workspace root relative to this script file, purely to bootstrap
+# sys.path below before fundamental_express is importable - the canonical
+# SCRIPT_DIR/SCRATCH_DIR/OUTPUT_DIR now live in
+# fundamental_express.cli.paths (docs/spec/refactor-tasks.md T22) and are
+# re-imported a few lines down once that import becomes possible.
+_BOOTSTRAP_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Package-under-migration lives in src/ (docs/spec/refactor-architecture-spec.md)
 # and isn't installed - add it to sys.path so `python financial_analyzer.py`
 # keeps working unchanged from any working directory.
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
+sys.path.insert(0, os.path.join(_BOOTSTRAP_SCRIPT_DIR, "src"))
 
 import pandas as pd
+
+# Moved to src/fundamental_express/cli/paths.py (docs/spec/refactor-tasks.md
+# T22). SCRIPT_DIR/SCRATCH_DIR are not otherwise used in this file anymore,
+# but stay re-exported under their original names since nothing forbids an
+# external caller from having imported them from here before T22.
+from fundamental_express.cli.paths import SCRIPT_DIR, SCRATCH_DIR, OUTPUT_DIR  # noqa: E402
 
 # The express "sins" checklist in compute_metrics() is a two-tier model
 # (see docs/spec/technical-implementation-spec.md Section 1):
@@ -781,66 +786,20 @@ from fundamental_express.reporting.sections_bank import build_bank_sections  # n
 from fundamental_express.reporting.sections_reit import build_reit_sections  # noqa: E402
 
 
-CATALYSTS_PLACEHOLDER = (
-    "Катализаторы не указаны — заполните вручную перед принятием решения. "
-    "Справедливая стоимость по DCF может не реализовываться рынком годами без триггера переоценки."
-)
-
-
-def resolve_catalysts_text(catalysts=None, catalysts_file=None):
-    """Resolve the qualitative catalysts/risks text for report Section 5.
-
-    Catalysts (product launches, regulatory shifts, reputational-crisis
-    recovery) aren't fetchable data - they're an analyst's judgment call, so
-    this never auto-generates or auto-fetches them. --catalysts and
-    --catalysts-file are mutually exclusive - checked here, before any
-    network call, so a bad CLI combo fails fast rather than after a slow
-    Yahoo Finance round-trip. Neither given -> the mandatory
-    methodology-reminder placeholder, never a fabricated catalyst.
-    """
-    if catalysts and catalysts_file:
-        raise SystemExit("--catalysts and --catalysts-file are mutually exclusive")
-    if catalysts_file:
-        try:
-            with open(catalysts_file, encoding="utf-8") as f:
-                text = f.read().strip()
-        except FileNotFoundError:
-            raise SystemExit(f"--catalysts-file not found: {catalysts_file}")
-        return text or CATALYSTS_PLACEHOLDER
-    if catalysts:
-        return catalysts.strip() or CATALYSTS_PLACEHOLDER
-    return CATALYSTS_PLACEHOLDER
-
-
-def required_return_type(value):
-    """argparse `type=` for --required-return. Fails fast (during parse_args(),
-    before any network call) rather than silently clamping - a clamped
-    out-of-range value (e.g. a `15` typo instead of `0.15`) would produce a
-    plausible-looking but silently wrong fair value with no indication
-    anything went wrong. Shared by financial_analyzer.py and
-    portfolio_analyzer.py so the validation behavior never drifts between them.
-    """
-    try:
-        fvalue = float(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Требуемая доходность должна быть числом. Получено: '{value}'")
-    if fvalue > 1.0:
-        suggested = fvalue / 100.0
-        raise argparse.ArgumentTypeError(
-            f"Некорректное значение: {value}. Параметр --required-return должен быть долей от единицы "
-            f"(например, 0.15, а не 15). Возможно, вы имели в виду {suggested:.3f}?"
-        )
-    if not (0.05 <= fvalue <= 0.25):
-        raise argparse.ArgumentTypeError(
-            f"Требуемая доходность должна быть в диапазоне 0.05-0.25 (5%-25%). Получено: {fvalue}."
-        )
-    return fvalue
+# Moved to src/fundamental_express/cli/catalysts.py and cli/args.py
+# (docs/spec/refactor-tasks.md T22). Re-exported under their original names -
+# analyzers.py imports CATALYSTS_PLACEHOLDER from here, and
+# tests/test_verdict_scoring.py imports required_return_type from here.
+from fundamental_express.cli.catalysts import CATALYSTS_PLACEHOLDER, resolve_catalysts_text  # noqa: E402
+from fundamental_express.cli.args import required_return_type  # noqa: E402
 
 
 # ── ORDINARY / BANK / REIT PDF REPORTS ──────────────────────────────────
 # Rendering portion (ReportLab document assembly) moved to
 # src/fundamental_express/reporting/pdf.py::render() (docs/spec/refactor-tasks.md T20).
-# Fetch/compute orchestration stays here until T21 moves it into analyzers.py.
+# Fetch/compute orchestration stays here - only cli/single_ticker.py's CLI
+# still calls these; AnalyzerFactory's analyzers (T21) call pdf_render()/
+# md_render() directly on self.data/self.metrics instead.
 def build_pdf_report(
     ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, force=False,
     required_return=None,
@@ -908,55 +867,8 @@ def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     return pdf_filename, md_filename
 
 
+# Moved to src/fundamental_express/cli/single_ticker.py (docs/spec/refactor-tasks.md T22).
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Comprehensive Fundamental Express Analyzer & DCF Model"
-    )
-    parser.add_argument(
-        "ticker", type=str, nargs="?", default="AAPL",
-        help="Stock ticker symbol (e.g. AAPL, MSFT, TSLA)",
-    )
-    parser.add_argument(
-        "--retries", type=int, default=5,
-        help="How many times to retry Yahoo Finance before giving up (default 5)",
-    )
-    parser.add_argument(
-        "--retry-delay", type=int, default=5,
-        help="Seconds to wait between retries (default 5)",
-    )
-    parser.add_argument(
-        "--allow-sample", action="store_true",
-        help="Fall back to labeled SAMPLE data if real data can't be fetched (demo only, off by default)",
-    )
-    parser.add_argument(
-        "--catalysts", type=str, default=None,
-        help="Free-text note on catalysts/risks to embed in the report (e.g. product launch, regulatory event).",
-    )
-    parser.add_argument(
-        "--catalysts-file", type=str, default=None,
-        help="Path to a text file with the catalysts note (alternative to --catalysts).",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Принудительно запустить анализ для несовместимых секторов (Финансы/REIT) под ответственность пользователя.",
-    )
-    parser.add_argument(
-        "--required-return", type=required_return_type, default=None,
-        help="Персональная требуемая доходность инвестора (0.05-0.25), заменяет CAPM-расчёт Ke.",
-    )
-    args = parser.parse_args()
+    from fundamental_express.cli.single_ticker import main
 
-    catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
-
-    try:
-        build_pdf_report(
-            args.ticker, retries=args.retries, retry_delay=args.retry_delay,
-            allow_sample=args.allow_sample, catalysts_text=catalysts_text, force=args.force,
-            required_return=args.required_return,
-        )
-    except DataUnavailableError as e:
-        print(f"FAILED: {e}")
-        raise SystemExit(1)
-    except UnsupportedSectorError as e:
-        print(str(e))
-        raise SystemExit(1)
+    main()
