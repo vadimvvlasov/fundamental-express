@@ -8,7 +8,8 @@ T12a: compute_forward_outlook/_peg_assessment/_EMPTY_FORWARD_OUTLOOK.
 T12b: REIT_CAP_RATE_MATRIX/_reit_cap_rate.
 T12c: ordinary_dcf_valuation (CAPM/WACC/DCF, Ordinary v3 DDM auto-switch,
 sensitivity matrix).
-T12d (this commit): bank_valuation (DDM or ROE/P-B).
+T12d: bank_valuation (DDM or ROE/P-B).
+T12e (this commit): reit_nav_valuation (NAV).
 """
 
 import pandas as pd
@@ -332,6 +333,65 @@ def _reit_cap_rate(info):
         if any(kw in haystack for kw in keywords):
             return rate, label
     return REIT_DEFAULT_CAP_RATE, REIT_DEFAULT_CAP_RATE_LABEL
+
+
+def reit_nav_valuation(info, noi, cash, receivables, construction_in_progress, total_liab, shares, price, ffo, diluted_shares, beta):
+    """NAV (Net Asset Value) fair value (spec Section 5) - REITs get no
+    CAPM cost of equity or DCF/DDM model switch (classical DCF is
+    meaningless for a pass-through of rental cash flow, see spec Section
+    0/2), so ValuationResult.valuation_model/cost_of_equity/
+    required_return_used all stay at their None default here. Moved
+    verbatim out of compute_reit_metrics() - every input here was already
+    computed earlier in that function.
+
+    Returns (ValuationResult, extras) - extras carries cap_rate/
+    cap_rate_label/property_value/nav/ffo_per_share/p_ffo.
+    """
+    cap_rate, cap_rate_label = _reit_cap_rate(info)
+    latest_noi = noi.iloc[-1]
+    property_value = latest_noi / cap_rate if cap_rate else 0.0
+    latest_cash = cash.iloc[-1] if not pd.isna(cash.iloc[-1]) else 0.0
+    latest_receivables = receivables.iloc[-1] if not pd.isna(receivables.iloc[-1]) else 0.0
+    latest_cip = construction_in_progress.iloc[-1] if not pd.isna(construction_in_progress.iloc[-1]) else 0.0
+    latest_total_liab = total_liab.iloc[-1] if not pd.isna(total_liab.iloc[-1]) else 0.0
+    nav = property_value + latest_cash + latest_receivables + latest_cip - latest_total_liab
+    fair_value_share = nav / shares if shares > 0 else 0.0
+
+    over_under = (fair_value_share - price) / price * 100 if price else 0.0
+    if over_under > 10.0:
+        val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
+        val_color_key = "success"
+    elif over_under < -10.0:
+        val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
+        val_color_key = "danger"
+    else:
+        val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
+        val_color_key = "warning"
+
+    latest_ffo = ffo.iloc[-1]
+    latest_diluted_shares = (
+        diluted_shares.iloc[-1] if len(diluted_shares) and not pd.isna(diluted_shares.iloc[-1]) else shares
+    )
+    ffo_per_share = latest_ffo / latest_diluted_shares if latest_diluted_shares else None
+    p_ffo = price / ffo_per_share if ffo_per_share and ffo_per_share > 0 else None
+
+    valuation = ValuationResult(
+        price=price,
+        fair_value_share=fair_value_share,
+        over_under_pct=over_under,
+        val_status=val_status,
+        val_color_key=val_color_key,
+        beta=beta,
+    )
+    extras = {
+        "cap_rate": cap_rate,
+        "cap_rate_label": cap_rate_label,
+        "property_value": property_value,
+        "nav": nav,
+        "ffo_per_share": ffo_per_share,
+        "p_ffo": p_ffo,
+    }
+    return valuation, extras
 
 
 _EMPTY_FORWARD_OUTLOOK = {

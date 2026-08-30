@@ -146,11 +146,12 @@ from fundamental_express.reporting.charts import (  # noqa: E402
     generate_ffo_chart,
 )
 
-# Ordinary DCF/DDM and Bank DDM/ROE-P-B valuation - moved to
-# src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c/T12d).
+# Ordinary DCF/DDM, Bank DDM/ROE-P-B, and REIT NAV valuation - moved to
+# src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c/T12d/T12e).
 from fundamental_express.domain.valuation import (  # noqa: E402
     ordinary_dcf_valuation,
     bank_valuation,
+    reit_nav_valuation,
 )
 
 
@@ -1223,33 +1224,21 @@ def compute_reit_metrics(data, required_return=None):
         )
 
     # ── Section 5: NAV fair value ────────────────────────────────────────
-    cap_rate, cap_rate_label = _reit_cap_rate(info)
-    latest_noi = noi.iloc[-1]
-    property_value = latest_noi / cap_rate if cap_rate else 0.0
-    latest_cash = cash.iloc[-1] if not pd.isna(cash.iloc[-1]) else 0.0
-    latest_receivables = receivables.iloc[-1] if not pd.isna(receivables.iloc[-1]) else 0.0
-    latest_cip = construction_in_progress.iloc[-1] if not pd.isna(construction_in_progress.iloc[-1]) else 0.0
-    latest_total_liab = total_liab.iloc[-1] if not pd.isna(total_liab.iloc[-1]) else 0.0
-    nav = property_value + latest_cash + latest_receivables + latest_cip - latest_total_liab
-    fair_value_share = nav / shares if shares > 0 else 0.0
-
-    over_under = (fair_value_share - price) / price * 100 if price else 0.0
-    if over_under > 10.0:
-        val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
-        val_color_key = "success"
-    elif over_under < -10.0:
-        val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
-        val_color_key = "danger"
-    else:
-        val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
-        val_color_key = "warning"
-
-    latest_ffo = ffo.iloc[-1]
-    latest_diluted_shares = (
-        diluted_shares.iloc[-1] if len(diluted_shares) and not pd.isna(diluted_shares.iloc[-1]) else shares
+    # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12e).
+    valuation, val_extras = reit_nav_valuation(
+        info, noi, cash, receivables, construction_in_progress, total_liab,
+        shares, price, ffo, diluted_shares, beta,
     )
-    ffo_per_share = latest_ffo / latest_diluted_shares if latest_diluted_shares else None
-    p_ffo = price / ffo_per_share if ffo_per_share and ffo_per_share > 0 else None
+    fair_value_share = valuation.fair_value_share
+    over_under = valuation.over_under_pct
+    val_status = valuation.val_status
+    val_color_key = valuation.val_color_key
+    cap_rate = val_extras["cap_rate"]
+    cap_rate_label = val_extras["cap_rate_label"]
+    property_value = val_extras["property_value"]
+    nav = val_extras["nav"]
+    ffo_per_share = val_extras["ffo_per_share"]
+    p_ffo = val_extras["p_ffo"]
 
     return {
         "kind": "reit",
