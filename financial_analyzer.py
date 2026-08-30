@@ -146,6 +146,10 @@ from fundamental_express.reporting.charts import (  # noqa: E402
     generate_ffo_chart,
 )
 
+# Ordinary DCF/DDM valuation - moved to
+# src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c).
+from fundamental_express.domain.valuation import ordinary_dcf_valuation  # noqa: E402
+
 
 # ── CORE ANALYSIS: EXPRESS "SINS" CHECKLIST + DCF ───────────────────────
 def compute_metrics(data, required_return=None):
@@ -563,150 +567,33 @@ def compute_metrics(data, required_return=None):
             "см. список ниже. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
         )
 
-    # ── DCF valuation (CAPM WACC) ───────────────────────────────────────
-    fcf_values = fcf.values
-    if len(fcf_values) >= 2 and fcf_values[0] > 0 and fcf_values[-1] > 0:
-        cagr = (fcf_values[-1] / fcf_values[0]) ** (1 / (len(fcf_values) - 1)) - 1
-        cagr = max(0.02, min(0.15, cagr))
-    else:
-        cagr = 0.05
-
-    rf_rate = 0.04
-    erp = 0.05
-    # --required-return lets the investor override CAPM entirely with their
-    # own required rate of return, bypassing the beta-driven Ke formula.
-    cost_of_equity = required_return if required_return is not None else rf_rate + beta * erp
-    cost_of_debt = 0.045
-    tax_rate = 0.21
-    after_tax_debt = cost_of_debt * (1 - tax_rate)
-
-    # latest_debt/net_debt (and its cash/lease/reported-vs-computed
-    # breakdown) are computed earlier now, ahead of the sins checklist -
-    # see the "Net debt - moved ahead..." comment above.
-    market_cap = price * shares
-    total_cap = market_cap + latest_debt
-    if total_cap > 0:
-        w_equity = market_cap / total_cap
-        w_debt = latest_debt / total_cap
-        wacc = (w_equity * cost_of_equity) + (w_debt * after_tax_debt)
-    else:
-        w_equity, w_debt = 1.0, 0.0
-        wacc = 0.09
-    wacc = max(0.05, min(0.15, wacc))
-
-    proj_years = list(range(1, 6))
-    fcf_latest = fcf_values[-1]
-    projected_fcfs = []
-    pv_fcfs = []
-    for t in proj_years:
-        future_fcf = fcf_latest * ((1 + cagr) ** t)
-        pv_fcf = future_fcf / ((1 + wacc) ** t)
-        projected_fcfs.append(future_fcf)
-        pv_fcfs.append(pv_fcf)
-
-    sum_pv_fcfs = sum(pv_fcfs)
-    terminal_g = 0.025
-    terminal_val = (
-        projected_fcfs[-1] * (1 + terminal_g) / (wacc - terminal_g)
-        if wacc > terminal_g
-        else 0.0
+    # ── DCF valuation (CAPM WACC, Ordinary v3 DDM auto-switch, sensitivity) ─
+    # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c).
+    valuation, val_extras = ordinary_dcf_valuation(
+        fcf, price, shares, beta, required_return, latest_debt, net_debt,
+        latest_equity, diluted_shares, cash_dividends_paid, data.get("info"),
     )
-    pv_terminal_val = terminal_val / ((1 + wacc) ** 5)
-
-    enterprise_value = sum_pv_fcfs + pv_terminal_val
-    equity_value = enterprise_value - net_debt
-    fair_value_share = equity_value / shares if shares > 0 else 0.0
-
-    over_under = (fair_value_share - price) / price * 100
-    if over_under > 10.0:
-        val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
-        val_color_key = "success"
-    elif over_under < -10.0:
-        val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
-        val_color_key = "danger"
-    else:
-        val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
-        val_color_key = "warning"
-
-    # ── Ordinary v3 (Step 4, spec Section 2.3): auto-switch DCF -> DDM ───
-    # A dividend-paying company with a distorted capital structure (equity
-    # <= 0, or leveraged past D/E 200%) gets a FCF-DCF fair value that's
-    # artificially depressed by lease/debt obligations swallowing the WACC.
-    # For that specific combination, switch to discounting the dividend
-    # stream instead - overrides fair_value_share/over_under/val_status/
-    # val_color_key in place so every existing consumer (portfolio_analyzer,
-    # build_markdown_report, build_pdf_report) keeps reading the same keys
-    # transparently; valuation_model tells the report renderers which
-    # section to draw. Never triggers without diluted_shares data (no
-    # fabricated near-zero DPS from a missing share count).
-    valuation_model = "DCF"
-    cagr_div = None
-    dps_last = None
-    info = data.get("info") or {}
-    dividend_yield = info.get("dividendYield") or 0.0
-    dividend_rate = info.get("dividendRate") or 0.0
-    pays_dividends = dividend_yield > 0 or dividend_rate > 0
-    debt_to_equity_ratio = (
-        latest_debt / latest_equity if latest_equity > 0 and not pd.isna(latest_debt) else None
-    )
-    capital_distorted = latest_equity <= 0 or (debt_to_equity_ratio is not None and debt_to_equity_ratio > 2.0)
-    use_ddm = pays_dividends and capital_distorted and not diluted_shares.isna().all()
-
-    if use_ddm:
-        dps_series = (cash_dividends_paid.abs() / diluted_shares).dropna()
-        dps_window = dps_series.iloc[-4:] if len(dps_series) >= 2 else dps_series
-        if len(dps_window) < 2 or dps_window.iloc[0] <= 0 or dps_window.iloc[-1] <= 0:
-            cagr_div = 0.05
-        else:
-            n_periods = len(dps_window) - 1
-            cagr_div = (dps_window.iloc[-1] / dps_window.iloc[0]) ** (1.0 / n_periods) - 1
-            cagr_div = max(0.02, min(0.10, cagr_div))
-        dps_last = dps_window.iloc[-1] if len(dps_window) else 0.0
-
-        ddm_proj_dps = [dps_last * ((1 + cagr_div) ** t) for t in proj_years]
-        ddm_pv_dividends = [ddm_proj_dps[t - 1] / ((1 + cost_of_equity) ** t) for t in proj_years]
-        ddm_sum_pv = sum(ddm_pv_dividends)
-        ddm_terminal_val = (
-            ddm_proj_dps[-1] * (1 + terminal_g) / (cost_of_equity - terminal_g)
-            if cost_of_equity > terminal_g else 0.0
-        )
-        ddm_pv_terminal = ddm_terminal_val / ((1 + cost_of_equity) ** 5)
-
-        valuation_model = "DDM"
-        fair_value_share = ddm_sum_pv + ddm_pv_terminal
-        over_under = (fair_value_share - price) / price * 100 if price else 0.0
-        if over_under > 10.0:
-            val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
-            val_color_key = "success"
-        elif over_under < -10.0:
-            val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
-            val_color_key = "danger"
-        else:
-            val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
-            val_color_key = "warning"
-
-    wacc_variations = [wacc - 0.015, wacc - 0.0075, wacc, wacc + 0.0075, wacc + 0.015]
-    growth_variations = [cagr - 0.02, cagr - 0.01, cagr, cagr + 0.01, cagr + 0.02]
-
-    sensitivity_rows = []
-    for g_v in growth_variations:
-        row_vals = []
-        for w_v in wacc_variations:
-            if w_v <= terminal_g:
-                row_vals.append("N/A")
-                continue
-            p_f_list = [fcf_latest * ((1 + g_v) ** t) for t in proj_years]
-            pv_f_list = [p_f_list[t - 1] / ((1 + w_v) ** t) for t in proj_years]
-            s_pv = sum(pv_f_list)
-            t_v = p_f_list[-1] * (1 + terminal_g) / (w_v - terminal_g)
-            pv_t_v = t_v / ((1 + w_v) ** 5)
-            ev_v = s_pv + pv_t_v
-            eq_v = ev_v - net_debt
-            fv_s = eq_v / shares if shares > 0 else 0.0
-            row_vals.append(f"{fv_s:.2f} USD")
-        sensitivity_rows.append([f"g = {g_v * 100:.1f}%"] + row_vals)
-
-    sensitivity_headers = ["г / WACC"] + [f"{w * 100:.2f}%" for w in wacc_variations]
+    cost_of_equity = valuation.cost_of_equity
+    fair_value_share = valuation.fair_value_share
+    over_under = valuation.over_under_pct
+    val_status = valuation.val_status
+    val_color_key = valuation.val_color_key
+    valuation_model = valuation.valuation_model
+    wacc = val_extras["wacc"]
+    after_tax_debt = val_extras["cost_of_debt_after_tax"]
+    w_equity = val_extras["equity_weight"]
+    w_debt = val_extras["debt_weight"]
+    cagr = val_extras["cagr"]
+    proj_years = val_extras["proj_years"]
+    projected_fcfs = val_extras["projected_fcfs"]
+    pv_fcfs = val_extras["pv_fcfs"]
+    enterprise_value = val_extras["enterprise_value"]
+    equity_value = val_extras["equity_value"]
+    sensitivity_headers = val_extras["sensitivity_headers"]
+    sensitivity_rows = val_extras["sensitivity_rows"]
+    cagr_div = val_extras["cagr_div"]
+    dps_last = val_extras["dps_last"]
+    debt_to_equity_ratio = val_extras["debt_to_equity_ratio"]
 
     return {
         "year_labels": year_labels,
