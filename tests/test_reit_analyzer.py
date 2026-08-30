@@ -94,10 +94,10 @@ def sin_ids(sins):
 
 def test_zero_sins_is_buy():
     m = compute_reit_metrics(make_reit_data())
-    assert m["sins"] == []
-    assert m["critical_sins"] == []
-    assert m["minor_score"] == 0
-    assert "КУПИТЬ" in m["verdict"]
+    assert m.scoring.sins == []
+    assert m.scoring.critical_sins == []
+    assert m.scoring.minor_score == 0
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_affo_payout_over_100_pct_is_critical():
@@ -107,9 +107,9 @@ def test_affo_payout_over_100_pct_is_critical():
         net_income=(70.0, 70.0), d_and_a=(50.0, 50.0), capex=(-20.0, -20.0),  # FFO=120, AFFO=100
         dividends_paid=(-120.0, -120.0),
     ))
-    assert sin_ids(m["critical_sins"]) == {"affo_payout_over_100"}
-    assert m["affo_payout_ratio"] == pytest.approx(1.2)
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"affo_payout_over_100"}
+    assert m.affo_payout_ratio == pytest.approx(1.2)
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_affo_payout_at_or_below_100_pct_is_not_critical():
@@ -117,38 +117,38 @@ def test_affo_payout_at_or_below_100_pct_is_not_critical():
         net_income=(70.0, 70.0), d_and_a=(50.0, 50.0), capex=(-20.0, -20.0),  # AFFO=100
         dividends_paid=(-100.0, -100.0),  # exactly 100%
     ))
-    assert m["critical_sins"] == []
-    assert m["affo_payout_ratio"] == pytest.approx(1.0)
+    assert m.scoring.critical_sins == []
+    assert m.affo_payout_ratio == pytest.approx(1.0)
 
 
 def test_no_dividends_paid_does_not_count_affo_payout_sin():
     m = compute_reit_metrics(make_reit_data(dividends_paid=(0.0, 0.0)))
-    assert m["affo_payout_ratio"] is None
-    assert "affo_payout_over_100" not in sin_ids(m["critical_sins"])
+    assert m.affo_payout_ratio is None
+    assert "affo_payout_over_100" not in sin_ids(m.scoring.critical_sins)
 
 
 def test_occupancy_below_80_pct_is_critical():
     m = compute_reit_metrics(make_reit_data(info={"occupancy": 0.78}))
-    assert sin_ids(m["critical_sins"]) == {"occupancy_below_80"}
-    assert m["occupancy_rate"] == pytest.approx(0.78)
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"occupancy_below_80"}
+    assert m.occupancy_rate == pytest.approx(0.78)
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_occupancy_at_80_pct_is_not_critical():
     m = compute_reit_metrics(make_reit_data(info={"occupancy": 0.80}))
-    assert m["critical_sins"] == []
+    assert m.scoring.critical_sins == []
 
 
 def test_occupancy_missing_defaults_to_95_pct():
     m = compute_reit_metrics(make_reit_data())
-    assert m["occupancy_rate"] == pytest.approx(0.95)
-    assert m["critical_sins"] == []
+    assert m.occupancy_rate == pytest.approx(0.95)
+    assert m.scoring.critical_sins == []
 
 
 def test_equity_non_positive_is_critical():
     m = compute_reit_metrics(make_reit_data(shareholders_equity=(1000.0, -10.0)))
-    assert sin_ids(m["critical_sins"]) == {"equity_negative"}
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"equity_negative"}
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_critical_sin_does_not_skip_minor_scoring():
@@ -159,8 +159,8 @@ def test_critical_sin_does_not_skip_minor_scoring():
         shareholders_equity=(1000.0, -10.0),
         rental_revenue=(300.0, 250.0),  # NOI declines: 200 -> 150
     ))
-    assert sin_ids(m["critical_sins"]) == {"equity_negative"}
-    assert "noi_declining" in sin_ids(m["minor_sins"])
+    assert sin_ids(m.scoring.critical_sins) == {"equity_negative"}
+    assert "noi_declining" in sin_ids(m.scoring.minor_sins)
 
 
 # ── Section 4.2: Minor sins ──────────────────────────────────────────────
@@ -169,51 +169,51 @@ def test_affo_declining_fires():
     # capex trimmed in proportion to FFO's decline (20/200=10% -> 17/170=10%)
     # so capex_ratio_growth doesn't co-fire - isolates affo_declining alone.
     m = compute_reit_metrics(make_reit_data(net_income=(150.0, 120.0), capex=(-20.0, -17.0)))
-    assert sin_ids(m["minor_sins"]) == {"affo_declining"}
-    assert m["minor_score"] == pytest.approx(1.0)
+    assert sin_ids(m.scoring.minor_sins) == {"affo_declining"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
 
 
 def test_dilution_fires_above_2_5_pct_growth():
     m = compute_reit_metrics(make_reit_data(diluted_shares=(100.0, 103.0)))  # +3%
-    assert sin_ids(m["minor_sins"]) == {"dilution"}
-    assert m["minor_score"] == pytest.approx(1.0)
+    assert sin_ids(m.scoring.minor_sins) == {"dilution"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
 
 
 def test_dilution_at_2_5_pct_does_not_fire():
     m = compute_reit_metrics(make_reit_data(diluted_shares=(100.0, 102.5)))  # exactly +2.5%
-    assert "dilution" not in sin_ids(m["minor_sins"])
+    assert "dilution" not in sin_ids(m.scoring.minor_sins)
 
 
 def test_buyback_bonus_floors_score_at_zero():
     m = compute_reit_metrics(make_reit_data(diluted_shares=(100.0, 98.0)))  # -2%
-    assert sin_ids(m["minor_sins"]) == {"buyback_bonus"}
-    assert m["minor_score"] == 0.0
+    assert sin_ids(m.scoring.minor_sins) == {"buyback_bonus"}
+    assert m.scoring.minor_score == 0.0
 
 
 def test_high_leverage_above_200_pct_fires():
     m = compute_reit_metrics(make_reit_data(total_debt=(400.0, 2100.0)))  # D/E 2.1x
-    assert m["debt_to_equity"] == pytest.approx(2.1)
-    assert sin_ids(m["minor_sins"]) == {"high_leverage"}
-    assert m["minor_score"] == pytest.approx(0.5)
+    assert m.debt_to_equity == pytest.approx(2.1)
+    assert sin_ids(m.scoring.minor_sins) == {"high_leverage"}
+    assert m.scoring.minor_score == pytest.approx(0.5)
 
 
 def test_high_leverage_at_200_pct_does_not_fire():
     m = compute_reit_metrics(make_reit_data(total_debt=(400.0, 2000.0)))  # exactly 2.0x
-    assert "high_leverage" not in sin_ids(m["minor_sins"])
+    assert "high_leverage" not in sin_ids(m.scoring.minor_sins)
 
 
 def test_noi_declining_fires():
     m = compute_reit_metrics(make_reit_data(rental_revenue=(300.0, 280.0)))  # NOI 200 -> 180
-    assert sin_ids(m["minor_sins"]) == {"noi_declining"}
-    assert m["minor_score"] == pytest.approx(0.5)
+    assert sin_ids(m.scoring.minor_sins) == {"noi_declining"}
+    assert m.scoring.minor_score == pytest.approx(0.5)
 
 
 def test_capex_ratio_growth_above_5_pct_fires():
     # CapEx/FFO: 20/200=10% -> 40/220=~18.2% (FFO also shifts with D&A held
     # flat and capex change alone) - use a clean isolated bump instead.
     m = compute_reit_metrics(make_reit_data(capex=(-20.0, -30.0)))  # ratio 10% -> 15%, FFO unchanged (capex doesn't feed FFO)
-    assert sin_ids(m["minor_sins"]) == {"capex_ratio_growth", "affo_declining"}
-    assert m["minor_score"] == pytest.approx(1.3)
+    assert sin_ids(m.scoring.minor_sins) == {"capex_ratio_growth", "affo_declining"}
+    assert m.scoring.minor_score == pytest.approx(1.3)
 
 
 def test_max_minor_score_matches_weight_table():
@@ -226,8 +226,8 @@ def test_max_minor_score_matches_weight_table():
 def test_minor_score_exactly_1_0_is_buy_boundary_inclusive():
     m = compute_reit_metrics(make_reit_data(total_debt=(400.0, 2100.0), rental_revenue=(300.0, 280.0)))
     # high_leverage (0.5) + noi_declining (0.5) = 1.0
-    assert m["minor_score"] == pytest.approx(1.0)
-    assert "КУПИТЬ" in m["verdict"]
+    assert m.scoring.minor_score == pytest.approx(1.0)
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_minor_score_3_0_is_skip():
@@ -237,10 +237,10 @@ def test_minor_score_3_0_is_skip():
         total_debt=(400.0, 2100.0),     # high_leverage: +0.5
         rental_revenue=(300.0, 280.0),  # noi_declining: +0.5
     ))
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {"affo_declining", "dilution", "high_leverage", "noi_declining"}
-    assert m["minor_score"] == pytest.approx(3.0)
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {"affo_declining", "dilution", "high_leverage", "noi_declining"}
+    assert m.scoring.minor_score == pytest.approx(3.0)
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 # ── Section 5/7.1: NAV valuation bridge ──────────────────────────────────
@@ -256,19 +256,19 @@ def test_nav_bridge_matches_spec_worked_example():
         shares=10.0,
         info={"capRate": 0.05},
     ))
-    assert m["cap_rate"] == pytest.approx(0.05)
-    assert m["cap_rate_label"] == "Explicit (info.capRate)"
-    assert m["property_value"] == pytest.approx(2000.0)
-    assert m["nav"] == pytest.approx(1510.0)
-    assert m["fair_value_share"] == pytest.approx(151.00, abs=0.01)
+    assert m.cap_rate == pytest.approx(0.05)
+    assert m.cap_rate_label == "Explicit (info.capRate)"
+    assert m.property_value == pytest.approx(2000.0)
+    assert m.nav == pytest.approx(1510.0)
+    assert m.valuation.fair_value_share == pytest.approx(151.00, abs=0.01)
 
 
 def test_cap_rate_matrix_by_industry_keyword():
-    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Industrial"}))["cap_rate"] == pytest.approx(0.055)
-    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Residential"}))["cap_rate"] == pytest.approx(0.060)
-    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Healthcare"}))["cap_rate"] == pytest.approx(0.065)
-    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Retail"}))["cap_rate"] == pytest.approx(0.070)
-    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Diversified"}))["cap_rate"] == pytest.approx(0.065)
+    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Industrial"})).cap_rate == pytest.approx(0.055)
+    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Residential"})).cap_rate == pytest.approx(0.060)
+    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Healthcare"})).cap_rate == pytest.approx(0.065)
+    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Retail"})).cap_rate == pytest.approx(0.070)
+    assert compute_reit_metrics(make_reit_data(info={"industry": "REIT - Diversified"})).cap_rate == pytest.approx(0.065)
 
 
 # ── Section 7.1 scenario 4: native routing without --force ──────────────

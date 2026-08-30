@@ -97,11 +97,11 @@ def sin_ids(sins):
 
 def test_zero_sins_is_buy_and_ddm_selected():
     m = compute_bank_metrics(make_bank_data())
-    assert m["sins"] == []
-    assert m["critical_sins"] == []
-    assert m["minor_score"] == 0
-    assert "КУПИТЬ" in m["verdict"]
-    assert m["valuation_model"] == "DDM"
+    assert m.scoring.sins == []
+    assert m.scoring.critical_sins == []
+    assert m.scoring.minor_score == 0
+    assert "КУПИТЬ" in m.scoring.verdict
+    assert m.valuation.valuation_model == "DDM"
 
 
 def test_nii_non_positive_is_critical_and_skips_minor_scoring():
@@ -110,28 +110,28 @@ def test_nii_non_positive_is_critical_and_skips_minor_scoring():
         interest_income=(500.0, 500.0, 500.0, 500.0),
         interest_expense=(150.0, 150.0, 150.0, 520.0),
     ))
-    assert sin_ids(m["critical_sins"]) == {"nii_non_positive"}
-    assert m["minor_sins"] == []  # detailed minor scoring interrupted (spec 4.1)
-    assert m["minor_score"] == 0
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"nii_non_positive"}
+    assert m.scoring.minor_sins == []  # detailed minor scoring interrupted (spec 4.1)
+    assert m.scoring.minor_score == 0
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_equity_non_positive_is_critical():
     m = compute_bank_metrics(make_bank_data(
         shareholders_equity=(1000.0, 1000.0, 1000.0, -50.0),
     ))
-    assert sin_ids(m["critical_sins"]) == {"equity_negative"}
-    assert m["minor_sins"] == []
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"equity_negative"}
+    assert m.scoring.minor_sins == []
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 # ── Section 5: Valuation model selection ────────────────────────────────
 
 def test_roe_pb_model_selected_when_no_dividends():
     m = compute_bank_metrics(make_bank_data(cash_dividends_paid=None, dividend_yield=0.0))
-    assert m["valuation_model"] == "ROE_PB"
-    assert m["bvps"] == pytest.approx(1000.0 / 100.0)
-    assert m["roe"] == pytest.approx(150.0 / 1000.0)
+    assert m.valuation.valuation_model == "ROE_PB"
+    assert m.bvps == pytest.approx(1000.0 / 100.0)
+    assert m.roe == pytest.approx(150.0 / 1000.0)
 
 
 def test_roe_pb_liquidation_discount_when_roe_non_positive():
@@ -139,40 +139,40 @@ def test_roe_pb_liquidation_discount_when_roe_non_positive():
         cash_dividends_paid=None, dividend_yield=0.0,
         net_income=(150.0, 150.0, 150.0, -20.0),
     ))
-    assert m["valuation_model"] == "ROE_PB"
-    assert m["roe"] <= 0
+    assert m.valuation.valuation_model == "ROE_PB"
+    assert m.roe <= 0
     bvps = 1000.0 / 100.0
-    assert m["fair_value_share"] == pytest.approx(0.1 * bvps)
+    assert m.valuation.fair_value_share == pytest.approx(0.1 * bvps)
 
 
 def test_ddm_selected_via_dividend_yield_even_with_zero_cash_div_paid():
     m = compute_bank_metrics(make_bank_data(cash_dividends_paid=(0.0, 0.0, 0.0, 0.0), dividend_yield=0.015))
-    assert m["valuation_model"] == "DDM"
+    assert m.valuation.valuation_model == "DDM"
 
 
 def test_ddm_cagr_div_clamped_to_8_pct_ceiling():
     # DPS quadruples over 3 years -> raw CAGR ~59%, clamped to 8%.
     m = compute_bank_metrics(make_bank_data(cash_dividends_paid=(-12.5, -25.0, -37.5, -50.0)))
-    assert m["valuation_model"] == "DDM"
-    assert m["cagr_div"] == pytest.approx(0.08)
+    assert m.valuation.valuation_model == "DDM"
+    assert m.cagr_div == pytest.approx(0.08)
 
 
 def test_ddm_defaults_cagr_div_to_3_pct_when_dps_zero_at_start():
     # No dividend paid in the first year -> DPS window starts at 0, which
     # fails the "both ends positive" check -> default 3% (spec Section 5.2).
     m = compute_bank_metrics(make_bank_data(cash_dividends_paid=(0.0, -20.0, -30.0, -50.0)))
-    assert m["valuation_model"] == "DDM"
-    assert m["cagr_div"] == pytest.approx(0.03)
+    assert m.valuation.valuation_model == "DDM"
+    assert m.cagr_div == pytest.approx(0.03)
 
 
 def test_required_return_overrides_capm_cost_of_equity_for_banks():
     m_default = compute_bank_metrics(make_bank_data())
-    assert m_default["required_return_used"] is False
-    assert m_default["cost_of_equity"] == pytest.approx(0.09)  # beta=1.0: 4% + 1.0*5%
+    assert m_default.valuation.required_return_used is False
+    assert m_default.valuation.cost_of_equity == pytest.approx(0.09)  # beta=1.0: 4% + 1.0*5%
 
     m_override = compute_bank_metrics(make_bank_data(), required_return=0.12)
-    assert m_override["required_return_used"] is True
-    assert m_override["cost_of_equity"] == pytest.approx(0.12)
+    assert m_override.valuation.required_return_used is True
+    assert m_override.valuation.cost_of_equity == pytest.approx(0.12)
 
 
 # ── Section 4.2: Minor sins ──────────────────────────────────────────────
@@ -185,43 +185,43 @@ def test_nii_declining_fires():
         net_interest_income=(350.0, 350.0, 350.0, 330.0),
         commissions_income=(80.0, 80.0, 80.0, 100.0),
     ))
-    assert sin_ids(m["minor_sins"]) == {"nii_declining"}
-    assert m["minor_score"] == pytest.approx(1.0)
-    assert "КУПИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.minor_sins) == {"nii_declining"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_provision_spike_above_15_pct_fires():
     m = compute_bank_metrics(make_bank_data(
         credit_loss_provision=(30.0, 30.0, 30.0, 40.0),  # +33% YoY
     ))
-    assert sin_ids(m["minor_sins"]) == {"provision_spike"}
-    assert m["minor_score"] == pytest.approx(1.0)
+    assert sin_ids(m.scoring.minor_sins) == {"provision_spike"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
 
 
 def test_provision_growth_at_or_below_15_pct_does_not_fire():
     m = compute_bank_metrics(make_bank_data(
         credit_loss_provision=(30.0, 30.0, 30.0, 34.5),  # exactly +15%
     ))
-    assert "provision_spike" not in sin_ids(m["minor_sins"])
+    assert "provision_spike" not in sin_ids(m.scoring.minor_sins)
 
 
 def test_dilution_fires_above_1_5_pct_growth():
     m = compute_bank_metrics(make_bank_data(diluted_shares=(100.0, 100.0, 100.0, 102.0)))
-    assert sin_ids(m["minor_sins"]) == {"dilution"}
-    assert m["minor_score"] == pytest.approx(1.0)
+    assert sin_ids(m.scoring.minor_sins) == {"dilution"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
 
 
 def test_buyback_bonus_floors_score_at_zero():
     m = compute_bank_metrics(make_bank_data(diluted_shares=(100.0, 100.0, 100.0, 98.0)))
-    assert sin_ids(m["minor_sins"]) == {"buyback_bonus"}
-    assert m["minor_score"] == 0.0
+    assert sin_ids(m.scoring.minor_sins) == {"buyback_bonus"}
+    assert m.scoring.minor_score == 0.0
 
 
 def test_ltd_above_100_pct_fires():
     m = compute_bank_metrics(make_bank_data(net_loans=(2000.0, 2000.0, 2000.0, 2600.0)))
-    assert m["ltd_ratio"] == pytest.approx(2600.0 / 2500.0)
-    assert sin_ids(m["minor_sins"]) == {"ltd_imbalance"}
-    assert m["minor_score"] == pytest.approx(0.5)
+    assert m.ltd_ratio == pytest.approx(2600.0 / 2500.0)
+    assert sin_ids(m.scoring.minor_sins) == {"ltd_imbalance"}
+    assert m.scoring.minor_score == pytest.approx(0.5)
 
 
 def test_ltd_below_60_pct_fires():
@@ -229,14 +229,14 @@ def test_ltd_below_60_pct_fires():
         net_loans=(2000.0, 2000.0, 2000.0, 1000.0),
         total_deposits=(2500.0, 2500.0, 2500.0, 2500.0),
     ))
-    assert m["ltd_ratio"] == pytest.approx(0.4)
-    assert sin_ids(m["minor_sins"]) == {"ltd_imbalance"}
+    assert m.ltd_ratio == pytest.approx(0.4)
+    assert sin_ids(m.scoring.minor_sins) == {"ltd_imbalance"}
 
 
 def test_ltd_within_60_100_pct_range_fires_no_sin():
     m = compute_bank_metrics(make_bank_data(net_loans=(2000.0, 2000.0, 2000.0, 2000.0)))
-    assert m["ltd_ratio"] == pytest.approx(0.8)
-    assert m["sins"] == []
+    assert m.ltd_ratio == pytest.approx(0.8)
+    assert m.scoring.sins == []
 
 
 def test_dead_cash_fires_on_cash_spike_plus_loan_shrinkage():
@@ -244,8 +244,8 @@ def test_dead_cash_fires_on_cash_spike_plus_loan_shrinkage():
         cash_and_equiv=(300.0, 300.0, 300.0, 400.0),  # +33%
         net_loans=(2000.0, 2000.0, 2000.0, 1900.0),   # shrinking
     ))
-    assert sin_ids(m["minor_sins"]) == {"dead_cash"}
-    assert m["minor_score"] == pytest.approx(0.5)
+    assert sin_ids(m.scoring.minor_sins) == {"dead_cash"}
+    assert m.scoring.minor_score == pytest.approx(0.5)
 
 
 def test_negative_jaws_fires_when_opex_outgrows_net_op_income():
@@ -253,8 +253,8 @@ def test_negative_jaws_fires_when_opex_outgrows_net_op_income():
         non_interest_expense=(200.0, 200.0, 200.0, 240.0),  # +20%
         # NII stays 350, commissions stays 80 -> net_op_income flat (0% growth)
     ))
-    assert sin_ids(m["minor_sins"]) == {"negative_jaws"}
-    assert m["minor_score"] == pytest.approx(0.5)
+    assert sin_ids(m.scoring.minor_sins) == {"negative_jaws"}
+    assert m.scoring.minor_score == pytest.approx(0.5)
 
 
 def test_commissions_declining_fires():
@@ -264,14 +264,14 @@ def test_commissions_declining_fires():
         net_interest_income=(350.0, 350.0, 350.0, 360.0),
         commissions_income=(80.0, 80.0, 80.0, 70.0),
     ))
-    assert sin_ids(m["minor_sins"]) == {"commissions_declining"}
-    assert m["minor_score"] == pytest.approx(0.3)
+    assert sin_ids(m.scoring.minor_sins) == {"commissions_declining"}
+    assert m.scoring.minor_score == pytest.approx(0.3)
 
 
 def test_net_income_declining_fires():
     m = compute_bank_metrics(make_bank_data(net_income=(150.0, 150.0, 150.0, 140.0)))
-    assert sin_ids(m["minor_sins"]) == {"net_income_declining"}
-    assert m["minor_score"] == pytest.approx(0.3)
+    assert sin_ids(m.scoring.minor_sins) == {"net_income_declining"}
+    assert m.scoring.minor_score == pytest.approx(0.3)
 
 
 # ── Section 4.3: Verdict scale boundaries ────────────────────────────────
@@ -280,9 +280,9 @@ def test_minor_score_exactly_1_0_is_buy_boundary_inclusive():
     # provision_spike alone (1.0) - unrelated to the NII/commissions/opex
     # JAWS formula, so it isolates cleanly.
     m = compute_bank_metrics(make_bank_data(credit_loss_provision=(30.0, 30.0, 30.0, 40.0)))
-    assert sin_ids(m["minor_sins"]) == {"provision_spike"}
-    assert m["minor_score"] == pytest.approx(1.0)
-    assert "КУПИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.minor_sins) == {"provision_spike"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_minor_score_2_6_is_skip():
@@ -296,12 +296,12 @@ def test_minor_score_2_6_is_skip():
         non_interest_expense=(200.0, 200.0, 200.0, 170.0),
         net_income=(150.0, 150.0, 150.0, 140.0),               # net_income_declining: +0.3
     ))
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {
         "nii_declining", "provision_spike", "commissions_declining", "net_income_declining",
     }
-    assert m["minor_score"] == pytest.approx(2.6)
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert m.scoring.minor_score == pytest.approx(2.6)
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_max_minor_score_matches_weight_table():

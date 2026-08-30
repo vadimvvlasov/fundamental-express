@@ -9,12 +9,47 @@
 Все сгенерированные отчёты (PDF/MD) и промежуточные графики попадают в `output/` и
 `scratch/` — обе директории в `.gitignore`, в репозиторий не коммитятся.
 
-**Архитектура (`analyzers.py`).** Роутинг по сектору тикера идёт через `AnalyzerFactory`:
-`OrdinaryAnalyzer` — тонкая обёртка над `compute_metrics()`/`build_*_report()` из
-`financial_analyzer.py` (не переписывает их); `BankAnalyzer`/`ReitAnalyzer` — заглушки,
-делегирующие в `OrdinaryAnalyzer` при `--force` (специализированные банковский/REIT-чеклисты
-и модели оценки — предмет будущих шагов, см. `docs/spec/`). Обычные компании работают
-по полной, уже описанной ниже методике уже сегодня.
+**Архитектура.** Роутинг по сектору тикера идёт через `AnalyzerFactory` (`analyzers.py`):
+`OrdinaryAnalyzer`, `BankAnalyzer` и `ReitAnalyzer` — три независимые реализации
+`BaseAnalyzer` (`fetch_data`/`calculate_metrics`/`calculate_fair_value`/
+`generate_markdown_report`/`generate_pdf_report`), каждая со своим чеклистом и своей
+моделью оценки: `OrdinaryAnalyzer` — DCF/DDM (`compute_metrics()`, `domain/ordinary.py`),
+`BankAnalyzer` — чеклист NII/Loan-to-Deposit и DDM/ROE-P-B (`compute_bank_metrics()`,
+`domain/bank.py`), `ReitAnalyzer` — чеклист FFO/AFFO/NOI и NAV (`compute_reit_metrics()`,
+`domain/reit.py`). Ни один не заглушка и не делегирует в другой — раньше
+`BankAnalyzer`/`ReitAnalyzer` действительно были обёртками над `OrdinaryAnalyzer` под
+`--force`, но с тех пор получили полноценные, независимые движки. `--force` больше не
+требуется ни для банков, ни для REIT — флаг остался только на случай будущего сектора,
+для которого секторная проверка снова начнёт что-то отклонять (сегодня она не
+отклоняет ничего, см. «Применимость методики по секторам» ниже).
+
+**Структура пакета (`src/fundamental_express/`).**
+
+- `data/` — всё, что говорит с сетью/файловой системой: `yahoo.py` (клиент Yahoo Finance,
+  FX-мост), `sample.py` (SAMPLE-фоллбэк), `parsing.py` (`find_row`, выравнивание
+  отчётности по годам), `errors.py` (`DataUnavailableError`, `UnsupportedSectorError`).
+- `domain/` — чистая логика без сети и файлового I/O: `sins.py` (реестр «грехов»,
+  взвешенный скоринг, пороги вердикта), `valuation.py` (CAPM/WACC/DCF, DDM, NAV,
+  ROE-P-B, форвардные мультипликаторы), `routing.py` (`check_sector_suitability`,
+  `_is_reit`), `metrics.py` (dataclass'ы `OrdinaryMetrics`/`BankMetrics`/`ReitMetrics`),
+  `ordinary.py`/`bank.py`/`reit.py` (чеклист-проверки каждого сектора).
+- `reporting/` — рендеринг: `theme.py`/`flowables.py`/`tables.py`/`charts.py`
+  (визуальные примитивы, без знания о секторах), `sections_ordinary.py`/
+  `sections_bank.py`/`sections_reit.py` (какие разделы отчёта существуют для каждого
+  сектора), `markdown.py`/`pdf.py` (по одному универсальному рендереру на формат,
+  управляемому списком разделов — вместо шести отдельных report-builder функций).
+- `cli/` — argparse-обвязка, изолированная от всего остального: `args.py`
+  (`required_return_type`), `catalysts.py` (`resolve_catalysts_text`), `paths.py`
+  (пути `output/`/`scratch/`), `single_ticker.py` (аргументы `financial_analyzer.py`),
+  `portfolio.py` (весь `portfolio_analyzer.py`, включая его собственную сборку PDF).
+
+`analyzers.py` (корень репозитория) — единственное место, где намеренно сходятся
+`data/`, `domain/` и `reporting/`: `BaseAnalyzer` и три его наследника выполняют
+fetch → compute → render, передавая готовые метрики и список разделов в
+`reporting/pdf.py`/`reporting/markdown.py`. `financial_analyzer.py` и
+`portfolio_analyzer.py` — тонкие входные точки (`cli.single_ticker:main`/
+`cli.portfolio:main` соответственно), сохраняющие прежний вызов
+(`python financial_analyzer.py TICKER`, `python portfolio_analyzer.py ...`).
 
 ## Установка
 
