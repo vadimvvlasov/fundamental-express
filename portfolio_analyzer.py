@@ -31,7 +31,7 @@ TICKER_RE = re.compile(r"^([A-Za-z.\-]+):([0-9]+(?:\.[0-9]+)?)$")
 def _sins_label(m):
     """Tier-aware sins label shared by the console table, PDF, and Markdown
     outputs - e.g. '1 крит. / 1.5 из 6.1' instead of a flat 'N/11' count."""
-    return f"{len(m['critical_sins'])} крит. / {m['minor_score']:.1f} из {m['max_minor_score']:.1f}"
+    return f"{len(m.scoring.critical_sins)} крит. / {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}"
 
 
 FORCE_WARNING_FOOTNOTE = (
@@ -50,17 +50,17 @@ def _ticker_label(r):
     excluded_sector for them. REIT rows instead get a "(REIT)" suffix (spec
     Section 6.2) so they're visually distinguishable in the same table."""
     label = f"{r['ticker']} ⚠️" if r.get("excluded_sector") else r["ticker"]
-    if r.get("ok") and r.get("metrics", {}).get("kind") == "reit":
+    if r.get("ok") and getattr(r.get("metrics"), "kind", None) == "reit":
         label = f"{label} (REIT)"
     return label
 
 
 def _is_bank(m):
-    return m.get("kind") == "bank"
+    return getattr(m, "kind", None) == "bank"
 
 
 def _is_reit(m):
-    return m.get("kind") == "reit"
+    return getattr(m, "kind", None) == "reit"
 
 
 def _liquidity_label(m):
@@ -69,10 +69,10 @@ def _liquidity_label(m):
     for a bank's balance sheet structure or a REIT's depreciation-distorted
     earnings."""
     if _is_bank(m):
-        return "N/A" if m["ltd_ratio"] is None else f"LTD {m['ltd_ratio'] * 100:.1f}%"
+        return "N/A" if m.ltd_ratio is None else f"LTD {m.ltd_ratio * 100:.1f}%"
     if _is_reit(m):
-        return "N/A" if m["p_ffo"] is None else f"P/FFO {m['p_ffo']:.1f}x"
-    return f"CR {m['current_ratio']:.2f}" if m.get("current_ratio") is not None else "N/A"
+        return "N/A" if m.p_ffo is None else f"P/FFO {m.p_ffo:.1f}x"
+    return f"CR {m.current_ratio:.2f}" if m.current_ratio is not None else "N/A"
 
 
 def _cashflow_label(m):
@@ -80,14 +80,14 @@ def _cashflow_label(m):
     Ratio for REIT (spec Section 6.2 - replaces Payout) - banks and REITs
     don't generate a classical Free Cash Flow figure."""
     if _is_bank(m):
-        nii = m["net_interest_income"]
+        nii = m.net_interest_income
         return f"NII {nii.iloc[-1] / 1e6:,.0f}M" if len(nii) else "N/A"
     if _is_reit(m):
-        ratio = m["affo_payout_ratio"]
+        ratio = m.affo_payout_ratio
         if ratio is None:
             return "N/A (no div.)"
         return "Payout ∞" if ratio == float("inf") else f"Payout {ratio * 100:.0f}%"
-    fcf = m["fcf"]
+    fcf = m.fcf
     return f"FCF {fcf.iloc[-1] / 1e6:,.0f}M" if len(fcf) else "N/A"
 
 
@@ -96,8 +96,8 @@ def _leverage_label(m):
     REIT - neither bank nor REIT has an Enterprise Value/Net Debt figure in
     the classical DCF sense (spec Section 2.2.2 / Step 3 Section 4.2)."""
     if _is_bank(m) or _is_reit(m):
-        return "N/A" if m["debt_to_equity"] is None else f"D/E {m['debt_to_equity']:.2f}x"
-    return f"ND {m['net_debt'] / 1e9:,.2f}B"
+        return "N/A" if m.debt_to_equity is None else f"D/E {m.debt_to_equity:.2f}x"
+    return f"ND {m.net_debt / 1e9:,.2f}B"
 
 
 def parse_holdings(args_list):
@@ -175,13 +175,13 @@ def print_table(results):
             print(f"{r['ticker']:<14}{r['weight']:>4.0f}% {'НЕТ ДАННЫХ (Yahoo)':<50}")
             continue
         m = r["metrics"]
-        ou = m["over_under_pct"]
+        ou = m.valuation.over_under_pct
         label = "недооценена" if ou > 10 else "переоценена" if ou < -10 else "справедливо"
         print(
             f"{_ticker_label(r):<14}{r['weight']:>4.0f}% "
-            f"${m['price']:<10.2f}${m['fair_value_share']:<10.2f}"
+            f"${m.valuation.price:<10.2f}${m.valuation.fair_value_share:<10.2f}"
             f"{ou:+.1f}% ({label:<12}) "
-            f"{m['verdict']:<20}{_sins_label(m):<20}"
+            f"{m.scoring.verdict:<20}{_sins_label(m):<20}"
             f"{_liquidity_label(m):<14}{_cashflow_label(m):<14}{_leverage_label(m):<14}"
         )
     print("=" * 100)
@@ -250,11 +250,11 @@ def build_comparative_pdf(results, name="Portfolio"):
             failed.append(r["ticker"])
             continue
         m = r["metrics"]
-        ou = m["over_under_pct"]
+        ou = m.valuation.over_under_pct
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         rows.append([
-            _ticker_label(r), w, f"${m['price']:,.2f}", f"${m['fair_value_share']:,.2f}",
-            ou_label, m["verdict"], _sins_label(m),
+            _ticker_label(r), w, f"${m.valuation.price:,.2f}", f"${m.valuation.fair_value_share:,.2f}",
+            ou_label, m.scoring.verdict, _sins_label(m),
             _liquidity_label(m), _cashflow_label(m), _leverage_label(m),
         ])
     story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[38, 26, 48, 55, 95, 60, 60, 55, 55, 60]))
@@ -276,9 +276,9 @@ def build_comparative_pdf(results, name="Portfolio"):
         if not r["ok"]:
             continue
         m = r["metrics"]
-        if m["sins"]:
-            text = f"<b>{_ticker_label(r)}</b>: " + "; ".join(s.message for s in m["sins"])
-            box_color = COLORS["danger"] if m["critical_sins"] else COLORS["warning"]
+        if m.scoring.sins:
+            text = f"<b>{_ticker_label(r)}</b>: " + "; ".join(s.message for s in m.scoring.sins)
+            box_color = COLORS["danger"] if m.scoring.critical_sins else COLORS["warning"]
             story.append(CalloutBox(text, USABLE_W, COLORS, callout_text, box_color))
         else:
             story.append(CalloutBox(f"<b>{_ticker_label(r)}</b>: грехов не обнаружено.", USABLE_W, COLORS, callout_text, COLORS["success"]))
@@ -311,11 +311,11 @@ def build_comparative_markdown(results, name="Portfolio"):
             failed.append(r["ticker"])
             continue
         m = r["metrics"]
-        ou = m["over_under_pct"]
+        ou = m.valuation.over_under_pct
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         lines.append(
-            f"| {_ticker_label(r)} | {w} | ${m['price']:,.2f} | ${m['fair_value_share']:,.2f} | "
-            f"{ou_label} | {m['verdict']} | {_sins_label(m)} | "
+            f"| {_ticker_label(r)} | {w} | ${m.valuation.price:,.2f} | ${m.valuation.fair_value_share:,.2f} | "
+            f"{ou_label} | {m.scoring.verdict} | {_sins_label(m)} | "
             f"{_liquidity_label(m)} | {_cashflow_label(m)} | {_leverage_label(m)} |"
         )
     lines.append("")
@@ -336,8 +336,8 @@ def build_comparative_markdown(results, name="Portfolio"):
         if not r["ok"]:
             continue
         m = r["metrics"]
-        if m["sins"]:
-            lines.append(f"- **{_ticker_label(r)}**: " + "; ".join(s.message for s in m["sins"]))
+        if m.scoring.sins:
+            lines.append(f"- **{_ticker_label(r)}**: " + "; ".join(s.message for s in m.scoring.sins))
         else:
             lines.append(f"- **{_ticker_label(r)}**: грехов не обнаружено.")
     lines.append("")

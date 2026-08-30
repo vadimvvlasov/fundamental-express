@@ -33,7 +33,7 @@ def test_ordinary_golden_markdown(monkeypatch, tmp_path):
     monkeypatch.setattr(fa, "OUTPUT_DIR", str(tmp_path))
     data = build_ordinary_data()
     m = fa.compute_metrics(data)
-    forward_outlook = fa.compute_forward_outlook(data.get("info", {}), m["price"], m["eps"], m["cagr"])
+    forward_outlook = fa.compute_forward_outlook(data.get("info", {}), m.valuation.price, m.eps, m.cagr)
     md_path = fa.build_markdown_report("ACME", data, m, forward_outlook)
     content = open(md_path, encoding="utf-8").read()
     assert content == _read_snapshot("ordinary.md")

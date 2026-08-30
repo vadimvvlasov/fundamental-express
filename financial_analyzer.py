@@ -142,66 +142,6 @@ from fundamental_express.domain.sins import (  # noqa: E402
 from fundamental_express.domain.metrics import OrdinaryMetrics  # noqa: E402
 
 
-def _ordinary_metrics_to_dict(m):
-    """Dict-shape adapter, kept only until T16 rewires every caller onto
-    attribute access (docs/spec/refactor-tasks.md T13/T16) - reconstructs
-    compute_metrics()'s original ~48-key dict from an OrdinaryMetrics."""
-    return {
-        "year_labels": m.year_labels,
-        "revenue": m.revenue,
-        "operating_income": m.operating_income,
-        "net_income": m.net_income,
-        "eps": m.eps,
-        "curr_assets": m.curr_assets,
-        "curr_liab": m.curr_liab,
-        "curr_ratios": m.curr_ratios,
-        "equity": m.equity,
-        "fcf": m.fcf,
-        "net_margin": m.net_margin,
-        "sins": m.scoring.sins,
-        "critical_sins": m.scoring.critical_sins,
-        "minor_sins": m.scoring.minor_sins,
-        "minor_score": m.scoring.minor_score,
-        "max_minor_score": m.scoring.max_minor_score,
-        "verdict": m.scoring.verdict,
-        "verdict_color_key": m.scoring.verdict_color_key,
-        "reasoning": m.scoring.reasoning,
-        "beta": m.valuation.beta,
-        "wacc": m.wacc,
-        "cost_of_equity": m.valuation.cost_of_equity,
-        "required_return_used": m.valuation.required_return_used,
-        "cost_of_debt_after_tax": m.cost_of_debt_after_tax,
-        "equity_weight": m.equity_weight,
-        "debt_weight": m.debt_weight,
-        "cagr": m.cagr,
-        "proj_years": m.proj_years,
-        "projected_fcfs": m.projected_fcfs,
-        "pv_fcfs": m.pv_fcfs,
-        "enterprise_value": m.enterprise_value,
-        "net_debt": m.net_debt,
-        "net_debt_source": m.net_debt_source,
-        "interest_bearing_debt": m.interest_bearing_debt,
-        "lease_liabilities": m.lease_liabilities,
-        "total_debt_incl_leases": m.total_debt_incl_leases,
-        "cash_balance": m.cash_balance,
-        "equity_value": m.equity_value,
-        "price": m.valuation.price,
-        "fair_value_share": m.valuation.fair_value_share,
-        "over_under_pct": m.valuation.over_under_pct,
-        "val_status": m.valuation.val_status,
-        "val_color_key": m.valuation.val_color_key,
-        "sensitivity_headers": m.sensitivity_headers,
-        "sensitivity_rows": m.sensitivity_rows,
-        "current_ratio": m.current_ratio,
-        "net_margin_pct": m.net_margin_pct,
-        # Ordinary v3 (Step 4): "DCF" unless the auto-switch above fired.
-        "valuation_model": m.valuation.valuation_model,
-        "cagr_div": m.cagr_div,
-        "dps_last": m.dps_last,
-        "debt_to_equity_ratio": m.debt_to_equity_ratio,
-    }
-
-
 # ── CORE ANALYSIS: EXPRESS "SINS" CHECKLIST + DCF ───────────────────────
 def compute_metrics(data, required_return=None):
     """Run the express sins-checklist and the CAPM/DCF valuation on `data`.
@@ -455,10 +395,7 @@ def compute_metrics(data, required_return=None):
         dps_last=dps_last,
         debt_to_equity_ratio=debt_to_equity_ratio,
     )
-    # Dict-shape return boundary, kept only until T16 rewires every caller
-    # (renderers, portfolio_analyzer.py, all 87+ pre-existing tests) onto
-    # attribute access - see docs/spec/refactor-tasks.md T13/T16.
-    return _ordinary_metrics_to_dict(metrics)
+    return metrics
 
 
 # ── BANK-SPECIFIC ENGINE (Step 2, docs/spec/step2-bank-analyzer-implementation-spec.md) ──
@@ -481,59 +418,6 @@ from fundamental_express.domain.sins import (  # noqa: E402
 )
 from fundamental_express.domain.bank import check_bank_sins  # noqa: E402
 from fundamental_express.domain.metrics import BankMetrics  # noqa: E402
-
-
-def _bank_metrics_to_dict(m):
-    """Dict-shape adapter, kept only until T16 rewires every caller onto
-    attribute access (docs/spec/refactor-tasks.md T14/T16) - reconstructs
-    compute_bank_metrics()'s original dict from a BankMetrics."""
-    return {
-        "kind": "bank",
-        "year_labels": m.year_labels,
-        "interest_income": m.interest_income,
-        "interest_expense": m.interest_expense,
-        "net_interest_income": m.net_interest_income,
-        "commissions_income": m.commissions_income,
-        "trading_income": m.trading_income,
-        "credit_loss_provision": m.credit_loss_provision,
-        "non_interest_expense": m.non_interest_expense,
-        "net_income": m.net_income,
-        "preferred_dividends": m.preferred_dividends,
-        "cash_and_equiv": m.cash_and_equiv,
-        "trading_assets": m.trading_assets,
-        "htm_securities": m.htm_securities,
-        "net_loans": m.net_loans,
-        "loan_loss_allowance": m.loan_loss_allowance,
-        "total_deposits": m.total_deposits,
-        "total_borrowings": m.total_borrowings,
-        "shareholders_equity": m.shareholders_equity,
-        "diluted_shares": m.diluted_shares,
-        "ltd_ratio": m.ltd_ratio,
-        "debt_to_equity": m.debt_to_equity,
-        "sins": m.scoring.sins,
-        "critical_sins": m.scoring.critical_sins,
-        "minor_sins": m.scoring.minor_sins,
-        "minor_score": m.scoring.minor_score,
-        "max_minor_score": m.scoring.max_minor_score,
-        "verdict": m.scoring.verdict,
-        "verdict_color_key": m.scoring.verdict_color_key,
-        "reasoning": m.scoring.reasoning,
-        "beta": m.valuation.beta,
-        "cost_of_equity": m.valuation.cost_of_equity,
-        "required_return_used": m.valuation.required_return_used,
-        "valuation_model": m.valuation.valuation_model,
-        "cagr_div": m.cagr_div,
-        "dps_last": m.dps_last,
-        "bvps": m.bvps,
-        "roe": m.roe,
-        "price": m.valuation.price,
-        "fair_value_share": m.valuation.fair_value_share,
-        "over_under_pct": m.valuation.over_under_pct,
-        "val_status": m.valuation.val_status,
-        "val_color_key": m.valuation.val_color_key,
-        "current_ratio": m.current_ratio,
-        "net_margin_pct": m.net_margin_pct,
-    }
 
 
 def compute_bank_metrics(data, required_return=None):
@@ -707,9 +591,7 @@ def compute_bank_metrics(data, required_return=None):
         bvps=bvps,
         roe=roe,
     )
-    # Dict-shape return boundary, kept only until T16 rewires every caller
-    # onto attribute access - see docs/spec/refactor-tasks.md T14/T16.
-    return _bank_metrics_to_dict(metrics)
+    return metrics
 
 
 # ── REIT-SPECIFIC ENGINE (Step 3, docs/spec/step3-reit-analyzer-implementation-spec.md) ──
@@ -732,59 +614,6 @@ from fundamental_express.domain.sins import (  # noqa: E402
 )
 from fundamental_express.domain.reit import check_reit_sins  # noqa: E402
 from fundamental_express.domain.metrics import ReitMetrics  # noqa: E402
-
-
-def _reit_metrics_to_dict(m):
-    """Dict-shape adapter, kept only until T16 rewires every caller onto
-    attribute access (docs/spec/refactor-tasks.md T15/T16) - reconstructs
-    compute_reit_metrics()'s original dict from a ReitMetrics."""
-    return {
-        "kind": "reit",
-        "year_labels": m.year_labels,
-        "d_and_a": m.d_and_a,
-        "gain_on_sale": m.gain_on_sale,
-        "capex": m.capex,
-        "net_income": m.net_income,
-        "rental_revenue": m.rental_revenue,
-        "property_opex": m.property_opex,
-        "re_taxes": m.re_taxes,
-        "construction_in_progress": m.construction_in_progress,
-        "receivables": m.receivables,
-        "cash": m.cash,
-        "total_liab": m.total_liab,
-        "total_debt": m.total_debt,
-        "shareholders_equity": m.shareholders_equity,
-        "diluted_shares": m.diluted_shares,
-        "dividends_paid": m.dividends_paid,
-        "ffo": m.ffo,
-        "affo": m.affo,
-        "noi": m.noi,
-        "occupancy_rate": m.occupancy_rate,
-        "affo_payout_ratio": m.affo_payout_ratio,
-        "debt_to_equity": m.debt_to_equity,
-        "cap_rate": m.cap_rate,
-        "cap_rate_label": m.cap_rate_label,
-        "property_value": m.property_value,
-        "nav": m.nav,
-        "ffo_per_share": m.ffo_per_share,
-        "p_ffo": m.p_ffo,
-        "sins": m.scoring.sins,
-        "critical_sins": m.scoring.critical_sins,
-        "minor_sins": m.scoring.minor_sins,
-        "minor_score": m.scoring.minor_score,
-        "max_minor_score": m.scoring.max_minor_score,
-        "verdict": m.scoring.verdict,
-        "verdict_color_key": m.scoring.verdict_color_key,
-        "reasoning": m.scoring.reasoning,
-        "beta": m.valuation.beta,
-        "price": m.valuation.price,
-        "fair_value_share": m.valuation.fair_value_share,
-        "over_under_pct": m.valuation.over_under_pct,
-        "val_status": m.valuation.val_status,
-        "val_color_key": m.valuation.val_color_key,
-        "current_ratio": m.current_ratio,
-        "net_margin_pct": m.net_margin_pct,
-    }
 
 
 # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12b).
@@ -956,9 +785,7 @@ def compute_reit_metrics(data, required_return=None):
         ffo_per_share=ffo_per_share,
         p_ffo=p_ffo,
     )
-    # Dict-shape return boundary, kept only until T16 rewires every caller
-    # onto attribute access - see docs/spec/refactor-tasks.md T15/T16.
-    return _reit_metrics_to_dict(metrics)
+    return metrics
 
 
 # ── FORWARD OUTLOOK (Forward P/E, consensus growth, PEG) ────────────────
@@ -1045,30 +872,30 @@ def _debt_lines(m, trading_ccy):
     """
     lines = [(
         "Долгосрочный долг (Long Term Debt, только процентный долг)",
-        f"{m['interest_bearing_debt'] / 1e9:,.2f} млрд. {trading_ccy}",
+        f"{m.interest_bearing_debt / 1e9:,.2f} млрд. {trading_ccy}",
     )]
-    if not pd.isna(m["lease_liabilities"]):
+    if not pd.isna(m.lease_liabilities):
         lines.append((
             "Долгосрочные обязательства по аренде (Long-term lease liability, исключены из net debt ниже)",
-            f"{m['lease_liabilities'] / 1e9:,.2f} млрд. {trading_ccy}",
+            f"{m.lease_liabilities / 1e9:,.2f} млрд. {trading_ccy}",
         ))
-    if not pd.isna(m["total_debt_incl_leases"]):
+    if not pd.isna(m.total_debt_incl_leases):
         lines.append((
             "Total Debt (агрегированное поле провайдера данных, включает долг и debt-like "
             "обязательства по его классификации - может не равняться простой сумме строк "
             "выше; справочно, не используется в DCF)",
-            f"{m['total_debt_incl_leases'] / 1e9:,.2f} млрд. {trading_ccy}",
+            f"{m.total_debt_incl_leases / 1e9:,.2f} млрд. {trading_ccy}",
         ))
     lines.append((
         "Денежные средства (Cash and Cash Equivalents)",
-        f"{m['cash_balance'] / 1e9:,.2f} млрд. {trading_ccy}",
+        f"{m.cash_balance / 1e9:,.2f} млрд. {trading_ccy}",
     ))
     net_debt_label = (
         "Чистый долг, использован в DCF (поле Net Debt из Yahoo Finance)"
-        if m["net_debt_source"] == "reported"
+        if m.net_debt_source == "reported"
         else "Чистый долг, использован в DCF (расчёт: Долгосрочный долг − Кэш)"
     )
-    lines.append((net_debt_label, f"{m['net_debt'] / 1e9:,.2f} млрд. {trading_ccy}"))
+    lines.append((net_debt_label, f"{m.net_debt / 1e9:,.2f} млрд. {trading_ccy}"))
     return lines
 
 
@@ -1097,27 +924,27 @@ def build_markdown_report(
         f"{data.get('fx_rate', 1.0):.4f}\n\n"
         if financial_ccy != trading_ccy else ""
     )
-    year_labels = m["year_labels"]
+    year_labels = m.year_labels
 
     def row(label, series, fmt="{:,.1f}"):
         return f"| {label} | " + " | ".join(fmt.format(v) for v in series) + " |"
 
-    if m["sins"]:
+    if m.scoring.sins:
         sins_parts = []
-        if m["critical_sins"]:
-            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m["critical_sins"]))
-        if m["minor_sins"]:
+        if m.scoring.critical_sins:
+            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins))
+        if m.scoring.minor_sins:
             sins_parts.append(
-                f"**Второстепенные (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):**\n"
-                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m["minor_sins"])
+                f"**Второстепенные (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):**\n"
+                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
             )
         sins_block = "\n\n".join(sins_parts)
     else:
         sins_block = "- Грехов не обнаружено."
     debt_block = "\n".join(f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy))
-    sens_header = "| " + " | ".join(m["sensitivity_headers"]) + " |"
-    sens_sep = "|" + "---|" * len(m["sensitivity_headers"])
-    sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m["sensitivity_rows"])
+    sens_header = "| " + " | ".join(m.sensitivity_headers) + " |"
+    sens_sep = "|" + "---|" * len(m.sensitivity_headers)
+    sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m.sensitivity_rows)
 
     peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
     peg_emoji = {"success": "🟢", "warning": "🟡", "danger": "🔴", "muted": "⚪"}[peg_color_key]
@@ -1125,49 +952,49 @@ def build_markdown_report(
     growth_txt = _fmt_or_na(forward_outlook["growth_pct"], "{:.1f}%")
     peg_txt = _fmt_or_na(forward_outlook["peg_ratio"])
     ke_disclosure = (
-        f"Ke = задано инвестором (--required-return) = {m['cost_of_equity'] * 100:.2f}%"
-        if m["required_return_used"]
-        else f"Ke = Rf + β×ERP = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%"
+        f"Ke = задано инвестором (--required-return) = {m.valuation.cost_of_equity * 100:.2f}%"
+        if m.valuation.required_return_used
+        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%"
     )
 
     # Ordinary v3 (Step 4): a dividend-paying company with a distorted
     # capital structure (equity<=0 or D/E>200%) gets valued by DDM instead
-    # of DCF - see compute_metrics()'s "Ordinary v3" section. m["fair_value_share"]/
+    # of DCF - see compute_metrics()'s "Ordinary v3" section. m.valuation.fair_value_share/
     # over_under_pct/val_status already reflect whichever model ran; only the
     # disclosure text below needs to branch, since the DCF-only concepts
     # (WACC, Enterprise Value, sensitivity matrix) don't apply to DDM.
-    if m.get("valuation_model") == "DDM":
+    if m.valuation.valuation_model == "DDM":
         section3_md = f"""## 3. Оценка справедливой стоимости (Модель DDM)
 
 ⚠️ **Внимание:** Применена модель дисконтирования дивидендов (DDM) вместо классического DCF - у компании искажена структура капитала (отрицательный или "перегруженный" долгом акционерный капитал) на фоне стабильной истории дивидендных выплат. Классический FCF-DCF в этом случае занижает стоимость (лизинговые/долговые обязательства искажают WACC).
 
 - {ke_disclosure}
-- Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%): {m['cagr_div'] * 100:.2f}%
-- DPS последнего года (Dividends Paid / Diluted Shares): {m['dps_last']:.2f} {trading_ccy}
+- Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%): {m.cagr_div * 100:.2f}%
+- DPS последнего года (Dividends Paid / Diluted Shares): {m.dps_last:.2f} {trading_ccy}
 - Терминальный темп роста (Gordon Growth): 2.5%
 
-**Справедливая стоимость по DDM: {m['fair_value_share']:.2f} {trading_ccy}**
-Текущая рыночная цена: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+**Справедливая стоимость по DDM: {m.valuation.fair_value_share:.2f} {trading_ccy}**
+Текущая рыночная цена: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
 """
     else:
         section3_md = f"""## 3. Модель дисконтирования денежных потоков (DCF)
 
 - Стоимость собственного капитала: {ke_disclosure}
-- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m['cost_of_debt_after_tax'] * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
-- Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m['equity_weight'] * 100:.1f}%, D/(D+E) = {m['debt_weight'] * 100:.1f}%
-- **WACC:** {m['equity_weight'] * 100:.1f}%×{m['cost_of_equity'] * 100:.2f}% + {m['debt_weight'] * 100:.1f}%×{m['cost_of_debt_after_tax'] * 100:.2f}% = **{m['wacc'] * 100:.2f}%**
-- CAGR роста FCF: {m['cagr'] * 100:.2f}% (историческая, ограничена 2-15%)
+- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
+- Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m.equity_weight * 100:.1f}%, D/(D+E) = {m.debt_weight * 100:.1f}%
+- **WACC:** {m.equity_weight * 100:.1f}%×{m.valuation.cost_of_equity * 100:.2f}% + {m.debt_weight * 100:.1f}%×{m.cost_of_debt_after_tax * 100:.2f}% = **{m.wacc * 100:.2f}%**
+- CAGR роста FCF: {m.cagr * 100:.2f}% (историческая, ограничена 2-15%)
 - Терминальный темп роста: 2.5%
 
 {debt_block}
 
 > {LEASE_ASSUMPTION_NOTE}
 
-- Enterprise Value: {m['enterprise_value'] / 1e9:,.2f} млрд. {trading_ccy}
-- Equity Value: {m['equity_value'] / 1e9:,.2f} млрд. {trading_ccy}
+- Enterprise Value: {m.enterprise_value / 1e9:,.2f} млрд. {trading_ccy}
+- Equity Value: {m.equity_value / 1e9:,.2f} млрд. {trading_ccy}
 
-**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
+Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
 
 ### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на 2.5% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
 
@@ -1178,13 +1005,13 @@ def build_markdown_report(
 
     md = f"""{sector_warning_line}# Фундаментальный анализ & оценка DCF: {ticker.upper()}
 
-Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
+Компания: **{name}** | Цена: **{m.valuation.price:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
 
 {fx_line}## 1. Экспресс-вердикт и оценка рисков
 
-**{m['verdict']}**
+**{m.scoring.verdict}**
 
-{m['reasoning']}
+{m.scoring.reasoning}
 
 **Выявленные риски:**
 
@@ -1196,15 +1023,15 @@ def build_markdown_report(
 
 | Показатель | {" | ".join(year_labels)} |
 |---|{"---|" * len(year_labels)}
-{row("Выручка (Revenue)", [v / 1e6 for v in m["revenue"]])}
-{row("Операционная прибыль", [v / 1e6 for v in m["operating_income"]])}
-{row("Чистая прибыль (Net Income)", [v / 1e6 for v in m["net_income"]])}
-{row("Разводненная EPS, USD", list(m["eps"]), fmt="{:.2f}")}
-{row("Оборотные активы", [v / 1e6 for v in m["curr_assets"]])}
-{row("Краткосрочные обязательства", [v / 1e6 for v in m["curr_liab"]])}
-{row("Current Ratio", list(m["curr_ratios"]), fmt="{:.2f}")}
-{row("Акционерный капитал", [v / 1e6 for v in m["equity"]])}
-{row("Free Cash Flow", [v / 1e6 for v in m["fcf"]])}
+{row("Выручка (Revenue)", [v / 1e6 for v in m.revenue])}
+{row("Операционная прибыль", [v / 1e6 for v in m.operating_income])}
+{row("Чистая прибыль (Net Income)", [v / 1e6 for v in m.net_income])}
+{row("Разводненная EPS, USD", list(m.eps), fmt="{:.2f}")}
+{row("Оборотные активы", [v / 1e6 for v in m.curr_assets])}
+{row("Краткосрочные обязательства", [v / 1e6 for v in m.curr_liab])}
+{row("Current Ratio", list(m.curr_ratios), fmt="{:.2f}")}
+{row("Акционерный капитал", [v / 1e6 for v in m.equity])}
+{row("Free Cash Flow", [v / 1e6 for v in m.fcf])}
 
 {section3_md}
 ## 4. Форвардные мультипликаторы и консенсус-прогноз
@@ -1236,7 +1063,7 @@ def build_pdf_report(
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
     excluded_sector, excluded_industry = check_sector_suitability(ticker, data.get("info", {}), force)
     m = compute_metrics(data, required_return=required_return)
-    forward_outlook = compute_forward_outlook(data.get("info", {}), m["price"], m["eps"], m["cagr"])
+    forward_outlook = compute_forward_outlook(data.get("info", {}), m.valuation.price, m.eps, m.cagr)
     catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
 
     name = data["name"]
@@ -1248,40 +1075,40 @@ def build_pdf_report(
         f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
         if financial_ccy != trading_ccy else ""
     )
-    price = m["price"]
-    beta = m["beta"]
-    year_labels = m["year_labels"]
-    revenue = m["revenue"]
-    operating_income = m["operating_income"]
-    net_income = m["net_income"]
-    eps = m["eps"]
-    curr_assets = m["curr_assets"]
-    curr_liab = m["curr_liab"]
-    curr_ratios = m["curr_ratios"]
-    equity = m["equity"]
-    fcf = m["fcf"]
-    sins = m["sins"]
-    verdict = m["verdict"]
-    verdict_color = COLORS[m["verdict_color_key"]]
-    reasoning = m["reasoning"]
-    wacc = m["wacc"]
-    cagr = m["cagr"]
-    proj_years = m["proj_years"]
-    projected_fcfs = m["projected_fcfs"]
-    pv_fcfs = m["pv_fcfs"]
-    enterprise_value = m["enterprise_value"]
-    net_debt = m["net_debt"]
+    price = m.valuation.price
+    beta = m.valuation.beta
+    year_labels = m.year_labels
+    revenue = m.revenue
+    operating_income = m.operating_income
+    net_income = m.net_income
+    eps = m.eps
+    curr_assets = m.curr_assets
+    curr_liab = m.curr_liab
+    curr_ratios = m.curr_ratios
+    equity = m.equity
+    fcf = m.fcf
+    sins = m.scoring.sins
+    verdict = m.scoring.verdict
+    verdict_color = COLORS[m.scoring.verdict_color_key]
+    reasoning = m.scoring.reasoning
+    wacc = m.wacc
+    cagr = m.cagr
+    proj_years = m.proj_years
+    projected_fcfs = m.projected_fcfs
+    pv_fcfs = m.pv_fcfs
+    enterprise_value = m.enterprise_value
+    net_debt = m.net_debt
     debt_lines = _debt_lines(m, trading_ccy)
-    cost_of_equity = m["cost_of_equity"]
-    cost_of_debt_after_tax = m["cost_of_debt_after_tax"]
-    equity_weight = m["equity_weight"]
-    debt_weight = m["debt_weight"]
-    equity_value = m["equity_value"]
-    fair_value_share = m["fair_value_share"]
-    val_status = m["val_status"]
-    val_color = COLORS[m["val_color_key"]]
-    sensitivity_headers = m["sensitivity_headers"]
-    sensitivity_rows = m["sensitivity_rows"]
+    cost_of_equity = m.valuation.cost_of_equity
+    cost_of_debt_after_tax = m.cost_of_debt_after_tax
+    equity_weight = m.equity_weight
+    debt_weight = m.debt_weight
+    equity_value = m.equity_value
+    fair_value_share = m.valuation.fair_value_share
+    val_status = m.valuation.val_status
+    val_color = COLORS[m.valuation.val_color_key]
+    sensitivity_headers = m.sensitivity_headers
+    sensitivity_rows = m.sensitivity_rows
 
     chart_img_path = generate_fcf_chart(
         year_labels, fcf.values, proj_years, projected_fcfs, ticker
@@ -1400,17 +1227,17 @@ def build_pdf_report(
     story.append(Paragraph(verdict, verdict_text_style))
     story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
 
-    if m["critical_sins"]:
+    if m.scoring.critical_sins:
         crit_text = (
             "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
-            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m["critical_sins"])
+            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m.scoring.critical_sins)
         )
         story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
         story.append(Spacer(1, 6))
-    if m["minor_sins"]:
+    if m.scoring.minor_sins:
         minor_text = (
-            f"<b>Второстепенные риски (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):</b><br/>"
-            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m["minor_sins"])
+            f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
+            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m.scoring.minor_sins)
         )
         story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
     if not sins:
@@ -1457,9 +1284,9 @@ def build_pdf_report(
 
     # ── SECTION 3: FAIR VALUE (DCF, or DDM for Ordinary v3 - Step 4) ─────
     # See build_markdown_report()'s twin branch and compute_metrics()'s
-    # "Ordinary v3" section for why/when DDM replaces DCF here - m["fair_
-    # value_share"]/val_status already reflect whichever model ran.
-    if m.get("valuation_model") == "DDM":
+    # "Ordinary v3" section for why/when DDM replaces DCF here -
+    # m.valuation.fair_value_share/val_status already reflect whichever model ran.
+    if m.valuation.valuation_model == "DDM":
         story.append(Paragraph("3. Оценка справедливой стоимости (Модель DDM)", h1_style))
         story.append(
             Paragraph(
@@ -1472,13 +1299,13 @@ def build_pdf_report(
         )
         ke_disclosure = (
             f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
-            if m["required_return_used"]
+            if m.valuation.required_return_used
             else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
         )
         ddm_info_text = (
             f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
-            f"• <b>Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%):</b> {m['cagr_div'] * 100:.2f}%<br/>"
-            f"• <b>DPS последнего года (Dividends Paid / Diluted Shares):</b> {m['dps_last']:.2f} {trading_ccy}<br/>"
+            f"• <b>Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%):</b> {m.cagr_div * 100:.2f}%<br/>"
+            f"• <b>DPS последнего года (Dividends Paid / Diluted Shares):</b> {m.dps_last:.2f} {trading_ccy}<br/>"
             f"• <b>Терминальный темп роста (Gordon Growth):</b> 2.5%<br/>"
         )
         story.append(CalloutBox(ddm_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
@@ -1509,7 +1336,7 @@ def build_pdf_report(
         debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in debt_lines)
         ke_disclosure = (
             f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
-            if m["required_return_used"]
+            if m.valuation.required_return_used
             else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
         )
         dcf_info_text = (
@@ -1626,21 +1453,21 @@ def _bank_valuation_disclosure(m):
     """Plain (label, value) pairs for the DDM/ROE-P-B model disclosure -
     shared between the PDF and Markdown bank renderers (spec Section 6.2)."""
     ke_line = (
-        f"Ke = задано инвестором (--required-return) = {m['cost_of_equity'] * 100:.2f}%"
-        if m["required_return_used"]
-        else f"Ke = Rf + β×ERP = 4% + {m['beta']:.2f}×5% = {m['cost_of_equity'] * 100:.2f}%"
+        f"Ke = задано инвестором (--required-return) = {m.valuation.cost_of_equity * 100:.2f}%"
+        if m.valuation.required_return_used
+        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%"
     )
-    if m["valuation_model"] == "DDM":
+    if m.valuation.valuation_model == "DDM":
         return "Модель дисконтирования дивидендов (DDM)", [
             (ke_line, ""),
-            ("Темп роста дивидендов (CAGR_div, ограничен 1.0%-8.0%)", f"{m['cagr_div'] * 100:.2f}%"),
-            ("DPS последнего года (Common Dividends Paid / Diluted Shares)", f"{m['dps_last']:.2f} USD"),
+            ("Темп роста дивидендов (CAGR_div, ограничен 1.0%-8.0%)", f"{m.cagr_div * 100:.2f}%"),
+            ("DPS последнего года (Common Dividends Paid / Diluted Shares)", f"{m.dps_last:.2f} USD"),
             ("Терминальный темп роста (Gordon Growth)", "2.5%"),
         ]
     return "Модель рентабельности капитала (ROE / P/B)", [
         (ke_line, ""),
-        ("Балансовая стоимость на акцию (BVPS)", f"{m['bvps']:.2f} USD"),
-        ("Рентабельность капитала (ROE)", f"{m['roe'] * 100:.2f}%"),
+        ("Балансовая стоимость на акцию (BVPS)", f"{m.bvps:.2f} USD"),
+        ("Рентабельность капитала (ROE)", f"{m.roe * 100:.2f}%"),
     ]
 
 
@@ -1654,12 +1481,12 @@ def _bank_structural_rows(m, trading_ccy):
         ]
 
     rows = [
-        ["Net Loans (млн.)"] + fmt(m["net_loans"]),
-        ["Allowance for Credit Losses (млн.)"] + fmt(m["loan_loss_allowance"]),
-        ["Total Deposits (млн.)"] + fmt(m["total_deposits"]),
+        ["Net Loans (млн.)"] + fmt(m.net_loans),
+        ["Allowance for Credit Losses (млн.)"] + fmt(m.loan_loss_allowance),
+        ["Total Deposits (млн.)"] + fmt(m.total_deposits),
         ["LTD Ratio"] + [
             "N/A" if pd.isna(l) or pd.isna(d) or d == 0 else f"{(l / d) * 100:.1f}%"
-            for l, d in zip(m["net_loans"], m["total_deposits"])
+            for l, d in zip(m.net_loans, m.total_deposits)
         ],
     ]
     return rows
@@ -1681,21 +1508,21 @@ def build_bank_markdown_report(ticker, data, m, catalysts_text=None):
         f"{data.get('fx_rate', 1.0):.4f}\n\n"
         if financial_ccy != trading_ccy else ""
     )
-    year_labels = m["year_labels"]
+    year_labels = m.year_labels
 
     def row(label, series, fmt="{:,.1f}"):
         return f"| {label} | " + " | ".join(
             "N/A" if pd.isna(v) else fmt.format(v) for v in series
         ) + " |"
 
-    if m["sins"]:
+    if m.scoring.sins:
         sins_parts = []
-        if m["critical_sins"]:
-            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m["critical_sins"]))
-        if m["minor_sins"]:
+        if m.scoring.critical_sins:
+            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins))
+        if m.scoring.minor_sins:
             sins_parts.append(
-                f"**Второстепенные (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):**\n"
-                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m["minor_sins"])
+                f"**Второстепенные (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):**\n"
+                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
             )
         sins_block = "\n\n".join(sins_parts)
     else:
@@ -1703,19 +1530,19 @@ def build_bank_markdown_report(ticker, data, m, catalysts_text=None):
 
     model_name, model_lines = _bank_valuation_disclosure(m)
     model_block = "\n".join(f"- {label}{': ' + value if value else ''}" for label, value in model_lines)
-    ltd_txt = "N/A" if m["ltd_ratio"] is None else f"{m['ltd_ratio'] * 100:.1f}%"
-    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+    ltd_txt = "N/A" if m.ltd_ratio is None else f"{m.ltd_ratio * 100:.1f}%"
+    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
     struct_rows = _bank_structural_rows(m, trading_ccy)
 
     md = f"""# Фундаментальный анализ & оценка банка: {ticker.upper()}
 
-Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
+Компания: **{name}** | Цена: **{m.valuation.price:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
 
 {fx_line}## 1. Экспресс-вердикт и оценка рисков (банковский чеклист)
 
-**{m['verdict']}**
+**{m.scoring.verdict}**
 
-{m['reasoning']}
+{m.scoring.reasoning}
 
 **Выявленные риски:**
 
@@ -1727,11 +1554,11 @@ def build_bank_markdown_report(ticker, data, m, catalysts_text=None):
 
 | Показатель | {" | ".join(year_labels)} |
 |---|{"---|" * len(year_labels)}
-{row("Net Interest Income (NII)", m["net_interest_income"] / 1e6)}
-{row("Комиссионный доход", m["commissions_income"] / 1e6)}
-{row("Резервы под потери по кредитам (Provision)", m["credit_loss_provision"] / 1e6)}
-{row("Чистая прибыль (Net Income)", m["net_income"] / 1e6)}
-{row("Акционерный капитал (Shareholders Equity)", m["shareholders_equity"] / 1e6)}
+{row("Net Interest Income (NII)", m.net_interest_income / 1e6)}
+{row("Комиссионный доход", m.commissions_income / 1e6)}
+{row("Резервы под потери по кредитам (Provision)", m.credit_loss_provision / 1e6)}
+{row("Чистая прибыль (Net Income)", m.net_income / 1e6)}
+{row("Акционерный капитал (Shareholders Equity)", m.shareholders_equity / 1e6)}
 
 **Loan-to-Deposit Ratio (LTD, последний год): {ltd_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
 
@@ -1745,8 +1572,8 @@ def build_bank_markdown_report(ticker, data, m, catalysts_text=None):
 
 {model_block}
 
-**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
+Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
 
 ## 4. Катализаторы и риски (качественная оценка)
 
@@ -1777,14 +1604,14 @@ def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
         f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
         if financial_ccy != trading_ccy else ""
     )
-    price = m["price"]
-    year_labels = m["year_labels"]
-    verdict = m["verdict"]
-    verdict_color = COLORS[m["verdict_color_key"]]
-    reasoning = m["reasoning"]
-    val_color = COLORS[m["val_color_key"]]
+    price = m.valuation.price
+    year_labels = m.year_labels
+    verdict = m.scoring.verdict
+    verdict_color = COLORS[m.scoring.verdict_color_key]
+    reasoning = m.scoring.reasoning
+    val_color = COLORS[m.valuation.val_color_key]
 
-    chart_img_path = generate_nii_chart(year_labels, m["net_interest_income"].values, ticker)
+    chart_img_path = generate_nii_chart(year_labels, m.net_interest_income.values, ticker)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
@@ -1846,20 +1673,20 @@ def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     story.append(Paragraph(verdict, verdict_text_style))
     story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
 
-    if m["critical_sins"]:
+    if m.scoring.critical_sins:
         crit_text = (
             "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
-            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m["critical_sins"])
+            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m.scoring.critical_sins)
         )
         story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
         story.append(Spacer(1, 6))
-    if m["minor_sins"]:
+    if m.scoring.minor_sins:
         minor_text = (
-            f"<b>Второстепенные риски (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):</b><br/>"
-            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m["minor_sins"])
+            f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
+            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m.scoring.minor_sins)
         )
         story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-    if not m["sins"]:
+    if not m.scoring.sins:
         story.append(CalloutBox(
             "<b>Финансовые риски:</b> Грехов не обнаружено. Показатели банка в безупречной форме.",
             USABLE_W, COLORS, callout_text_style, COLORS["success"],
@@ -1884,17 +1711,17 @@ def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
         ]
 
     fund_rows = [
-        ["Net Interest Income (NII)"] + _fmt_last4(m["net_interest_income"]),
-        ["Комиссионный доход"] + _fmt_last4(m["commissions_income"]),
-        ["Резервы под потери по кредитам"] + _fmt_last4(m["credit_loss_provision"]),
-        ["Чистая прибыль (Net Income)"] + _fmt_last4(m["net_income"]),
-        ["Акционерный капитал (Shareholders Equity)"] + _fmt_last4(m["shareholders_equity"]),
+        ["Net Interest Income (NII)"] + _fmt_last4(m.net_interest_income),
+        ["Комиссионный доход"] + _fmt_last4(m.commissions_income),
+        ["Резервы под потери по кредитам"] + _fmt_last4(m.credit_loss_provision),
+        ["Чистая прибыль (Net Income)"] + _fmt_last4(m.net_income),
+        ["Акционерный капитал (Shareholders Equity)"] + _fmt_last4(m.shareholders_equity),
     ]
     story.append(create_reportlab_table(fund_headers, fund_rows, styles, COLORS, col_widths=[190, 70, 70, 70, 70]))
     story.append(Spacer(1, 8))
 
-    ltd_txt = "N/A" if m["ltd_ratio"] is None else f"{m['ltd_ratio'] * 100:.1f}%"
-    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+    ltd_txt = "N/A" if m.ltd_ratio is None else f"{m.ltd_ratio * 100:.1f}%"
+    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
     story.append(Paragraph(
         f"<b>Loan-to-Deposit Ratio (LTD, последний год):</b> {ltd_txt} &nbsp;&nbsp; "
         f"<b>Total Debt / Shareholders Equity:</b> {de_txt} "
@@ -1922,9 +1749,9 @@ def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     story.append(Spacer(1, 8))
 
     val_banner_text = (
-        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m['fair_value_share']:.2f} {trading_ccy}</b><br/>"
+        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m.valuation.fair_value_share:.2f} {trading_ccy}</b><br/>"
         f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
-        f"| Статус: <font color='{val_color.hexval()}'><b>{m['val_status']}</b></font>"
+        f"| Статус: <font color='{val_color.hexval()}'><b>{m.valuation.val_status}</b></font>"
     )
     story.append(CalloutBox(
         val_banner_text, USABLE_W, COLORS,
@@ -1966,14 +1793,14 @@ def _reit_nav_bridge_rows(m, trading_ccy):
     """Plain (label, value) pairs for the NAV bridge - shared between the
     PDF and Markdown REIT renderers (spec Section 6.1)."""
     return [
-        (f"NOI (последний год)", f"{m['noi'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Применённый Cap Rate", f"{m['cap_rate'] * 100:.2f}% ({m['cap_rate_label']})"),
-        ("Property Value = NOI / Cap Rate", f"{m['property_value'] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Плюс: Cash", f"{m['cash'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Плюс: Receivables", f"{m['receivables'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Плюс: Construction in Progress", f"{m['construction_in_progress'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Минус: Total Liabilities", f"{m['total_liab'].iloc[-1] / 1e6:,.1f} млн. {trading_ccy}" if not pd.isna(m["total_liab"].iloc[-1]) else "N/A"),
-        ("= Net Asset Value (NAV)", f"{m['nav'] / 1e6:,.1f} млн. {trading_ccy}"),
+        (f"NOI (последний год)", f"{m.noi.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Применённый Cap Rate", f"{m.cap_rate * 100:.2f}% ({m.cap_rate_label})"),
+        ("Property Value = NOI / Cap Rate", f"{m.property_value / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Плюс: Cash", f"{m.cash.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Плюс: Receivables", f"{m.receivables.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Плюс: Construction in Progress", f"{m.construction_in_progress.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        ("Минус: Total Liabilities", f"{m.total_liab.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}" if not pd.isna(m.total_liab.iloc[-1]) else "N/A"),
+        ("= Net Asset Value (NAV)", f"{m.nav / 1e6:,.1f} млн. {trading_ccy}"),
     ]
 
 
@@ -1982,11 +1809,11 @@ def _reit_operating_rows(m):
         return ["N/A" if pd.isna(v) else f"{v / 1e6:,.1f}" for v in series]
 
     return [
-        ["FFO (млн.)"] + fmt(m["ffo"]),
-        ["AFFO (млн.)"] + fmt(m["affo"]),
-        ["NOI (млн.)"] + fmt(m["noi"]),
-        ["CapEx (млн.)"] + fmt(m["capex"].abs()),
-        ["Dividends Paid (млн.)"] + fmt(m["dividends_paid"]),
+        ["FFO (млн.)"] + fmt(m.ffo),
+        ["AFFO (млн.)"] + fmt(m.affo),
+        ["NOI (млн.)"] + fmt(m.noi),
+        ["CapEx (млн.)"] + fmt(m.capex.abs()),
+        ["Dividends Paid (млн.)"] + fmt(m.dividends_paid),
     ]
 
 
@@ -2006,16 +1833,16 @@ def build_reit_markdown_report(ticker, data, m, catalysts_text=None):
         f"{data.get('fx_rate', 1.0):.4f}\n\n"
         if financial_ccy != trading_ccy else ""
     )
-    year_labels = m["year_labels"]
+    year_labels = m.year_labels
 
-    if m["sins"]:
+    if m.scoring.sins:
         sins_parts = []
-        if m["critical_sins"]:
-            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m["critical_sins"]))
-        if m["minor_sins"]:
+        if m.scoring.critical_sins:
+            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins))
+        if m.scoring.minor_sins:
             sins_parts.append(
-                f"**Второстепенные (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):**\n"
-                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m["minor_sins"])
+                f"**Второстепенные (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):**\n"
+                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
             )
         sins_block = "\n\n".join(sins_parts)
     else:
@@ -2024,20 +1851,20 @@ def build_reit_markdown_report(ticker, data, m, catalysts_text=None):
     op_rows = _reit_operating_rows(m)
     nav_rows = _reit_nav_bridge_rows(m, trading_ccy)
     nav_block = "\n".join(f"- {label}: {value}" for label, value in nav_rows)
-    payout_txt = "N/A (дивиденды не выплачиваются)" if m["affo_payout_ratio"] is None else (
-        "∞ (AFFO ≤ 0)" if m["affo_payout_ratio"] == float("inf") else f"{m['affo_payout_ratio'] * 100:.1f}%"
+    payout_txt = "N/A (дивиденды не выплачиваются)" if m.affo_payout_ratio is None else (
+        "∞ (AFFO ≤ 0)" if m.affo_payout_ratio == float("inf") else f"{m.affo_payout_ratio * 100:.1f}%"
     )
-    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
 
     md = f"""# Фундаментальный анализ & оценка REIT: {ticker.upper()}
 
-Компания: **{name}** | Цена: **{m['price']:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
+Компания: **{name}** | Цена: **{m.valuation.price:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
 
 {fx_line}## 1. Экспресс-вердикт и оценка рисков (чеклист REIT)
 
-**{m['verdict']}**
+**{m.scoring.verdict}**
 
-{m['reasoning']}
+{m.scoring.reasoning}
 
 **Выявленные риски:**
 
@@ -2051,14 +1878,14 @@ def build_reit_markdown_report(ticker, data, m, catalysts_text=None):
 |---|{"---|" * len(year_labels)}
 {chr(10).join("| " + " | ".join(str(c) for c in r) + " |" for r in op_rows)}
 
-**Occupancy Rate: {m['occupancy_rate'] * 100:.1f}%** | **AFFO Payout Ratio: {payout_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
+**Occupancy Rate: {m.occupancy_rate * 100:.1f}%** | **AFFO Payout Ratio: {payout_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
 
 ## 3. NAV Valuation Bridge
 
 {nav_block}
 
-**Справедливая стоимость акции: {m['fair_value_share']:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m['price']:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m['val_status']}**
+**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
+Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
 
 ## 4. Катализаторы и риски (качественная оценка)
 
@@ -2089,14 +1916,14 @@ def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
         f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
         if financial_ccy != trading_ccy else ""
     )
-    price = m["price"]
-    year_labels = m["year_labels"]
-    verdict = m["verdict"]
-    verdict_color = COLORS[m["verdict_color_key"]]
-    reasoning = m["reasoning"]
-    val_color = COLORS[m["val_color_key"]]
+    price = m.valuation.price
+    year_labels = m.year_labels
+    verdict = m.scoring.verdict
+    verdict_color = COLORS[m.scoring.verdict_color_key]
+    reasoning = m.scoring.reasoning
+    val_color = COLORS[m.valuation.val_color_key]
 
-    chart_img_path = generate_ffo_chart(year_labels, m["ffo"].values, m["affo"].values, ticker)
+    chart_img_path = generate_ffo_chart(year_labels, m.ffo.values, m.affo.values, ticker)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
@@ -2158,20 +1985,20 @@ def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     story.append(Paragraph(verdict, verdict_text_style))
     story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
 
-    if m["critical_sins"]:
+    if m.scoring.critical_sins:
         crit_text = (
             "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
-            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m["critical_sins"])
+            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m.scoring.critical_sins)
         )
         story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
         story.append(Spacer(1, 6))
-    if m["minor_sins"]:
+    if m.scoring.minor_sins:
         minor_text = (
-            f"<b>Второстепенные риски (балл {m['minor_score']:.1f} из {m['max_minor_score']:.1f}):</b><br/>"
-            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m["minor_sins"])
+            f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
+            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m.scoring.minor_sins)
         )
         story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-    if not m["sins"]:
+    if not m.scoring.sins:
         story.append(CalloutBox(
             "<b>Финансовые риски:</b> Грехов не обнаружено. Показатели REIT в безупречной форме.",
             USABLE_W, COLORS, callout_text_style, COLORS["success"],
@@ -2193,21 +2020,21 @@ def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
         return ["N/A" if pd.isna(series.iloc[i]) else f"{series.iloc[i] / 1e6:,.1f}" for i in last4]
 
     fund_rows = [
-        ["FFO"] + _fmt_last4(m["ffo"]),
-        ["AFFO"] + _fmt_last4(m["affo"]),
-        ["NOI"] + _fmt_last4(m["noi"]),
-        ["CapEx"] + _fmt_last4(m["capex"].abs()),
-        ["Dividends Paid"] + _fmt_last4(m["dividends_paid"]),
+        ["FFO"] + _fmt_last4(m.ffo),
+        ["AFFO"] + _fmt_last4(m.affo),
+        ["NOI"] + _fmt_last4(m.noi),
+        ["CapEx"] + _fmt_last4(m.capex.abs()),
+        ["Dividends Paid"] + _fmt_last4(m.dividends_paid),
     ]
     story.append(create_reportlab_table(fund_headers, fund_rows, styles, COLORS, col_widths=[190, 70, 70, 70, 70]))
     story.append(Spacer(1, 8))
 
-    payout_txt = "N/A (дивиденды не выплачиваются)" if m["affo_payout_ratio"] is None else (
-        "∞ (AFFO ≤ 0)" if m["affo_payout_ratio"] == float("inf") else f"{m['affo_payout_ratio'] * 100:.1f}%"
+    payout_txt = "N/A (дивиденды не выплачиваются)" if m.affo_payout_ratio is None else (
+        "∞ (AFFO ≤ 0)" if m.affo_payout_ratio == float("inf") else f"{m.affo_payout_ratio * 100:.1f}%"
     )
-    de_txt = "N/A" if m["debt_to_equity"] is None else f"{m['debt_to_equity']:.2f}x"
+    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
     story.append(Paragraph(
-        f"<b>Occupancy Rate:</b> {m['occupancy_rate'] * 100:.1f}% &nbsp;&nbsp; "
+        f"<b>Occupancy Rate:</b> {m.occupancy_rate * 100:.1f}% &nbsp;&nbsp; "
         f"<b>AFFO Payout Ratio:</b> {payout_txt} &nbsp;&nbsp; "
         f"<b>Total Debt / Shareholders Equity:</b> {de_txt}",
         body_style,
@@ -2224,9 +2051,9 @@ def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     story.append(Spacer(1, 8))
 
     val_banner_text = (
-        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m['fair_value_share']:.2f} {trading_ccy}</b><br/>"
+        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m.valuation.fair_value_share:.2f} {trading_ccy}</b><br/>"
         f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
-        f"| Статус: <font color='{val_color.hexval()}'><b>{m['val_status']}</b></font>"
+        f"| Статус: <font color='{val_color.hexval()}'><b>{m.valuation.val_status}</b></font>"
     )
     story.append(CalloutBox(
         val_banner_text, USABLE_W, COLORS,

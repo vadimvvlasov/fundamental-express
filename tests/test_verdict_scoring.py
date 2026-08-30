@@ -86,29 +86,29 @@ def sin_ids(sins):
 
 def test_zero_sins_is_buy():
     m = compute_metrics(make_data())
-    assert m["sins"] == []
-    assert m["critical_sins"] == []
-    assert m["minor_score"] == 0
-    assert m["verdict_color_key"] == "success"
-    assert "КУПИТЬ" in m["verdict"]
+    assert m.scoring.sins == []
+    assert m.scoring.critical_sins == []
+    assert m.scoring.minor_score == 0
+    assert m.scoring.verdict_color_key == "success"
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_single_critical_sin_forces_skip_even_with_zero_minor_score():
     m = compute_metrics(make_data(fcf=(180.0, -10.0)))
-    assert sin_ids(m["critical_sins"]) == {"fcf_negative"}
-    assert m["minor_sins"] == []
-    assert m["minor_score"] == 0
-    assert m["verdict_color_key"] == "danger"
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"fcf_negative"}
+    assert m.scoring.minor_sins == []
+    assert m.scoring.minor_score == 0
+    assert m.scoring.verdict_color_key == "danger"
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_minor_score_exactly_1_0_is_buy_boundary_inclusive():
     m = compute_metrics(make_data(equity=(1200.0, 1100.0)))
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {"equity_declining"}
-    assert m["minor_score"] == pytest.approx(1.0)
-    assert m["verdict_color_key"] == "success"
-    assert "КУПИТЬ" in m["verdict"]
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {"equity_declining"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
+    assert m.scoring.verdict_color_key == "success"
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_minor_score_1_1_is_watch():
@@ -116,13 +116,13 @@ def test_minor_score_1_1_is_watch():
         cost_of_revenue=(600.0, 650.0),   # gross margin 40% -> 35%: +0.5
         net_income=(150.0, 140.0),        # net income decline: +0.3, net margin 15%->14%: +0.3
     ))
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {
         "gross_margin_declining", "net_income_declining", "net_margin_declining",
     }
-    assert m["minor_score"] == pytest.approx(1.1)
-    assert m["verdict_color_key"] == "warning"
-    assert "НАБЛЮДАТЬ" in m["verdict"]
+    assert m.scoring.minor_score == pytest.approx(1.1)
+    assert m.scoring.verdict_color_key == "warning"
+    assert "НАБЛЮДАТЬ" in m.scoring.verdict
 
 
 def test_minor_score_exactly_2_5_is_watch_boundary_inclusive():
@@ -132,11 +132,11 @@ def test_minor_score_exactly_2_5_is_watch_boundary_inclusive():
         curr_assets=(540.0, 450.0),       # CR 1.8 -> 1.5, still < 2.0: +0.5
         curr_liab=(300.0, 300.0),
     ))
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {"equity_declining", "fcf_declining", "cr_declining"}
-    assert m["minor_score"] == pytest.approx(2.5)
-    assert m["verdict_color_key"] == "warning"
-    assert "НАБЛЮДАТЬ" in m["verdict"]
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {"equity_declining", "fcf_declining", "cr_declining"}
+    assert m.scoring.minor_score == pytest.approx(2.5)
+    assert m.scoring.verdict_color_key == "warning"
+    assert "НАБЛЮДАТЬ" in m.scoring.verdict
 
 
 def test_minor_score_2_6_is_skip():
@@ -145,13 +145,13 @@ def test_minor_score_2_6_is_skip():
         fcf=(180.0, 150.0),        # +1.0
         net_income=(150.0, 140.0), # +0.3, net margin +0.3
     ))
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {
         "equity_declining", "fcf_declining", "net_income_declining", "net_margin_declining",
     }
-    assert m["minor_score"] == pytest.approx(2.6)
-    assert m["verdict_color_key"] == "danger"
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert m.scoring.minor_score == pytest.approx(2.6)
+    assert m.scoring.verdict_color_key == "danger"
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_cr_below_1_is_critical_and_does_not_also_fire_cr_declining():
@@ -159,10 +159,10 @@ def test_cr_below_1_is_critical_and_does_not_also_fire_cr_declining():
         curr_assets=(400.0, 270.0),  # CR 1.33 -> 0.9
         curr_liab=(300.0, 300.0),
     ))
-    assert m["current_ratio"] == pytest.approx(0.9)
-    assert sin_ids(m["critical_sins"]) == {"cr_below_1"}
-    assert "cr_declining" not in sin_ids(m["minor_sins"])
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert m.current_ratio == pytest.approx(0.9)
+    assert sin_ids(m.scoring.critical_sins) == {"cr_below_1"}
+    assert "cr_declining" not in sin_ids(m.scoring.minor_sins)
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_cr_1_5_declining_from_1_8_is_minor_only():
@@ -170,9 +170,9 @@ def test_cr_1_5_declining_from_1_8_is_minor_only():
         curr_assets=(540.0, 450.0),  # CR 1.8 -> 1.5
         curr_liab=(300.0, 300.0),
     ))
-    assert m["current_ratio"] == pytest.approx(1.5)
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {"cr_declining"}
+    assert m.current_ratio == pytest.approx(1.5)
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {"cr_declining"}
 
 
 def test_cr_2_5_declining_from_3_0_fires_no_sin():
@@ -180,8 +180,8 @@ def test_cr_2_5_declining_from_3_0_fires_no_sin():
         curr_assets=(600.0, 500.0),  # CR 3.0 -> 2.5, healthy-decline carve-out
         curr_liab=(200.0, 200.0),
     ))
-    assert m["current_ratio"] == pytest.approx(2.5)
-    assert m["sins"] == []
+    assert m.current_ratio == pytest.approx(2.5)
+    assert m.scoring.sins == []
 
 
 def test_max_minor_score_matches_weight_table():
@@ -194,16 +194,16 @@ def test_max_minor_score_matches_weight_table():
 
 def test_dilution_fires_above_1_5_pct_growth():
     m = compute_metrics(make_data(diluted_shares=(100.0, 102.0)))  # +2.0%
-    assert sin_ids(m["minor_sins"]) == {"dilution"}
-    assert m["minor_score"] == pytest.approx(1.0)
-    assert "КУПИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.minor_sins) == {"dilution"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_buyback_bonus_alone_floors_at_zero_not_negative():
     m = compute_metrics(make_data(diluted_shares=(100.0, 98.0)))  # -2.0%, well past the 1/1.015 threshold
-    assert sin_ids(m["minor_sins"]) == {"buyback_bonus"}
-    assert m["minor_score"] == 0.0  # max(0.0, -0.5) - never negative
-    assert "КУПИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.minor_sins) == {"buyback_bonus"}
+    assert m.scoring.minor_score == 0.0  # max(0.0, -0.5) - never negative
+    assert "КУПИТЬ" in m.scoring.verdict
 
 
 def test_buyback_bonus_reduces_a_combined_score():
@@ -211,8 +211,8 @@ def test_buyback_bonus_reduces_a_combined_score():
         equity=(1200.0, 1100.0),          # +1.0
         diluted_shares=(100.0, 98.0),     # -0.5 bonus
     ))
-    assert sin_ids(m["minor_sins"]) == {"equity_declining", "buyback_bonus"}
-    assert m["minor_score"] == pytest.approx(0.5)
+    assert sin_ids(m.scoring.minor_sins) == {"equity_declining", "buyback_bonus"}
+    assert m.scoring.minor_score == pytest.approx(0.5)
 
 
 # ── Step 1: Current Ratio < 1.0 smart bypass (spec Section 2.3) ─────────
@@ -222,11 +222,11 @@ def test_cr_below_1_bypassed_when_fcf_positive_and_cash_covers_current_debt():
         curr_assets=(400.0, 270.0), curr_liab=(300.0, 300.0),  # CR 1.33 -> 0.9
         current_debt=(50.0, 50.0),  # cash (300, baseline) > current_debt (50)
     ))
-    assert m["current_ratio"] == pytest.approx(0.9)
-    assert m["critical_sins"] == []
-    assert sin_ids(m["minor_sins"]) == {"cr_below_1_bypassed"}
-    assert m["minor_score"] == pytest.approx(1.0)
-    assert "КУПИТЬ" in m["verdict"]  # NOT an automatic SKIP
+    assert m.current_ratio == pytest.approx(0.9)
+    assert m.scoring.critical_sins == []
+    assert sin_ids(m.scoring.minor_sins) == {"cr_below_1_bypassed"}
+    assert m.scoring.minor_score == pytest.approx(1.0)
+    assert "КУПИТЬ" in m.scoring.verdict  # NOT an automatic SKIP
 
 
 def test_cr_below_1_stays_critical_when_current_debt_row_is_missing():
@@ -235,9 +235,9 @@ def test_cr_below_1_stays_critical_when_current_debt_row_is_missing():
     m = compute_metrics(make_data(
         curr_assets=(400.0, 270.0), curr_liab=(300.0, 300.0),
     ))
-    assert sin_ids(m["critical_sins"]) == {"cr_below_1"}
-    assert "cr_below_1_bypassed" not in sin_ids(m["minor_sins"])
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"cr_below_1"}
+    assert "cr_below_1_bypassed" not in sin_ids(m.scoring.minor_sins)
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_cr_below_1_not_bypassed_when_fcf_negative():
@@ -246,20 +246,20 @@ def test_cr_below_1_not_bypassed_when_fcf_negative():
         current_debt=(50.0, 50.0),  # cash would cover current_debt...
         fcf=(180.0, -10.0),         # ...but FCF is negative, so bypass is not eligible
     ))
-    assert sin_ids(m["critical_sins"]) == {"cr_below_1", "fcf_negative"}
-    assert "cr_below_1_bypassed" not in sin_ids(m["minor_sins"])
+    assert sin_ids(m.scoring.critical_sins) == {"cr_below_1", "fcf_negative"}
+    assert "cr_below_1_bypassed" not in sin_ids(m.scoring.minor_sins)
 
 
 # ── Step 1: --required-return (spec Sections 2.4/2.5) ────────────────────
 
 def test_required_return_overrides_capm_cost_of_equity():
     m_default = compute_metrics(make_data())
-    assert m_default["required_return_used"] is False
-    assert m_default["cost_of_equity"] == pytest.approx(0.09)  # beta=1.0: 4% + 1.0*5%
+    assert m_default.valuation.required_return_used is False
+    assert m_default.valuation.cost_of_equity == pytest.approx(0.09)  # beta=1.0: 4% + 1.0*5%
 
     m_override = compute_metrics(make_data(), required_return=0.12)
-    assert m_override["required_return_used"] is True
-    assert m_override["cost_of_equity"] == pytest.approx(0.12)
+    assert m_override.valuation.required_return_used is True
+    assert m_override.valuation.cost_of_equity == pytest.approx(0.12)
 
 
 def test_required_return_type_accepts_valid_decimal():

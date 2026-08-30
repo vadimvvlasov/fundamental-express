@@ -98,7 +98,7 @@ class OrdinaryAnalyzer(BaseAnalyzer):
 
     def generate_markdown_report(self):
         forward_outlook = compute_forward_outlook(
-            self.data.get("info", {}), self.metrics["price"], self.metrics["eps"], self.metrics["cagr"],
+            self.data.get("info", {}), self.metrics.valuation.price, self.metrics.eps, self.metrics.cagr,
         )
         return build_markdown_report(
             self.ticker, self.data, self.metrics, forward_outlook,

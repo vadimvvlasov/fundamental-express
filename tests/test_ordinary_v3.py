@@ -98,11 +98,11 @@ def test_equity_negative_bypassed_when_all_three_conditions_met():
         fcf=(180.0, 180.0, 180.0, 180.0),  # positive all 4
         diluted_shares=(110.0, 108.0, 104.0, 100.0),  # steadily shrinking
     ))
-    assert "equity_negative" not in sin_ids(m["critical_sins"])
-    assert sin_ids(m["minor_sins"]) & {"technical_negative_equity"} == {"technical_negative_equity"}
-    tne = next(s for s in m["minor_sins"] if s.id == "technical_negative_equity")
+    assert "equity_negative" not in sin_ids(m.scoring.critical_sins)
+    assert sin_ids(m.scoring.minor_sins) & {"technical_negative_equity"} == {"technical_negative_equity"}
+    tne = next(s for s in m.scoring.minor_sins if s.id == "technical_negative_equity")
     assert tne.weight == pytest.approx(1.0)
-    assert "ПРОПУСТИТЬ" not in m["verdict"] or m["minor_score"] > 2.5  # verdict driven by score, not auto-SKIP
+    assert "ПРОПУСТИТЬ" not in m.scoring.verdict or m.scoring.minor_score > 2.5  # verdict driven by score, not auto-SKIP
 
 
 def test_equity_negative_stays_critical_when_operating_income_negative_one_year():
@@ -112,9 +112,9 @@ def test_equity_negative_stays_critical_when_operating_income_negative_one_year(
         fcf=(180.0, 180.0, 180.0, 180.0),
         diluted_shares=(110.0, 108.0, 104.0, 100.0),
     ))
-    assert sin_ids(m["critical_sins"]) == {"equity_negative"}
-    assert "technical_negative_equity" not in sin_ids(m["minor_sins"])
-    assert "ПРОПУСТИТЬ" in m["verdict"]
+    assert sin_ids(m.scoring.critical_sins) == {"equity_negative"}
+    assert "technical_negative_equity" not in sin_ids(m.scoring.minor_sins)
+    assert "ПРОПУСТИТЬ" in m.scoring.verdict
 
 
 def test_equity_negative_stays_critical_when_fcf_negative_one_year():
@@ -124,8 +124,8 @@ def test_equity_negative_stays_critical_when_fcf_negative_one_year():
         fcf=(180.0, -10.0, 180.0, 180.0),  # one bad year
         diluted_shares=(110.0, 108.0, 104.0, 100.0),
     ))
-    assert sin_ids(m["critical_sins"]) == {"equity_negative"}
-    assert "technical_negative_equity" not in sin_ids(m["minor_sins"])
+    assert sin_ids(m.scoring.critical_sins) == {"equity_negative"}
+    assert "technical_negative_equity" not in sin_ids(m.scoring.minor_sins)
 
 
 def test_equity_negative_stays_critical_when_shares_not_declining():
@@ -135,8 +135,8 @@ def test_equity_negative_stays_critical_when_shares_not_declining():
         fcf=(180.0, 180.0, 180.0, 180.0),
         diluted_shares=(100.0, 100.0, 100.0, 100.0),  # flat, no buyback proof
     ))
-    assert sin_ids(m["critical_sins"]) == {"equity_negative"}
-    assert "technical_negative_equity" not in sin_ids(m["minor_sins"])
+    assert sin_ids(m.scoring.critical_sins) == {"equity_negative"}
+    assert "technical_negative_equity" not in sin_ids(m.scoring.minor_sins)
 
 
 # ── Section 2.2.1: lt_insolvency smart bypass ────────────────────────────
@@ -152,9 +152,9 @@ def test_lt_insolvency_bypassed_when_all_three_conditions_met():
         fcf=(180.0, 180.0, 180.0, 180.0),
         diluted_shares=(110.0, 108.0, 104.0, 100.0),
     ))
-    assert "lt_insolvency" not in sin_ids(m["critical_sins"])
-    assert "technical_lt_insolvency" in sin_ids(m["minor_sins"])
-    tli = next(s for s in m["minor_sins"] if s.id == "technical_lt_insolvency")
+    assert "lt_insolvency" not in sin_ids(m.scoring.critical_sins)
+    assert "technical_lt_insolvency" in sin_ids(m.scoring.minor_sins)
+    tli = next(s for s in m.scoring.minor_sins if s.id == "technical_lt_insolvency")
     assert tli.weight == pytest.approx(1.0)
 
 
@@ -164,8 +164,8 @@ def test_lt_insolvency_stays_critical_without_buyback_proof():
         total_liab=(900.0, 900.0, 900.0, 900.0),
         diluted_shares=(100.0, 100.0, 100.0, 100.0),  # flat, no buyback proof
     ))
-    assert sin_ids(m["critical_sins"]) == {"lt_insolvency"}
-    assert "technical_lt_insolvency" not in sin_ids(m["minor_sins"])
+    assert sin_ids(m.scoring.critical_sins) == {"lt_insolvency"}
+    assert "technical_lt_insolvency" not in sin_ids(m.scoring.minor_sins)
 
 
 # ── Section 2.2 Scenario 2: Current Ratio bypass via ICR proxy ───────────
@@ -180,9 +180,9 @@ def test_cr_bypass_scenario2_fires_with_safe_leverage_and_strong_icr():
         # Net Debt = 600-100 = 500; Operating Income = 200 -> ND/OpInc = 2.5 (< 4.0)
         interest_expense=(30.0, 30.0, 30.0, 30.0),  # ICR = 200/30 = 6.67 (> 4.0)
     ))
-    assert m["current_ratio"] == pytest.approx(0.9)
-    assert m["critical_sins"] == []
-    assert "cr_below_1_bypassed" in sin_ids(m["minor_sins"])
+    assert m.current_ratio == pytest.approx(0.9)
+    assert m.scoring.critical_sins == []
+    assert "cr_below_1_bypassed" in sin_ids(m.scoring.minor_sins)
 
 
 def test_cr_bypass_scenario2_does_not_fire_above_leverage_cutoff():
@@ -192,7 +192,7 @@ def test_cr_bypass_scenario2_does_not_fire_above_leverage_cutoff():
         # Net Debt = 1100; ND/OpInc = 1100/200 = 5.5 (> 4.0) -> fails
         interest_expense=(30.0, 30.0, 30.0, 30.0),
     ))
-    assert sin_ids(m["critical_sins"]) == {"cr_below_1"}
+    assert sin_ids(m.scoring.critical_sins) == {"cr_below_1"}
 
 
 def test_cr_bypass_scenario2_does_not_fire_below_icr_cutoff():
@@ -201,7 +201,7 @@ def test_cr_bypass_scenario2_does_not_fire_below_icr_cutoff():
         long_term_debt=(600.0, 600.0, 600.0, 600.0), cash=(100.0, 100.0, 100.0, 100.0),
         interest_expense=(80.0, 80.0, 80.0, 80.0),  # ICR = 200/80 = 2.5 (< 4.0) -> fails
     ))
-    assert sin_ids(m["critical_sins"]) == {"cr_below_1"}
+    assert sin_ids(m.scoring.critical_sins) == {"cr_below_1"}
 
 
 def test_cr_bypass_scenario2_auto_passes_icr_when_interest_expense_missing():
@@ -210,8 +210,8 @@ def test_cr_bypass_scenario2_auto_passes_icr_when_interest_expense_missing():
         long_term_debt=(600.0, 600.0, 600.0, 600.0), cash=(100.0, 100.0, 100.0, 100.0),
         # No Interest Expense row at all -> ICR auto-passes; ND/OpInc = 2.5 still < 4.0
     ))
-    assert m["critical_sins"] == []
-    assert "cr_below_1_bypassed" in sin_ids(m["minor_sins"])
+    assert m.scoring.critical_sins == []
+    assert "cr_below_1_bypassed" in sin_ids(m.scoring.minor_sins)
 
 
 def test_cr_bypass_scenario2_does_not_fire_for_net_cash_company():
@@ -224,7 +224,7 @@ def test_cr_bypass_scenario2_does_not_fire_for_net_cash_company():
         long_term_debt=(100.0, 100.0, 100.0, 100.0), cash=(300.0, 300.0, 300.0, 300.0),
         # Net Debt = 100-300 = -200 (net cash)
     ))
-    assert sin_ids(m["critical_sins"]) == {"cr_below_1"}
+    assert sin_ids(m.scoring.critical_sins) == {"cr_below_1"}
 
 
 # ── Section 2.3: DCF -> DDM auto-switch ──────────────────────────────────
@@ -236,10 +236,10 @@ def test_ddm_triggers_on_negative_equity_plus_dividends():
         diluted_shares=(110.0, 108.0, 104.0, 100.0),
         dividend_yield=0.03,
     ))
-    assert m["valuation_model"] == "DDM"
-    assert m["cagr_div"] is not None
-    assert 0.02 <= m["cagr_div"] <= 0.10
-    assert m["dps_last"] == pytest.approx(230.0 / 100.0)
+    assert m.valuation.valuation_model == "DDM"
+    assert m.cagr_div is not None
+    assert 0.02 <= m.cagr_div <= 0.10
+    assert m.dps_last == pytest.approx(230.0 / 100.0)
 
 
 def test_ddm_triggers_on_high_debt_to_equity_plus_dividends():
@@ -249,14 +249,14 @@ def test_ddm_triggers_on_high_debt_to_equity_plus_dividends():
         cash_dividends_paid=(-200.0, -210.0, -220.0, -230.0),
         dividend_rate=1.5,
     ))
-    assert m["debt_to_equity_ratio"] == pytest.approx(2.5)
-    assert m["valuation_model"] == "DDM"
+    assert m.debt_to_equity_ratio == pytest.approx(2.5)
+    assert m.valuation.valuation_model == "DDM"
 
 
 def test_ddm_not_triggered_without_dividends_even_if_capital_distorted():
     m = compute_metrics(make_data(equity=(-50.0, -60.0, -70.0, -80.0)))
-    assert m["valuation_model"] == "DCF"
-    assert m["cagr_div"] is None
+    assert m.valuation.valuation_model == "DCF"
+    assert m.cagr_div is None
 
 
 def test_ddm_not_triggered_when_capital_is_healthy():
@@ -264,7 +264,7 @@ def test_ddm_not_triggered_when_capital_is_healthy():
         cash_dividends_paid=(-200.0, -210.0, -220.0, -230.0), dividend_yield=0.03,
     ))
     # equity positive (1200), D/E = 100/1200 = 0.08 (< 2.0) -> stays DCF
-    assert m["valuation_model"] == "DCF"
+    assert m.valuation.valuation_model == "DCF"
 
 
 def test_ddm_cagr_div_clamped_to_10_pct_ceiling():
@@ -274,8 +274,8 @@ def test_ddm_cagr_div_clamped_to_10_pct_ceiling():
         diluted_shares=(110.0, 108.0, 104.0, 100.0),
         dividend_yield=0.03,
     ))
-    assert m["valuation_model"] == "DDM"
-    assert m["cagr_div"] == pytest.approx(0.10)
+    assert m.valuation.valuation_model == "DDM"
+    assert m.cagr_div == pytest.approx(0.10)
 
 
 def test_ddm_defaults_cagr_div_to_5_pct_when_dps_unavailable_at_start():
@@ -285,8 +285,8 @@ def test_ddm_defaults_cagr_div_to_5_pct_when_dps_unavailable_at_start():
         diluted_shares=(110.0, 108.0, 104.0, 100.0),
         dividend_yield=0.03,
     ))
-    assert m["valuation_model"] == "DDM"
-    assert m["cagr_div"] == pytest.approx(0.05)
+    assert m.valuation.valuation_model == "DDM"
+    assert m.cagr_div == pytest.approx(0.05)
 
 
 def test_ddm_required_return_overrides_capm_cost_of_equity():
@@ -296,5 +296,5 @@ def test_ddm_required_return_overrides_capm_cost_of_equity():
         diluted_shares=(110.0, 108.0, 104.0, 100.0),
         dividend_yield=0.03,
     ), required_return=0.12)
-    assert m["valuation_model"] == "DDM"
-    assert m["cost_of_equity"] == pytest.approx(0.12)
+    assert m.valuation.valuation_model == "DDM"
+    assert m.valuation.cost_of_equity == pytest.approx(0.12)
