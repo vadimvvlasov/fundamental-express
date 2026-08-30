@@ -146,9 +146,12 @@ from fundamental_express.reporting.charts import (  # noqa: E402
     generate_ffo_chart,
 )
 
-# Ordinary DCF/DDM valuation - moved to
-# src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c).
-from fundamental_express.domain.valuation import ordinary_dcf_valuation  # noqa: E402
+# Ordinary DCF/DDM and Bank DDM/ROE-P-B valuation - moved to
+# src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c/T12d).
+from fundamental_express.domain.valuation import (  # noqa: E402
+    ordinary_dcf_valuation,
+    bank_valuation,
+)
 
 
 # ── CORE ANALYSIS: EXPRESS "SINS" CHECKLIST + DCF ───────────────────────
@@ -918,75 +921,21 @@ def compute_bank_metrics(data, required_return=None):
         )
 
     # ── Section 5: Fair value (DDM or ROE/P-B) ──────────────────────────
-    def _cost_of_equity():
-        if required_return is not None:
-            return required_return
-        ke = 0.04 + beta * 0.05
-        return max(0.05, min(0.15, ke))
-
-    cost_of_equity = _cost_of_equity()
-    terminal_g = 0.025
-
-    dividend_yield = info.get("dividendYield") or 0.0
-    latest_common_div_paid = (
-        common_dividends_paid.iloc[-1] if len(common_dividends_paid) and not pd.isna(common_dividends_paid.iloc[-1])
-        else 0.0
+    # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12d).
+    valuation, val_extras = bank_valuation(
+        required_return, beta, info, common_dividends_paid, diluted_shares,
+        latest_equity, shares, net_income, price,
     )
-    pays_dividends = latest_common_div_paid > 0 or dividend_yield > 0
-
-    bvps = None
-    roe = None
-    cagr_div = None
-    dps_last = None
-    dps_series = None
-
-    if pays_dividends and not diluted_shares.isna().all():
-        dps_series = (common_dividends_paid / diluted_shares).dropna()
-        dps_window = dps_series.iloc[-4:] if len(dps_series) >= 2 else dps_series
-        if len(dps_window) < 2 or dps_window.iloc[0] <= 0 or dps_window.iloc[-1] <= 0:
-            cagr_div = 0.03
-        else:
-            n_periods = len(dps_window) - 1
-            cagr_div = (dps_window.iloc[-1] / dps_window.iloc[0]) ** (1.0 / n_periods) - 1
-            cagr_div = max(0.01, min(0.08, cagr_div))
-        dps_last = dps_window.iloc[-1] if len(dps_window) else 0.0
-
-        proj_years = list(range(1, 6))
-        proj_dps = [dps_last * ((1 + cagr_div) ** t) for t in proj_years]
-        pv_dividends = [proj_dps[t - 1] / ((1 + cost_of_equity) ** t) for t in proj_years]
-        sum_pv_dividends = sum(pv_dividends)
-        terminal_val = (
-            proj_dps[-1] * (1 + terminal_g) / (cost_of_equity - terminal_g)
-            if cost_of_equity > terminal_g else 0.0
-        )
-        pv_terminal_val = terminal_val / ((1 + cost_of_equity) ** 5)
-        fair_value_share = sum_pv_dividends + pv_terminal_val
-        valuation_model = "DDM"
-    else:
-        valuation_model = "ROE_PB"
-        if pd.isna(latest_equity) or latest_equity <= 0 or shares <= 0:
-            bvps = 0.0
-            roe = 0.0
-            fair_value_share = 0.0
-        else:
-            bvps = latest_equity / shares
-            latest_net_income = net_income.iloc[-1]
-            roe = latest_net_income / latest_equity
-            if roe <= 0:
-                fair_value_share = 0.1 * bvps
-            else:
-                fair_value_share = bvps * (roe / cost_of_equity)
-
-    over_under = (fair_value_share - price) / price * 100 if price else 0.0
-    if over_under > 10.0:
-        val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
-        val_color_key = "success"
-    elif over_under < -10.0:
-        val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
-        val_color_key = "danger"
-    else:
-        val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
-        val_color_key = "warning"
+    cost_of_equity = valuation.cost_of_equity
+    fair_value_share = valuation.fair_value_share
+    over_under = valuation.over_under_pct
+    val_status = valuation.val_status
+    val_color_key = valuation.val_color_key
+    valuation_model = valuation.valuation_model
+    cagr_div = val_extras["cagr_div"]
+    dps_last = val_extras["dps_last"]
+    bvps = val_extras["bvps"]
+    roe = val_extras["roe"]
 
     return {
         "kind": "bank",

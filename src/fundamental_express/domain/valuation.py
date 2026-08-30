@@ -6,8 +6,9 @@ compute_*_metrics() sins-checklist) and lands here in its own commit.
 
 T12a: compute_forward_outlook/_peg_assessment/_EMPTY_FORWARD_OUTLOOK.
 T12b: REIT_CAP_RATE_MATRIX/_reit_cap_rate.
-T12c (this commit): ordinary_dcf_valuation (CAPM/WACC/DCF, Ordinary v3
-DDM auto-switch, sensitivity matrix).
+T12c: ordinary_dcf_valuation (CAPM/WACC/DCF, Ordinary v3 DDM auto-switch,
+sensitivity matrix).
+T12d (this commit): bank_valuation (DDM or ROE/P-B).
 """
 
 import pandas as pd
@@ -202,6 +203,105 @@ def ordinary_dcf_valuation(
         "cagr_div": cagr_div,
         "dps_last": dps_last,
         "debt_to_equity_ratio": debt_to_equity_ratio,
+    }
+    return valuation, extras
+
+
+def bank_valuation(required_return, beta, info, common_dividends_paid, diluted_shares, latest_equity, shares, net_income, price):
+    """DDM (dividend-paying bank) or ROE/P-B (non-payer) fair value (spec
+    Section 5, docs/spec/step2-bank-analyzer-implementation-spec.md). Moved
+    verbatim out of compute_bank_metrics() - every input here was already
+    computed earlier in that function.
+
+    Returns (ValuationResult, extras) - extras carries cagr_div/dps_last
+    (DDM path only, else None) and bvps/roe (ROE/P-B path only, else None).
+    """
+    def _cost_of_equity():
+        if required_return is not None:
+            return required_return
+        ke = 0.04 + beta * 0.05
+        return max(0.05, min(0.15, ke))
+
+    cost_of_equity = _cost_of_equity()
+    terminal_g = 0.025
+
+    dividend_yield = info.get("dividendYield") or 0.0
+    latest_common_div_paid = (
+        common_dividends_paid.iloc[-1] if len(common_dividends_paid) and not pd.isna(common_dividends_paid.iloc[-1])
+        else 0.0
+    )
+    pays_dividends = latest_common_div_paid > 0 or dividend_yield > 0
+
+    bvps = None
+    roe = None
+    cagr_div = None
+    dps_last = None
+    dps_series = None
+
+    if pays_dividends and not diluted_shares.isna().all():
+        dps_series = (common_dividends_paid / diluted_shares).dropna()
+        dps_window = dps_series.iloc[-4:] if len(dps_series) >= 2 else dps_series
+        if len(dps_window) < 2 or dps_window.iloc[0] <= 0 or dps_window.iloc[-1] <= 0:
+            cagr_div = 0.03
+        else:
+            n_periods = len(dps_window) - 1
+            cagr_div = (dps_window.iloc[-1] / dps_window.iloc[0]) ** (1.0 / n_periods) - 1
+            cagr_div = max(0.01, min(0.08, cagr_div))
+        dps_last = dps_window.iloc[-1] if len(dps_window) else 0.0
+
+        proj_years = list(range(1, 6))
+        proj_dps = [dps_last * ((1 + cagr_div) ** t) for t in proj_years]
+        pv_dividends = [proj_dps[t - 1] / ((1 + cost_of_equity) ** t) for t in proj_years]
+        sum_pv_dividends = sum(pv_dividends)
+        terminal_val = (
+            proj_dps[-1] * (1 + terminal_g) / (cost_of_equity - terminal_g)
+            if cost_of_equity > terminal_g else 0.0
+        )
+        pv_terminal_val = terminal_val / ((1 + cost_of_equity) ** 5)
+        fair_value_share = sum_pv_dividends + pv_terminal_val
+        valuation_model = "DDM"
+    else:
+        valuation_model = "ROE_PB"
+        if pd.isna(latest_equity) or latest_equity <= 0 or shares <= 0:
+            bvps = 0.0
+            roe = 0.0
+            fair_value_share = 0.0
+        else:
+            bvps = latest_equity / shares
+            latest_net_income = net_income.iloc[-1]
+            roe = latest_net_income / latest_equity
+            if roe <= 0:
+                fair_value_share = 0.1 * bvps
+            else:
+                fair_value_share = bvps * (roe / cost_of_equity)
+
+    over_under = (fair_value_share - price) / price * 100 if price else 0.0
+    if over_under > 10.0:
+        val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
+        val_color_key = "success"
+    elif over_under < -10.0:
+        val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
+        val_color_key = "danger"
+    else:
+        val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
+        val_color_key = "warning"
+
+    valuation = ValuationResult(
+        price=price,
+        fair_value_share=fair_value_share,
+        over_under_pct=over_under,
+        val_status=val_status,
+        val_color_key=val_color_key,
+        beta=beta,
+        valuation_model=valuation_model,
+        cost_of_equity=cost_of_equity,
+        required_return_used=required_return is not None,
+    )
+    extras = {
+        "cagr_div": cagr_div,
+        "dps_last": dps_last,
+        "bvps": bvps,
+        "roe": roe,
     }
     return valuation, extras
 
