@@ -719,16 +719,73 @@ def compute_bank_metrics(data, required_return=None):
 # through of rental cash flow - see spec Section 0/2. This is a third
 # parallel engine (after Ordinary/Bank): FFO/AFFO/NOI checklist, NAV
 # (Net Asset Value) fair value instead of DCF.
-REIT_MINOR_SIN_WEIGHTS = {
-    "affo_declining": 1.0,
-    "occupancy_declining": 1.0,
-    "dilution": 1.0,
-    "high_leverage": 0.5,
-    "noi_declining": 0.5,
-    "capex_ratio_growth": 0.3,
-}
-REIT_BUYBACK_BONUS_WEIGHT = -0.5
-REIT_MAX_MINOR_SCORE = sum(REIT_MINOR_SIN_WEIGHTS.values())
+# REIT sin weight table (REIT_MINOR_SIN_WEIGHTS, REIT_BUYBACK_BONUS_WEIGHT)
+# moved into the declarative registry in
+# src/fundamental_express/domain/sins.py (docs/spec/refactor-tasks.md T11,
+# wired in by T15). REIT_MAX_MINOR_SCORE is re-exported under its original
+# name since tests/test_reit_analyzer.py imports it directly.
+from fundamental_express.domain.sins import (  # noqa: E402
+    REIT_MAX_MINOR_SCORE,
+    REIT_SIN_REGISTRY,
+    REIT_REASONING,
+    score,
+)
+from fundamental_express.domain.reit import check_reit_sins  # noqa: E402
+from fundamental_express.domain.metrics import ReitMetrics  # noqa: E402
+
+
+def _reit_metrics_to_dict(m):
+    """Dict-shape adapter, kept only until T16 rewires every caller onto
+    attribute access (docs/spec/refactor-tasks.md T15/T16) - reconstructs
+    compute_reit_metrics()'s original dict from a ReitMetrics."""
+    return {
+        "kind": "reit",
+        "year_labels": m.year_labels,
+        "d_and_a": m.d_and_a,
+        "gain_on_sale": m.gain_on_sale,
+        "capex": m.capex,
+        "net_income": m.net_income,
+        "rental_revenue": m.rental_revenue,
+        "property_opex": m.property_opex,
+        "re_taxes": m.re_taxes,
+        "construction_in_progress": m.construction_in_progress,
+        "receivables": m.receivables,
+        "cash": m.cash,
+        "total_liab": m.total_liab,
+        "total_debt": m.total_debt,
+        "shareholders_equity": m.shareholders_equity,
+        "diluted_shares": m.diluted_shares,
+        "dividends_paid": m.dividends_paid,
+        "ffo": m.ffo,
+        "affo": m.affo,
+        "noi": m.noi,
+        "occupancy_rate": m.occupancy_rate,
+        "affo_payout_ratio": m.affo_payout_ratio,
+        "debt_to_equity": m.debt_to_equity,
+        "cap_rate": m.cap_rate,
+        "cap_rate_label": m.cap_rate_label,
+        "property_value": m.property_value,
+        "nav": m.nav,
+        "ffo_per_share": m.ffo_per_share,
+        "p_ffo": m.p_ffo,
+        "sins": m.scoring.sins,
+        "critical_sins": m.scoring.critical_sins,
+        "minor_sins": m.scoring.minor_sins,
+        "minor_score": m.scoring.minor_score,
+        "max_minor_score": m.scoring.max_minor_score,
+        "verdict": m.scoring.verdict,
+        "verdict_color_key": m.scoring.verdict_color_key,
+        "reasoning": m.scoring.reasoning,
+        "beta": m.valuation.beta,
+        "price": m.valuation.price,
+        "fair_value_share": m.valuation.fair_value_share,
+        "over_under_pct": m.valuation.over_under_pct,
+        "val_status": m.valuation.val_status,
+        "val_color_key": m.valuation.val_color_key,
+        "current_ratio": m.current_ratio,
+        "net_margin_pct": m.net_margin_pct,
+    }
+
 
 # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12b).
 from fundamental_express.domain.valuation import (  # noqa: E402
@@ -835,118 +892,20 @@ def compute_reit_metrics(data, required_return=None):
     affo = ffo - capex.abs()
     noi = rental_revenue - property_opex - re_taxes
 
-    latest_equity = shareholders_equity.iloc[-1]
-    latest_affo = affo.iloc[-1]
-    latest_dividends = dividends_paid.iloc[-1] if not pd.isna(dividends_paid.iloc[-1]) else 0.0
-
-    # ── Section 4.1: Critical sins ───────────────────────────────────────
-    sins = []
-    affo_payout_ratio = None
-    if latest_dividends > 0:
-        if latest_affo <= 0:
-            affo_payout_ratio = float("inf")
-            sins.append(Sin(
-                "affo_payout_over_100", "critical", 0.0,
-                f"Дивиденды «в долг»: выплачены дивиденды ({latest_dividends / 1e6:,.0f} млн) при "
-                f"AFFO ≤ 0 ({latest_affo / 1e6:,.0f} млн) - выплата не обеспечена денежным потоком.",
-            ))
-        else:
-            affo_payout_ratio = latest_dividends / latest_affo
-            if affo_payout_ratio > 1.0:
-                sins.append(Sin(
-                    "affo_payout_over_100", "critical", 0.0,
-                    f"Дивиденды «в долг»: AFFO Payout Ratio = {affo_payout_ratio * 100:.1f}% (> 100%) - "
-                    "траст выплачивает больше, чем зарабатывает по AFFO.",
-                ))
-    if occupancy_rate < 0.80:
-        sins.append(Sin(
-            "occupancy_below_80", "critical", 0.0,
-            f"Низкая заполняемость объектов: Occupancy Rate = {occupancy_rate * 100:.1f}% (< 80%).",
-        ))
-    if not pd.isna(latest_equity) and latest_equity <= 0:
-        sins.append(Sin(
-            "equity_negative", "critical", 0.0,
-            f"Отрицательный акционерный капитал: Shareholders Equity ({latest_equity / 1e6:,.0f} млн) ≤ 0.",
-        ))
-    critical_sins = [s for s in sins if s.tier == "critical"]
-
-    # ── Section 4.2: Minor sins (always computed - no interruption here) ─
-    if len(affo) >= 2 and affo.iloc[-2] > 0 and affo.iloc[-1] > 0 and affo.iloc[-1] < affo.iloc[-2]:
-        sins.append(Sin(
-            "affo_declining", "minor", REIT_MINOR_SIN_WEIGHTS["affo_declining"],
-            f"Падение AFFO: с {affo.iloc[-2] / 1e6:,.0f} до {affo.iloc[-1] / 1e6:,.0f} млн.",
-        ))
-    # Note: occupancy_declining (spec Section 4.2) is not evaluated here -
-    # occupancy_rate above is a single current-snapshot value (yfinance
-    # carries no historical Occupancy Rate time series), so there is no
-    # prior-year figure to compare against without inventing one.
-    debt_to_equity = None
-    if (
-        not diluted_shares.isna().any()
-        and len(diluted_shares) >= 2
-        and diluted_shares.iloc[-2] != 0
-    ):
-        shares_ratio = diluted_shares.iloc[-1] / diluted_shares.iloc[-2]
-        if shares_ratio > 1.025:
-            sins.append(Sin(
-                "dilution", "minor", REIT_MINOR_SIN_WEIGHTS["dilution"],
-                f"Размытие капитала через SPO: среднее число акций выросло с {diluted_shares.iloc[-2]:,.0f} "
-                f"до {diluted_shares.iloc[-1]:,.0f} ({(shares_ratio - 1) * 100:.1f}%).",
-            ))
-        elif shares_ratio < (1 / 1.015):
-            sins.append(Sin(
-                "buyback_bonus", "minor", REIT_BUYBACK_BONUS_WEIGHT,
-                f"Бонус за байбэк: число акций сократилось с {diluted_shares.iloc[-2]:,.0f} "
-                f"до {diluted_shares.iloc[-1]:,.0f} ({(1 - shares_ratio) * 100:.1f}%).",
-            ))
-    if not pd.isna(latest_equity) and latest_equity > 0 and not pd.isna(total_debt.iloc[-1]):
-        debt_to_equity = total_debt.iloc[-1] / latest_equity
-        if debt_to_equity > 2.0:
-            sins.append(Sin(
-                "high_leverage", "minor", REIT_MINOR_SIN_WEIGHTS["high_leverage"],
-                f"Критический долг: Total Debt / Shareholders Equity = {debt_to_equity * 100:.1f}% (> 200%).",
-            ))
-    if len(noi) >= 2 and noi.iloc[-1] < noi.iloc[-2]:
-        sins.append(Sin(
-            "noi_declining", "minor", REIT_MINOR_SIN_WEIGHTS["noi_declining"],
-            f"Падение NOI: с {noi.iloc[-2] / 1e6:,.0f} до {noi.iloc[-1] / 1e6:,.0f} млн.",
-        ))
-    if len(capex) >= 2 and len(ffo) >= 2 and ffo.iloc[-2] > 0 and ffo.iloc[-1] > 0:
-        capex_ratio_prior = capex.iloc[-2].__abs__() / ffo.iloc[-2]
-        capex_ratio_current = capex.iloc[-1].__abs__() / ffo.iloc[-1]
-        if capex_ratio_prior > 0 and (capex_ratio_current / capex_ratio_prior - 1) > 0.05:
-            sins.append(Sin(
-                "capex_ratio_growth", "minor", REIT_MINOR_SIN_WEIGHTS["capex_ratio_growth"],
-                f"Рост доли капинвестиций: CapEx/FFO вырос с {capex_ratio_prior * 100:.1f}% до "
-                f"{capex_ratio_current * 100:.1f}% (YoY > 5%).",
-            ))
-
-    minor_sins = [s for s in sins if s.tier == "minor"]
-    minor_score = max(0.0, sum(s.weight for s in minor_sins))
-
-    if critical_sins:
-        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
-        verdict_color_key = "danger"
-        crit_labels = ", ".join(s.id for s in critical_sins)
-        reasoning = (
-            f"Обнаружен(ы) критический(е) фактор(ы) риска REIT ({crit_labels}). "
-            "Любой из них по отдельности делает инвестицию рискованной вне зависимости от прочих показателей."
-        )
-    elif minor_score <= 1.0:
-        verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
-        verdict_color_key = "success"
-        reasoning = "Траст демонстрирует устойчивый рост AFFO/NOI, комфортную заполняемость объектов и разумную долговую нагрузку. Риски минимальны."
-    elif minor_score <= 2.5:
-        verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
-        verdict_color_key = "warning"
-        reasoning = "Портфель недвижимости остаётся жизнеспособным, однако в динамике AFFO, NOI или долговой нагрузки присутствуют умеренные погрешности."
-    else:
-        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
-        verdict_color_key = "danger"
-        reasoning = (
-            f"Взвешенный балл второстепенных нарушений REIT составил {minor_score:.1f} из "
-            f"{REIT_MAX_MINOR_SCORE:.1f}. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
-        )
+    # ── REIT sins checklist (condition checks + registry-driven scoring) ──
+    # Moved to src/fundamental_express/domain/reit.py (condition checks) and
+    # domain/sins.py (scoring) - docs/spec/refactor-tasks.md T15.
+    sins, affo_payout_ratio, debt_to_equity = check_reit_sins(
+        dividends_paid, affo, occupancy_rate, shareholders_equity,
+        diluted_shares, total_debt, noi, capex, ffo,
+    )
+    scoring = score(sins, REIT_SIN_REGISTRY, REIT_REASONING)
+    critical_sins = scoring.critical_sins
+    minor_sins = scoring.minor_sins
+    minor_score = scoring.minor_score
+    verdict = scoring.verdict
+    verdict_color_key = scoring.verdict_color_key
+    reasoning = scoring.reasoning
 
     # ── Section 5: NAV fair value ────────────────────────────────────────
     # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12e).
@@ -965,53 +924,41 @@ def compute_reit_metrics(data, required_return=None):
     ffo_per_share = val_extras["ffo_per_share"]
     p_ffo = val_extras["p_ffo"]
 
-    return {
-        "kind": "reit",
-        "year_labels": year_labels,
-        "d_and_a": d_and_a,
-        "gain_on_sale": gain_on_sale,
-        "capex": capex,
-        "net_income": net_income,
-        "rental_revenue": rental_revenue,
-        "property_opex": property_opex,
-        "re_taxes": re_taxes,
-        "construction_in_progress": construction_in_progress,
-        "receivables": receivables,
-        "cash": cash,
-        "total_liab": total_liab,
-        "total_debt": total_debt,
-        "shareholders_equity": shareholders_equity,
-        "diluted_shares": diluted_shares,
-        "dividends_paid": dividends_paid,
-        "ffo": ffo,
-        "affo": affo,
-        "noi": noi,
-        "occupancy_rate": occupancy_rate,
-        "affo_payout_ratio": affo_payout_ratio,
-        "debt_to_equity": debt_to_equity,
-        "cap_rate": cap_rate,
-        "cap_rate_label": cap_rate_label,
-        "property_value": property_value,
-        "nav": nav,
-        "ffo_per_share": ffo_per_share,
-        "p_ffo": p_ffo,
-        "sins": sins,
-        "critical_sins": critical_sins,
-        "minor_sins": minor_sins,
-        "minor_score": minor_score,
-        "max_minor_score": REIT_MAX_MINOR_SCORE,
-        "verdict": verdict,
-        "verdict_color_key": verdict_color_key,
-        "reasoning": reasoning,
-        "beta": beta,
-        "price": price,
-        "fair_value_share": fair_value_share,
-        "over_under_pct": over_under,
-        "val_status": val_status,
-        "val_color_key": val_color_key,
-        "current_ratio": None,
-        "net_margin_pct": None,
-    }
+    metrics = ReitMetrics(
+        scoring=scoring,
+        valuation=valuation,
+        year_labels=year_labels,
+        d_and_a=d_and_a,
+        gain_on_sale=gain_on_sale,
+        capex=capex,
+        net_income=net_income,
+        rental_revenue=rental_revenue,
+        property_opex=property_opex,
+        re_taxes=re_taxes,
+        construction_in_progress=construction_in_progress,
+        receivables=receivables,
+        cash=cash,
+        total_liab=total_liab,
+        total_debt=total_debt,
+        shareholders_equity=shareholders_equity,
+        diluted_shares=diluted_shares,
+        dividends_paid=dividends_paid,
+        ffo=ffo,
+        affo=affo,
+        noi=noi,
+        occupancy_rate=occupancy_rate,
+        affo_payout_ratio=affo_payout_ratio,
+        debt_to_equity=debt_to_equity,
+        cap_rate=cap_rate,
+        cap_rate_label=cap_rate_label,
+        property_value=property_value,
+        nav=nav,
+        ffo_per_share=ffo_per_share,
+        p_ffo=p_ffo,
+    )
+    # Dict-shape return boundary, kept only until T16 rewires every caller
+    # onto attribute access - see docs/spec/refactor-tasks.md T15/T16.
+    return _reit_metrics_to_dict(metrics)
 
 
 # ── FORWARD OUTLOOK (Forward P/E, consensus growth, PEG) ────────────────
