@@ -4,7 +4,8 @@ docs/spec/step3-reit-analyzer-implementation-spec.md).
 
 Adapter pattern: OrdinaryAnalyzer wraps the existing, tested function-based
 engine in financial_analyzer.py (get_company_data/compute_metrics/
-build_pdf_report/build_markdown_report) rather than reimplementing it.
+build_pdf_report) and the shared markdown renderer (reporting/markdown.py,
+reporting/sections_ordinary.py) rather than reimplementing it.
 BankAnalyzer (Step 2) and ReitAnalyzer (Step 3) are both real, independent
 implementations on top of their own compute_*_metrics()/build_*_report()
 engines - neither delegates to OrdinaryAnalyzer anymore.
@@ -13,11 +14,8 @@ engines - neither delegates to OrdinaryAnalyzer anymore.
 from abc import ABC, abstractmethod
 
 from financial_analyzer import (
-    build_bank_markdown_report,
     build_bank_pdf_report,
-    build_markdown_report,
     build_pdf_report,
-    build_reit_markdown_report,
     build_reit_pdf_report,
     check_sector_suitability,
     compute_bank_metrics,
@@ -29,6 +27,11 @@ from financial_analyzer import (
 # financial_analyzer's import above adds src/ to sys.path as a side effect
 # (docs/spec/refactor-tasks.md T02), which this import relies on.
 from fundamental_express.domain.routing import _is_reit  # noqa: E402
+from fundamental_express.reporting.markdown import render as md_render, write as md_write  # noqa: E402
+from fundamental_express.reporting.sections_ordinary import build_ordinary_sections  # noqa: E402
+from fundamental_express.reporting.sections_bank import build_bank_sections  # noqa: E402
+from fundamental_express.reporting.sections_reit import build_reit_sections  # noqa: E402
+from financial_analyzer import OUTPUT_DIR, CATALYSTS_PLACEHOLDER  # noqa: E402
 
 
 class BaseAnalyzer(ABC):
@@ -100,12 +103,16 @@ class OrdinaryAnalyzer(BaseAnalyzer):
         forward_outlook = compute_forward_outlook(
             self.data.get("info", {}), self.metrics.valuation.price, self.metrics.eps, self.metrics.cagr,
         )
-        return build_markdown_report(
-            self.ticker, self.data, self.metrics, forward_outlook,
-            getattr(self.args, "catalysts_text", None),
+        sections = build_ordinary_sections(
+            self.metrics, forward_outlook, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
+            self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
+        )
+        content = md_render(
+            self.ticker, self.data, self.metrics, sections,
             getattr(self.args, "excluded_sector", None),
             getattr(self.args, "excluded_industry", None),
         )
+        return md_write(self.ticker, content, OUTPUT_DIR)
 
     def generate_pdf_report(self):
         # Re-fetches and re-computes internally - an accepted, deliberate
@@ -126,7 +133,7 @@ class OrdinaryAnalyzer(BaseAnalyzer):
 class BankAnalyzer(BaseAnalyzer):
     """Step 2 real implementation - NII/LTD sins checklist and DDM/ROE-P-B
     fair value (compute_bank_metrics()), rendered by the dedicated
-    build_bank_pdf_report()/build_bank_markdown_report() (spec Section 6).
+    build_bank_pdf_report()/reporting/markdown.py::render() (spec Section 6).
     No longer delegates to OrdinaryAnalyzer: check_sector_suitability() no
     longer restricts Financial Services at all (see its docstring), and
     AnalyzerFactory routes "Financial Services" here unconditionally, with
@@ -155,10 +162,12 @@ class BankAnalyzer(BaseAnalyzer):
         return self.metrics
 
     def generate_markdown_report(self):
-        return build_bank_markdown_report(
-            self.ticker, self.data, self.metrics,
-            getattr(self.args, "catalysts_text", None),
+        sections = build_bank_sections(
+            self.metrics, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
+            self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
         )
+        content = md_render(self.ticker, self.data, self.metrics, sections)
+        return md_write(self.ticker, content, OUTPUT_DIR)
 
     def generate_pdf_report(self):
         # Re-fetches and re-computes internally, same accepted seam as
@@ -176,7 +185,7 @@ class BankAnalyzer(BaseAnalyzer):
 class ReitAnalyzer(BaseAnalyzer):
     """Step 3 real implementation - FFO/AFFO/NOI sins checklist and NAV fair
     value (compute_reit_metrics()), rendered by the dedicated
-    build_reit_pdf_report()/build_reit_markdown_report() (spec Section 6).
+    build_reit_pdf_report()/reporting/markdown.py::render() (spec Section 6).
     No longer delegates to OrdinaryAnalyzer: check_sector_suitability() no
     longer restricts any sector at all (see its docstring), and
     AnalyzerFactory routes REIT industries here unconditionally, with or
@@ -205,10 +214,12 @@ class ReitAnalyzer(BaseAnalyzer):
         return self.metrics
 
     def generate_markdown_report(self):
-        return build_reit_markdown_report(
-            self.ticker, self.data, self.metrics,
-            getattr(self.args, "catalysts_text", None),
+        sections = build_reit_sections(
+            self.metrics, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
+            self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
         )
+        content = md_render(self.ticker, self.data, self.metrics, sections)
+        return md_write(self.ticker, content, OUTPUT_DIR)
 
     def generate_pdf_report(self):
         # Re-fetches and re-computes internally, same accepted seam as
@@ -241,14 +252,15 @@ class AnalyzerFactory:
         which as of Step 3 never restricts anything (see its docstring) -
         kept in place only so a future sector can reuse the same mechanism,
         and so OrdinaryAnalyzer's warning-banner rendering path in
-        build_markdown_report()/build_pdf_report() stays exercised by its
-        existing tests even though no live sector currently triggers it.
+        reporting/markdown.py::render()/build_pdf_report() stays exercised
+        by its existing tests even though no live sector currently
+        triggers it.
 
         Stashes excluded_sector/excluded_industry onto `args` so
-        OrdinaryAnalyzer.generate_markdown_report() can thread them into the
-        warning-banner rendering without another signature change to
-        build_markdown_report(). Set to None for the bank/REIT branches,
-        which never carry that warning banner.
+        OrdinaryAnalyzer.generate_markdown_report() can thread them into
+        render()'s warning-banner rendering without another signature
+        change. Set to None for the bank/REIT branches, which never carry
+        that warning banner.
         """
         sector = info.get("sector") or ""
         if sector == "Financial Services":

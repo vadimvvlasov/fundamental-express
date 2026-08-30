@@ -899,161 +899,14 @@ def _debt_lines(m, trading_ccy):
     return lines
 
 
-def build_markdown_report(
-    ticker, data, m, forward_outlook=None, catalysts_text=None,
-    excluded_sector=None, excluded_industry=None,
-):
-    """Plain-text/Markdown twin of the PDF report - same numbers, no charts."""
-    name = data["name"]
-    trading_ccy = data.get("trading_currency", "USD")
-    financial_ccy = data.get("financial_currency", "USD")
-    forward_outlook = forward_outlook or dict(_EMPTY_FORWARD_OUTLOOK)
-    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
-    catalysts_block = "\n".join(
-        f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
-    )
-    sector_warning_line = (
-        f"> ⚠️ **ВНИМАНИЕ (НЕПРИМЕНИМАЯ МЕТОДИКА):** Компания относится к сектору "
-        f"**{excluded_sector} ({excluded_industry})**. Экспресс-оценка ликвидности (Current Ratio) и "
-        "классический расчет справедливой цены по DCF для данного сектора могут быть некорректны и "
-        "давать ложные результаты!\n\n"
-        if excluded_sector else ""
-    )
-    fx_line = (
-        f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
-        f"{data.get('fx_rate', 1.0):.4f}\n\n"
-        if financial_ccy != trading_ccy else ""
-    )
-    year_labels = m.year_labels
-
-    def row(label, series, fmt="{:,.1f}"):
-        return f"| {label} | " + " | ".join(fmt.format(v) for v in series) + " |"
-
-    if m.scoring.sins:
-        sins_parts = []
-        if m.scoring.critical_sins:
-            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins))
-        if m.scoring.minor_sins:
-            sins_parts.append(
-                f"**Второстепенные (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):**\n"
-                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
-            )
-        sins_block = "\n\n".join(sins_parts)
-    else:
-        sins_block = "- Грехов не обнаружено."
-    debt_block = "\n".join(f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy))
-    sens_header = "| " + " | ".join(m.sensitivity_headers) + " |"
-    sens_sep = "|" + "---|" * len(m.sensitivity_headers)
-    sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m.sensitivity_rows)
-
-    peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
-    peg_emoji = {"success": "🟢", "warning": "🟡", "danger": "🔴", "muted": "⚪"}[peg_color_key]
-    forward_pe_txt = _fmt_or_na(forward_outlook["forward_pe"])
-    growth_txt = _fmt_or_na(forward_outlook["growth_pct"], "{:.1f}%")
-    peg_txt = _fmt_or_na(forward_outlook["peg_ratio"])
-    ke_disclosure = (
-        f"Ke = задано инвестором (--required-return) = {m.valuation.cost_of_equity * 100:.2f}%"
-        if m.valuation.required_return_used
-        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%"
-    )
-
-    # Ordinary v3 (Step 4): a dividend-paying company with a distorted
-    # capital structure (equity<=0 or D/E>200%) gets valued by DDM instead
-    # of DCF - see compute_metrics()'s "Ordinary v3" section. m.valuation.fair_value_share/
-    # over_under_pct/val_status already reflect whichever model ran; only the
-    # disclosure text below needs to branch, since the DCF-only concepts
-    # (WACC, Enterprise Value, sensitivity matrix) don't apply to DDM.
-    if m.valuation.valuation_model == "DDM":
-        section3_md = f"""## 3. Оценка справедливой стоимости (Модель DDM)
-
-⚠️ **Внимание:** Применена модель дисконтирования дивидендов (DDM) вместо классического DCF - у компании искажена структура капитала (отрицательный или "перегруженный" долгом акционерный капитал) на фоне стабильной истории дивидендных выплат. Классический FCF-DCF в этом случае занижает стоимость (лизинговые/долговые обязательства искажают WACC).
-
-- {ke_disclosure}
-- Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%): {m.cagr_div * 100:.2f}%
-- DPS последнего года (Dividends Paid / Diluted Shares): {m.dps_last:.2f} {trading_ccy}
-- Терминальный темп роста (Gordon Growth): 2.5%
-
-**Справедливая стоимость по DDM: {m.valuation.fair_value_share:.2f} {trading_ccy}**
-Текущая рыночная цена: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
-"""
-    else:
-        section3_md = f"""## 3. Модель дисконтирования денежных потоков (DCF)
-
-- Стоимость собственного капитала: {ke_disclosure}
-- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
-- Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m.equity_weight * 100:.1f}%, D/(D+E) = {m.debt_weight * 100:.1f}%
-- **WACC:** {m.equity_weight * 100:.1f}%×{m.valuation.cost_of_equity * 100:.2f}% + {m.debt_weight * 100:.1f}%×{m.cost_of_debt_after_tax * 100:.2f}% = **{m.wacc * 100:.2f}%**
-- CAGR роста FCF: {m.cagr * 100:.2f}% (историческая, ограничена 2-15%)
-- Терминальный темп роста: 2.5%
-
-{debt_block}
-
-> {LEASE_ASSUMPTION_NOTE}
-
-- Enterprise Value: {m.enterprise_value / 1e9:,.2f} млрд. {trading_ccy}
-- Equity Value: {m.equity_value / 1e9:,.2f} млрд. {trading_ccy}
-
-**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
-
-### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на 2.5% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
-
-{sens_header}
-{sens_sep}
-{sens_rows}
-"""
-
-    md = f"""{sector_warning_line}# Фундаментальный анализ & оценка DCF: {ticker.upper()}
-
-Компания: **{name}** | Цена: **{m.valuation.price:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
-
-{fx_line}## 1. Экспресс-вердикт и оценка рисков
-
-**{m.scoring.verdict}**
-
-{m.scoring.reasoning}
-
-**Выявленные риски:**
-
-{sins_block}
-
-## 2. Экспресс-анализ финансовых результатов и баланса
-
-Показатели в млн. {trading_ccy}.
-
-| Показатель | {" | ".join(year_labels)} |
-|---|{"---|" * len(year_labels)}
-{row("Выручка (Revenue)", [v / 1e6 for v in m.revenue])}
-{row("Операционная прибыль", [v / 1e6 for v in m.operating_income])}
-{row("Чистая прибыль (Net Income)", [v / 1e6 for v in m.net_income])}
-{row("Разводненная EPS, USD", list(m.eps), fmt="{:.2f}")}
-{row("Оборотные активы", [v / 1e6 for v in m.curr_assets])}
-{row("Краткосрочные обязательства", [v / 1e6 for v in m.curr_liab])}
-{row("Current Ratio", list(m.curr_ratios), fmt="{:.2f}")}
-{row("Акционерный капитал", [v / 1e6 for v in m.equity])}
-{row("Free Cash Flow", [v / 1e6 for v in m.fcf])}
-
-{section3_md}
-## 4. Форвардные мультипликаторы и консенсус-прогноз
-
-> Раздел носит справочный характер и не влияет на балл экспресс-чеклиста из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную на экстраполяции исторических 4 лет.
-
-- Forward P/E: **{forward_pe_txt}** [источник: {forward_outlook['forward_pe_source'] or 'N/A'}]
-- Ожидаемый рост (консенсус): **{growth_txt}** [источник: {forward_outlook['growth_source'] or 'N/A'}]
-- PEG Ratio: **{peg_txt}** {peg_emoji} — {peg_label} [источник: {forward_outlook['peg_source'] or 'N/A'}]
-
-## 5. Катализаторы и риски (качественная оценка)
-
-{catalysts_block}
-
----
-Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
-"""
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.md")
-    with open(md_filename, "w") as f:
-        f.write(md)
-    return md_filename
+# ── UNIFIED MARKDOWN RENDERER (docs/spec/refactor-tasks.md T19) ────────
+# build_markdown_report()/build_bank_markdown_report()/
+# build_reit_markdown_report() are deleted - replaced by one
+# render()/write() driven by each asset class's Section list.
+from fundamental_express.reporting.markdown import render as md_render, write as md_write  # noqa: E402
+from fundamental_express.reporting.sections_ordinary import build_ordinary_sections  # noqa: E402
+from fundamental_express.reporting.sections_bank import build_bank_sections  # noqa: E402
+from fundamental_express.reporting.sections_reit import build_reit_sections  # noqa: E402
 
 
 def build_pdf_report(
@@ -1438,9 +1291,11 @@ def build_pdf_report(
     doc.build(story)
     print(f"Success! Comprehensive report saved to: {pdf_filename}")
 
-    md_filename = build_markdown_report(
-        ticker, data, m, forward_outlook, catalysts_text, excluded_sector, excluded_industry,
+    ordinary_sections = build_ordinary_sections(
+        m, forward_outlook, catalysts_text, trading_ccy, price_kind, quote_time_label,
     )
+    md_content = md_render(ticker, data, m, ordinary_sections, excluded_sector, excluded_industry)
+    md_filename = md_write(ticker, md_content, OUTPUT_DIR)
     print(f"Success! Markdown report saved to: {md_filename}")
 
     return pdf_filename, md_filename
@@ -1490,104 +1345,6 @@ def _bank_structural_rows(m, trading_ccy):
         ],
     ]
     return rows
-
-
-def build_bank_markdown_report(ticker, data, m, catalysts_text=None):
-    """Bank twin of build_markdown_report() - NII/LTD in the header, DDM or
-    ROE/P-B valuation disclosure instead of WACC/DCF, loan/deposit
-    structural table instead of the Ordinary current-assets table."""
-    name = data["name"]
-    trading_ccy = data.get("trading_currency", "USD")
-    financial_ccy = data.get("financial_currency", "USD")
-    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
-    catalysts_block = "\n".join(
-        f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
-    )
-    fx_line = (
-        f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
-        f"{data.get('fx_rate', 1.0):.4f}\n\n"
-        if financial_ccy != trading_ccy else ""
-    )
-    year_labels = m.year_labels
-
-    def row(label, series, fmt="{:,.1f}"):
-        return f"| {label} | " + " | ".join(
-            "N/A" if pd.isna(v) else fmt.format(v) for v in series
-        ) + " |"
-
-    if m.scoring.sins:
-        sins_parts = []
-        if m.scoring.critical_sins:
-            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins))
-        if m.scoring.minor_sins:
-            sins_parts.append(
-                f"**Второстепенные (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):**\n"
-                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
-            )
-        sins_block = "\n\n".join(sins_parts)
-    else:
-        sins_block = "- Грехов не обнаружено."
-
-    model_name, model_lines = _bank_valuation_disclosure(m)
-    model_block = "\n".join(f"- {label}{': ' + value if value else ''}" for label, value in model_lines)
-    ltd_txt = "N/A" if m.ltd_ratio is None else f"{m.ltd_ratio * 100:.1f}%"
-    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
-    struct_rows = _bank_structural_rows(m, trading_ccy)
-
-    md = f"""# Фундаментальный анализ & оценка банка: {ticker.upper()}
-
-Компания: **{name}** | Цена: **{m.valuation.price:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
-
-{fx_line}## 1. Экспресс-вердикт и оценка рисков (банковский чеклист)
-
-**{m.scoring.verdict}**
-
-{m.scoring.reasoning}
-
-**Выявленные риски:**
-
-{sins_block}
-
-## 2. Экспресс-анализ процентного дохода и баланса
-
-Показатели в млн. {trading_ccy}. Вместо Revenue/Current Ratio для банков используются NII и Loan-to-Deposit (LTD).
-
-| Показатель | {" | ".join(year_labels)} |
-|---|{"---|" * len(year_labels)}
-{row("Net Interest Income (NII)", m.net_interest_income / 1e6)}
-{row("Комиссионный доход", m.commissions_income / 1e6)}
-{row("Резервы под потери по кредитам (Provision)", m.credit_loss_provision / 1e6)}
-{row("Чистая прибыль (Net Income)", m.net_income / 1e6)}
-{row("Акционерный капитал (Shareholders Equity)", m.shareholders_equity / 1e6)}
-
-**Loan-to-Deposit Ratio (LTD, последний год): {ltd_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
-
-### Структура кредитного портфеля и депозитной базы (YoY)
-
-| Показатель | {" | ".join(year_labels)} |
-|---|{"---|" * len(year_labels)}
-{chr(10).join("| " + " | ".join(str(c) for c in r) + " |" for r in struct_rows)}
-
-## 3. Оценка справедливой стоимости: {model_name}
-
-{model_block}
-
-**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
-
-## 4. Катализаторы и риски (качественная оценка)
-
-{catalysts_block}
-
----
-У банков отсутствуют Enterprise Value и Net Debt в классическом виде - долговая нагрузка оценивается через Total Debt / Shareholders Equity.
-Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
-"""
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.md")
-    with open(md_filename, "w") as f:
-        f.write(md)
-    return md_filename
 
 
 def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
@@ -1779,7 +1536,9 @@ def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     doc.build(story)
     print(f"Success! Comprehensive bank report saved to: {pdf_filename}")
 
-    md_filename = build_bank_markdown_report(ticker, data, m, catalysts_text)
+    bank_sections = build_bank_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label)
+    md_content = md_render(ticker, data, m, bank_sections)
+    md_filename = md_write(ticker, md_content, OUTPUT_DIR)
     print(f"Success! Markdown bank report saved to: {md_filename}")
 
     return pdf_filename, md_filename
@@ -1815,91 +1574,6 @@ def _reit_operating_rows(m):
         ["CapEx (млн.)"] + fmt(m.capex.abs()),
         ["Dividends Paid (млн.)"] + fmt(m.dividends_paid),
     ]
-
-
-def build_reit_markdown_report(ticker, data, m, catalysts_text=None):
-    """REIT twin of build_markdown_report()/build_bank_markdown_report() -
-    FFO/AFFO/NOI/Occupancy in the header, NAV valuation bridge instead of
-    WACC/DCF, loan/deposit-style operating-performance table."""
-    name = data["name"]
-    trading_ccy = data.get("trading_currency", "USD")
-    financial_ccy = data.get("financial_currency", "USD")
-    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
-    catalysts_block = "\n".join(
-        f"> {line}" if line.strip() else ">" for line in catalysts_text.splitlines()
-    )
-    fx_line = (
-        f"> Отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу "
-        f"{data.get('fx_rate', 1.0):.4f}\n\n"
-        if financial_ccy != trading_ccy else ""
-    )
-    year_labels = m.year_labels
-
-    if m.scoring.sins:
-        sins_parts = []
-        if m.scoring.critical_sins:
-            sins_parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins))
-        if m.scoring.minor_sins:
-            sins_parts.append(
-                f"**Второстепенные (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):**\n"
-                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
-            )
-        sins_block = "\n\n".join(sins_parts)
-    else:
-        sins_block = "- Грехов не обнаружено."
-
-    op_rows = _reit_operating_rows(m)
-    nav_rows = _reit_nav_bridge_rows(m, trading_ccy)
-    nav_block = "\n".join(f"- {label}: {value}" for label, value in nav_rows)
-    payout_txt = "N/A (дивиденды не выплачиваются)" if m.affo_payout_ratio is None else (
-        "∞ (AFFO ≤ 0)" if m.affo_payout_ratio == float("inf") else f"{m.affo_payout_ratio * 100:.1f}%"
-    )
-    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
-
-    md = f"""# Фундаментальный анализ & оценка REIT: {ticker.upper()}
-
-Компания: **{name}** | Цена: **{m.valuation.price:.2f} {trading_ccy}** ({data['price_kind']}, Yahoo Finance, {data['quote_time_label']})
-
-{fx_line}## 1. Экспресс-вердикт и оценка рисков (чеклист REIT)
-
-**{m.scoring.verdict}**
-
-{m.scoring.reasoning}
-
-**Выявленные риски:**
-
-{sins_block}
-
-## 2. REIT Operating Performance (FFO / AFFO / NOI)
-
-Показатели в млн. {trading_ccy}. Вместо Net Income/операционного кэш-флоу для REIT используются FFO, AFFO и NOI.
-
-| Показатель | {" | ".join(year_labels)} |
-|---|{"---|" * len(year_labels)}
-{chr(10).join("| " + " | ".join(str(c) for c in r) + " |" for r in op_rows)}
-
-**Occupancy Rate: {m.occupancy_rate * 100:.1f}%** | **AFFO Payout Ratio: {payout_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
-
-## 3. NAV Valuation Bridge
-
-{nav_block}
-
-**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({data['price_kind']}, {data['quote_time_label']}) | Статус: **{m.valuation.val_status}**
-
-## 4. Катализаторы и риски (качественная оценка)
-
-{catalysts_block}
-
----
-Классический DCF неприменим к REIT (искажение денежного потока операциями с недвижимостью) - справедливая стоимость оценивается по методу NAV (Net Asset Value) на базе NOI и отраслевой ставки капитализации (Cap Rate).
-Фундаментальный анализ отвечает на вопрос «что покупать» — точку входа по времени нужно определять в связке с техническим анализом.
-"""
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    md_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.md")
-    with open(md_filename, "w") as f:
-        f.write(md)
-    return md_filename
 
 
 def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
@@ -2081,7 +1755,9 @@ def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     doc.build(story)
     print(f"Success! Comprehensive REIT report saved to: {pdf_filename}")
 
-    md_filename = build_reit_markdown_report(ticker, data, m, catalysts_text)
+    reit_sections = build_reit_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label)
+    md_content = md_render(ticker, data, m, reit_sections)
+    md_filename = md_write(ticker, md_content, OUTPUT_DIR)
     print(f"Success! Markdown REIT report saved to: {md_filename}")
 
     return pdf_filename, md_filename
