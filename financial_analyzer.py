@@ -117,21 +117,8 @@ from fundamental_express.data.parsing import find_row, _align_statement_years  #
 from fundamental_express.data.errors import DataUnavailableError, UnsupportedSectorError  # noqa: E402
 
 
-def check_sector_suitability(ticker, info, force):
-    """No sector is restricted anymore - Financial Services (banks, Step 2)
-    and REIT industries (Step 3) both got their own real specialized
-    engines (compute_bank_metrics()/compute_reit_metrics()) and are routed
-    to them natively by AnalyzerFactory before this function is ever called
-    for that ticker (see its docstring). This always returns (None, None).
-
-    Kept in place - rather than deleted - for two reasons: it's the hook a
-    future restricted sector would reuse (raise UnsupportedSectorError as
-    before), and OrdinaryAnalyzer's warning-banner rendering path in
-    build_markdown_report()/build_pdf_report() stays reachable code (even
-    though no live sector currently triggers it) without touching that
-    tested Ordinary rendering.
-    """
-    return None, None
+# Moved to src/fundamental_express/domain/routing.py (docs/spec/refactor-tasks.md T08).
+from fundamental_express.domain.routing import check_sector_suitability  # noqa: E402
 
 
 def _fx_rate(from_ccy, to_ccy):

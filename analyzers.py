@@ -26,6 +26,9 @@ from financial_analyzer import (
     compute_reit_metrics,
     get_company_data,
 )
+# financial_analyzer's import above adds src/ to sys.path as a side effect
+# (docs/spec/refactor-tasks.md T02), which this import relies on.
+from fundamental_express.domain.routing import _is_reit  # noqa: E402
 
 
 class BaseAnalyzer(ABC):
@@ -218,16 +221,6 @@ class ReitAnalyzer(BaseAnalyzer):
             catalysts_text=getattr(self.args, "catalysts_text", None),
             required_return=getattr(self.args, "required_return", None),
         )
-
-
-def _is_reit(info):
-    """Spec Section 1.1 routing marker - industry/sector text containing a
-    REIT keyword, independent of check_sector_suitability()'s old
-    sector-gated rule (kept only for the now-dormant warning-banner path,
-    see that function's docstring)."""
-    industry = str(info.get("industry") or "").lower()
-    sector = str(info.get("sector") or "").lower()
-    return "reit" in industry or "real estate investment trust" in industry or "real estate investment trust" in sector
 
 
 class AnalyzerFactory:
