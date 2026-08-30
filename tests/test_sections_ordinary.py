@@ -24,7 +24,7 @@ def _sections():
     forward_outlook = fa.compute_forward_outlook(data.get("info", {}), m.valuation.price, m.eps, m.cagr)
     sections = build_ordinary_sections(
         m, forward_outlook, "Тестовый катализатор.",
-        data["trading_currency"], data["price_kind"], data["quote_time_label"],
+        data["trading_currency"], data["price_kind"], data["quote_time_label"], "ACME",
     )
     return m, sections
 
@@ -34,7 +34,7 @@ def test_returns_five_sections_in_order():
     assert [s.title for s in sections] == [
         "Экспресс-вердикт и оценка рисков",
         "Экспресс-анализ финансовых результатов и баланса",
-        "Оценка справедливой стоимости",
+        "Модель дисконтирования денежных потоков (DCF)",  # fixture uses the DCF branch
         "Форвардные мультипликаторы и консенсус-прогноз",
         "Катализаторы и риски",
     ]
@@ -52,7 +52,8 @@ def test_checklist_section_markdown_reflects_verdict_and_zero_sins():
 def test_checklist_section_flowables_render_without_error():
     _, sections = _sections()
     flowables = sections[0].flowables()
-    assert len(flowables) >= 2  # verdict paragraph + reasoning paragraph at minimum
+    # intro/verdict/reasoning paragraphs + the "no sins" callout (fixture is zero-sins)
+    assert len(flowables) >= 4
 
 
 def test_fundamentals_section_table_has_a_row_per_metric():
@@ -63,10 +64,10 @@ def test_fundamentals_section_table_has_a_row_per_metric():
         assert label in md
 
 
-def test_fundamentals_section_flowables_is_one_table():
+def test_fundamentals_section_flowables_includes_table_and_chart():
     _, sections = _sections()
     flowables = sections[1].flowables()
-    assert len(flowables) == 1
+    assert len(flowables) >= 3  # intro paragraph + table + chart image at minimum
 
 
 def test_valuation_section_uses_dcf_when_model_is_dcf():

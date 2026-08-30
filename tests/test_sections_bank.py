@@ -21,7 +21,7 @@ def _sections():
     data = build_bank_data()
     m = fa.compute_bank_metrics(data)
     sections = build_bank_sections(
-        m, "Тестовый катализатор.", data["trading_currency"], data["price_kind"], data["quote_time_label"],
+        m, "Тестовый катализатор.", data["trading_currency"], data["price_kind"], data["quote_time_label"], "GOLDBANK",
     )
     return m, sections
 
@@ -46,7 +46,7 @@ def test_checklist_section_markdown_reflects_verdict_and_zero_sins():
 
 def test_checklist_section_flowables_render_without_error():
     _, sections = _sections()
-    assert len(sections[0].flowables()) >= 2
+    assert len(sections[0].flowables()) >= 4
 
 
 def test_fundamentals_section_has_nii_and_ltd_table():
@@ -57,9 +57,10 @@ def test_fundamentals_section_has_nii_and_ltd_table():
     assert "Loan-to-Deposit Ratio" in md
 
 
-def test_fundamentals_section_flowables_is_two_tables():
+def test_fundamentals_section_flowables_includes_tables_and_chart():
     _, sections = _sections()
-    assert len(sections[1].flowables()) == 2
+    # intro para + NII table + LTD para + chart image + struct para + struct table
+    assert len(sections[1].flowables()) >= 6
 
 
 def test_valuation_section_uses_ddm_when_dividends_paid():

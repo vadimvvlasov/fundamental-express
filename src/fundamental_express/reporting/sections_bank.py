@@ -1,24 +1,31 @@
-"""Bank report sections (docs/spec/refactor-tasks.md T18): the same four
-numbered blocks build_bank_markdown_report()/build_bank_pdf_report()
+"""Bank report sections (docs/spec/refactor-tasks.md T18/T20): the same
+four numbered blocks build_bank_markdown_report()/build_bank_pdf_report()
 assemble inline today (checklist/verdict, NII/LTD table + structural
 rows, DDM/ROE-P-B valuation disclosure, catalysts), rebuilt as an ordered
 list[Section] from a BankMetrics. No forward-outlook section - Bank has
-none today (see build_bank_markdown_report()).
+none today.
 
-Not yet wired into build_bank_markdown_report()/build_bank_pdf_report() -
-pure addition, same posture as T17 (rollback = delete the two new files).
+`markdown()` is verified byte-for-byte against the golden snapshot (T19).
+`flowables()` was upgraded in T20 to match build_bank_pdf_report()'s
+actual content/richness (grouped sin callouts, the NII chart image, the
+structural table) - PDF output was never byte-comparable, so this is a
+structural/visual match verified by generating a real PDF, not a diff.
 `_bank_valuation_disclosure`/`_bank_structural_rows` are duplicated from
 financial_analyzer.py for the same reason as T17's `_debt_lines`.
 """
 
 import pandas as pd
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import Paragraph, Spacer
+from reportlab.platypus import Image, Paragraph, Spacer
 
+from fundamental_express.reporting.charts import generate_nii_chart
 from fundamental_express.reporting.flowables import CalloutBox
 from fundamental_express.reporting.sections import Section
 from fundamental_express.reporting.tables import create_reportlab_table
 from fundamental_express.reporting.theme import COLORS, FONT_NAME, USABLE_W
+
+_BODY = dict(fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6)
+_CALLOUT_TEXT = dict(fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13)
 
 
 def _bank_valuation_disclosure(m):
@@ -90,29 +97,37 @@ def _checklist_section(m):
             "VerdictText", fontName=FONT_NAME, fontSize=12, textColor=COLORS[m.scoring.verdict_color_key],
             leading=15, spaceAfter=6,
         )
-        body_style = ParagraphStyle(
-            "Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6,
-        )
-        callout_style = ParagraphStyle(
-            "CalloutText", fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13,
-        )
+        body_style = ParagraphStyle("Body", **_BODY)
+        callout_style = ParagraphStyle("CalloutText", **_CALLOUT_TEXT)
         items = [
+            Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style),
             Paragraph(m.scoring.verdict, verdict_style),
-            Paragraph(m.scoring.reasoning, body_style),
+            Paragraph(f"<b>Резюме и обоснование:</b> {m.scoring.reasoning}", body_style),
         ]
-        if m.scoring.sins:
-            for s in m.scoring.sins:
-                bar_color = COLORS["danger"] if s.tier == "critical" else COLORS["warning"]
-                items.append(CalloutBox(s.message, USABLE_W, COLORS, callout_style, bar_color))
-                items.append(Spacer(1, 4))
-        else:
-            items.append(Paragraph("Грехов не обнаружено.", body_style))
+        if m.scoring.critical_sins:
+            crit_text = (
+                "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
+                + "<br/>".join(f"• {s.message}" for s in m.scoring.critical_sins)
+            )
+            items.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_style, COLORS["danger"]))
+            items.append(Spacer(1, 6))
+        if m.scoring.minor_sins:
+            minor_text = (
+                f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
+                + "<br/>".join(f"• [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
+            )
+            items.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_style, COLORS["warning"]))
+        if not m.scoring.sins:
+            items.append(CalloutBox(
+                "<b>Финансовые риски:</b> Грехов не обнаружено. Показатели банка в безупречной форме.",
+                USABLE_W, COLORS, callout_style, COLORS["success"],
+            ))
         return items
 
     return Section("Экспресс-вердикт и оценка рисков (банковский чеклист)", markdown, flowables)
 
 
-def _fundamentals_section(m, trading_ccy):
+def _fundamentals_section(m, trading_ccy, ticker):
     year_labels = m.year_labels
 
     def row(label, series, fmt="{:,.1f}"):
@@ -146,14 +161,39 @@ def _fundamentals_section(m, trading_ccy):
 {chr(10).join("| " + " | ".join(str(c) for c in r) + " |" for r in struct_rows)}"""
 
     def flowables():
-        headers = ["Показатель"] + list(year_labels)
+        body_style = ParagraphStyle("Body", **_BODY)
+        last4 = range(len(year_labels) - 4, len(year_labels))
+        headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
+
+        def fmt_last4(series):
+            return ["N/A" if pd.isna(series.iloc[i]) else f"{series.iloc[i] / 1e6:,.1f}" for i in last4]
+
         rows = [
-            ["Net Interest Income (NII)"] + ["N/A" if pd.isna(v) else f"{v / 1e6:,.1f}" for v in m.net_interest_income],
-            ["Комиссионный доход"] + ["N/A" if pd.isna(v) else f"{v / 1e6:,.1f}" for v in m.commissions_income],
-            ["Чистая прибыль (Net Income)"] + ["N/A" if pd.isna(v) else f"{v / 1e6:,.1f}" for v in m.net_income],
+            ["Net Interest Income (NII)"] + fmt_last4(m.net_interest_income),
+            ["Комиссионный доход"] + fmt_last4(m.commissions_income),
+            ["Резервы под потери по кредитам"] + fmt_last4(m.credit_loss_provision),
+            ["Чистая прибыль (Net Income)"] + fmt_last4(m.net_income),
+            ["Акционерный капитал (Shareholders Equity)"] + fmt_last4(m.shareholders_equity),
         ]
+        chart_img_path = generate_nii_chart(year_labels, m.net_interest_income.values, ticker)
         return [
-            create_reportlab_table(headers, rows, {}, COLORS),
+            Paragraph(
+                "Вместо Revenue/Current Ratio (неприменимых к банкам) используются Net Interest Income (NII) и "
+                "Loan-to-Deposit Ratio (LTD).",
+                body_style,
+            ),
+            create_reportlab_table(headers, rows, {}, COLORS, col_widths=[190, 70, 70, 70, 70]),
+            Spacer(1, 8),
+            Paragraph(
+                f"<b>Loan-to-Deposit Ratio (LTD, последний год):</b> {ltd_txt} &nbsp;&nbsp; "
+                f"<b>Total Debt / Shareholders Equity:</b> {de_txt} "
+                "(у банков нет Enterprise Value/Net Debt в классическом смысле).",
+                body_style,
+            ),
+            Spacer(1, 8),
+            Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4),
+            Spacer(1, 10),
+            Paragraph("<b>Структура кредитного портфеля и депозитной базы (YoY):</b>", body_style),
             create_reportlab_table(["Показатель"] + list(year_labels), struct_rows, {}, COLORS),
         ]
 
@@ -173,14 +213,24 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
 Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) | Статус: **{m.valuation.val_status}**"""
 
     def flowables():
-        body_style = ParagraphStyle(
-            "Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6,
+        callout_style = ParagraphStyle("CalloutText", **_CALLOUT_TEXT)
+        val_color = COLORS[m.valuation.val_color_key]
+        model_html = "<br/>".join(
+            f"• <b>{label}</b>{': ' + value if value else ''}" for label, value in model_lines
         )
-        items = [Paragraph(label, body_style) for label, _ in model_lines]
-        items.append(Paragraph(
-            f"Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}", body_style,
-        ))
-        return items
+        val_banner_text = (
+            f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m.valuation.fair_value_share:.2f} {trading_ccy}</b><br/>"
+            f"Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
+            f"| Статус: <font color='{val_color.hexval()}'><b>{m.valuation.val_status}</b></font>"
+        )
+        return [
+            CalloutBox(model_html, USABLE_W, COLORS, callout_style, COLORS["accent"]),
+            Spacer(1, 8),
+            CalloutBox(
+                val_banner_text, USABLE_W, COLORS,
+                ParagraphStyle("ValB", parent=callout_style, fontSize=10, leading=14), val_color,
+            ),
+        ]
 
     return Section(f"Оценка справедливой стоимости: {model_name}", markdown, flowables)
 
@@ -196,21 +246,20 @@ def _catalysts_section(catalysts_text):
 {catalysts_block}"""
 
     def flowables():
-        body_style = ParagraphStyle(
-            "Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6,
-        )
-        return [Paragraph(catalysts_text.replace("\n", "<br/>"), body_style)]
+        callout_style = ParagraphStyle("CalloutText", **_CALLOUT_TEXT)
+        catalysts_html = "<br/>".join(catalysts_text.splitlines())
+        return [CalloutBox(catalysts_html, USABLE_W, COLORS, callout_style, COLORS["muted"])]
 
     return Section("Катализаторы и риски", markdown, flowables)
 
 
-def build_bank_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label):
+def build_bank_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker):
     """Ordered list[Section] for the Bank report - the four numbered
     blocks build_bank_markdown_report()/build_bank_pdf_report() assemble
     inline today. No forward-outlook section (Bank has none)."""
     return [
         _checklist_section(m),
-        _fundamentals_section(m, trading_ccy),
+        _fundamentals_section(m, trading_ccy, ticker),
         _valuation_section(m, trading_ccy, price_kind, quote_time_label),
         _catalysts_section(catalysts_text),
     ]

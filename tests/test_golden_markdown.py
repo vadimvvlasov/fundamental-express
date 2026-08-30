@@ -41,7 +41,7 @@ def test_ordinary_golden_markdown(tmp_path):
     forward_outlook = fa.compute_forward_outlook(data.get("info", {}), m.valuation.price, m.eps, m.cagr)
     sections = build_ordinary_sections(
         m, forward_outlook, fa.CATALYSTS_PLACEHOLDER,
-        data["trading_currency"], data["price_kind"], data["quote_time_label"],
+        data["trading_currency"], data["price_kind"], data["quote_time_label"], "ACME",
     )
     content = render("ACME", data, m, sections)
     md_path = write("ACME", content, str(tmp_path))
@@ -52,7 +52,7 @@ def test_bank_golden_markdown(tmp_path):
     data = build_bank_data()
     m = fa.compute_bank_metrics(data)
     sections = build_bank_sections(
-        m, fa.CATALYSTS_PLACEHOLDER, data["trading_currency"], data["price_kind"], data["quote_time_label"],
+        m, fa.CATALYSTS_PLACEHOLDER, data["trading_currency"], data["price_kind"], data["quote_time_label"], "GOLDBANK",
     )
     content = render("GOLDBANK", data, m, sections)
     md_path = write("GOLDBANK", content, str(tmp_path))
@@ -63,7 +63,7 @@ def test_reit_golden_markdown(tmp_path):
     data = build_reit_data()
     m = fa.compute_reit_metrics(data)
     sections = build_reit_sections(
-        m, fa.CATALYSTS_PLACEHOLDER, data["trading_currency"], data["price_kind"], data["quote_time_label"],
+        m, fa.CATALYSTS_PLACEHOLDER, data["trading_currency"], data["price_kind"], data["quote_time_label"], "PROPCO",
     )
     content = render("PROPCO", data, m, sections)
     md_path = write("PROPCO", content, str(tmp_path))

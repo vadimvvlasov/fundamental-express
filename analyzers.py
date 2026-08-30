@@ -106,6 +106,7 @@ class OrdinaryAnalyzer(BaseAnalyzer):
         sections = build_ordinary_sections(
             self.metrics, forward_outlook, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
             self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
+            self.ticker,
         )
         content = md_render(
             self.ticker, self.data, self.metrics, sections,
@@ -165,6 +166,7 @@ class BankAnalyzer(BaseAnalyzer):
         sections = build_bank_sections(
             self.metrics, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
             self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
+            self.ticker,
         )
         content = md_render(self.ticker, self.data, self.metrics, sections)
         return md_write(self.ticker, content, OUTPUT_DIR)
@@ -217,6 +219,7 @@ class ReitAnalyzer(BaseAnalyzer):
         sections = build_reit_sections(
             self.metrics, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
             self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
+            self.ticker,
         )
         content = md_render(self.ticker, self.data, self.metrics, sections)
         return md_write(self.ticker, content, OUTPUT_DIR)

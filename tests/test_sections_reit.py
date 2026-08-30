@@ -21,7 +21,7 @@ def _sections():
     data = build_reit_data()
     m = fa.compute_reit_metrics(data)
     sections = build_reit_sections(
-        m, "Тестовый катализатор.", data["trading_currency"], data["price_kind"], data["quote_time_label"],
+        m, "Тестовый катализатор.", data["trading_currency"], data["price_kind"], data["quote_time_label"], "PROPCO",
     )
     return m, sections
 
@@ -46,7 +46,7 @@ def test_checklist_section_markdown_reflects_verdict_and_zero_sins():
 
 def test_checklist_section_flowables_render_without_error():
     _, sections = _sections()
-    assert len(sections[0].flowables()) >= 2
+    assert len(sections[0].flowables()) >= 4
 
 
 def test_operating_section_has_ffo_affo_noi_rows():
@@ -58,9 +58,9 @@ def test_operating_section_has_ffo_affo_noi_rows():
     assert "Occupancy Rate" in md
 
 
-def test_operating_section_flowables_is_one_table():
+def test_operating_section_flowables_includes_table_and_chart():
     _, sections = _sections()
-    assert len(sections[1].flowables()) == 1
+    assert len(sections[1].flowables()) >= 3  # intro paragraph + table + chart image at minimum
 
 
 def test_valuation_section_has_nav_bridge():

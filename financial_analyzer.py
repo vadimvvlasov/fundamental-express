@@ -1,7 +1,6 @@
 import argparse
 import os
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 
 # Resolve workspace root relative to this script file
@@ -18,17 +17,6 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
 
 import pandas as pd
 
-from reportlab.lib.enums import TA_JUSTIFY
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.platypus import (
-    BaseDocTemplate,
-    Frame,
-    Image,
-    PageTemplate,
-    Paragraph,
-    Spacer,
-)
-
 # The express "sins" checklist in compute_metrics() is a two-tier model
 # (see docs/spec/technical-implementation-spec.md Section 1):
 #   - CRITICAL sins (fcf_negative, cr_below_1, lt_insolvency, equity_negative):
@@ -37,18 +25,10 @@ from reportlab.platypus import (
 #     operating/cash health vs how noisy/paper-driven the metric is. Weights
 #     sum to MAX_MINOR_SCORE and decide BUY/WATCH/SKIP when no critical sin
 #     fired.
-
-
-@dataclass
-class Sin:
-    """One fired checklist violation. `weight` is 0.0 for critical sins -
-    weight is meaningless there since any single critical hit is decisive."""
-
-    id: str
-    tier: str  # "critical" | "minor"
-    weight: float
-    message: str
-
+# `Sin` itself moved to src/fundamental_express/domain/sins.py in T11 and is
+# constructed there (via fire()) by every domain/{ordinary,bank,reit}.py
+# condition-check module (T13/T14/T15) - financial_analyzer.py never
+# constructs one directly anymore, so it's not re-exported here.
 
 # Ordinary sin weight tables (MINOR_SIN_WEIGHTS, BUYBACK_BONUS_WEIGHT,
 # TECHNICAL_NEGATIVE_EQUITY_WEIGHT, TECHNICAL_LT_INSOLVENCY_WEIGHT) moved
@@ -60,6 +40,8 @@ from fundamental_express.domain.sins import ORDINARY_MAX_MINOR_SCORE as MAX_MINO
 
 # ── VISUAL THEME (colors, fonts, page geometry) ─────────────────────────
 # Moved to src/fundamental_express/reporting/theme.py (docs/spec/refactor-tasks.md T02).
+# escape_xml/_fmt_or_na are not re-exported here - their only callers moved
+# into reporting/pdf.py and the reporting/sections_*.py modules in T20.
 from fundamental_express.reporting.theme import (  # noqa: E402
     COLORS,
     FONT_NAME,
@@ -69,8 +51,6 @@ from fundamental_express.reporting.theme import (  # noqa: E402
     PAGE_W,
     PAGE_H,
     USABLE_W,
-    escape_xml,
-    _fmt_or_na,
 )
 
 
@@ -100,27 +80,20 @@ from fundamental_express.data.yahoo import (  # noqa: E402
 from fundamental_express.data.sample import _sample_data  # noqa: E402
 
 
-# ── PDF FLOWABLES (section divider, callout box, sector warning banner) ─
+# ── PDF FLOWABLES (section divider, callout box) ────────────────────────
 # Moved to src/fundamental_express/reporting/flowables.py (docs/spec/refactor-tasks.md T03).
-from fundamental_express.reporting.flowables import (  # noqa: E402
-    SectionDivider,
-    CalloutBox,
-    SectorWarningBanner,
-)
+# SectorWarningBanner is not re-exported here - its only caller moved into
+# reporting/pdf.py in T20.
+from fundamental_express.reporting.flowables import SectionDivider, CalloutBox  # noqa: E402
 
 
 # ── SHARED PDF TABLE BUILDER ─────────────────────────────────────────────
 # Moved to src/fundamental_express/reporting/tables.py (docs/spec/refactor-tasks.md T04).
 from fundamental_express.reporting.tables import create_reportlab_table  # noqa: E402
 
-
-# ── CHART GENERATORS (FCF/NII/FFO) ──────────────────────────────────────
-# Moved to src/fundamental_express/reporting/charts.py (docs/spec/refactor-tasks.md T05).
-from fundamental_express.reporting.charts import (  # noqa: E402
-    generate_fcf_chart,
-    generate_nii_chart,
-    generate_ffo_chart,
-)
+# Chart generators (FCF/NII/FFO, src/fundamental_express/reporting/charts.py,
+# T05) are not re-exported here - every caller moved into the
+# reporting/sections_*.py modules in T20.
 
 # Ordinary DCF/DDM, Bank DDM/ROE-P-B, and REIT NAV valuation - moved to
 # src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c/T12d/T12e).
@@ -796,6 +769,17 @@ from fundamental_express.domain.valuation import (  # noqa: E402
     _peg_assessment,
 )
 
+# ── UNIFIED MARKDOWN/PDF RENDERERS (docs/spec/refactor-tasks.md T19/T20) ─
+# build_markdown_report()/build_bank_markdown_report()/build_reit_markdown_report()
+# and the ReportLab document-assembly portion of build_pdf_report()/
+# build_bank_pdf_report()/build_reit_pdf_report() are deleted - replaced by
+# one render()/write() per format, driven by each asset class's Section list.
+from fundamental_express.reporting.markdown import render as md_render, write as md_write  # noqa: E402
+from fundamental_express.reporting.pdf import render as pdf_render  # noqa: E402
+from fundamental_express.reporting.sections_ordinary import build_ordinary_sections  # noqa: E402
+from fundamental_express.reporting.sections_bank import build_bank_sections  # noqa: E402
+from fundamental_express.reporting.sections_reit import build_reit_sections  # noqa: E402
+
 
 CATALYSTS_PLACEHOLDER = (
     "Катализаторы не указаны — заполните вручную перед принятием решения. "
@@ -853,62 +837,10 @@ def required_return_type(value):
     return fvalue
 
 
-# ── MAIN PDF COMPILER ───────────────────────────────────────────────────
-LEASE_ASSUMPTION_NOTE = (
-    "Допущение по лизингу: в базовом DCF обязательства по аренде исключены из net debt, "
-    "поскольку модель использует FCF после операционных арендных платежей. Это "
-    "упрощающее допущение, а не универсальный бухгалтерский факт (выплаты по финансовой "
-    "аренде могут классифицироваться иначе) - для сопоставлений, где lease liabilities "
-    "рассматриваются как debt-like obligations, используйте альтернативный расчёт с "
-    "Total Debt (включая аренду) вместо приведённого net debt."
-)
-
-
-def _debt_lines(m, trading_ccy):
-    """Plain (label, value) pairs for the debt/net-debt disclosure - shared
-    between the PDF and Markdown renderers so the two never drift apart.
-    Never blends sources into a single invented number: each line names
-    exactly where its figure comes from.
-    """
-    lines = [(
-        "Долгосрочный долг (Long Term Debt, только процентный долг)",
-        f"{m.interest_bearing_debt / 1e9:,.2f} млрд. {trading_ccy}",
-    )]
-    if not pd.isna(m.lease_liabilities):
-        lines.append((
-            "Долгосрочные обязательства по аренде (Long-term lease liability, исключены из net debt ниже)",
-            f"{m.lease_liabilities / 1e9:,.2f} млрд. {trading_ccy}",
-        ))
-    if not pd.isna(m.total_debt_incl_leases):
-        lines.append((
-            "Total Debt (агрегированное поле провайдера данных, включает долг и debt-like "
-            "обязательства по его классификации - может не равняться простой сумме строк "
-            "выше; справочно, не используется в DCF)",
-            f"{m.total_debt_incl_leases / 1e9:,.2f} млрд. {trading_ccy}",
-        ))
-    lines.append((
-        "Денежные средства (Cash and Cash Equivalents)",
-        f"{m.cash_balance / 1e9:,.2f} млрд. {trading_ccy}",
-    ))
-    net_debt_label = (
-        "Чистый долг, использован в DCF (поле Net Debt из Yahoo Finance)"
-        if m.net_debt_source == "reported"
-        else "Чистый долг, использован в DCF (расчёт: Долгосрочный долг − Кэш)"
-    )
-    lines.append((net_debt_label, f"{m.net_debt / 1e9:,.2f} млрд. {trading_ccy}"))
-    return lines
-
-
-# ── UNIFIED MARKDOWN RENDERER (docs/spec/refactor-tasks.md T19) ────────
-# build_markdown_report()/build_bank_markdown_report()/
-# build_reit_markdown_report() are deleted - replaced by one
-# render()/write() driven by each asset class's Section list.
-from fundamental_express.reporting.markdown import render as md_render, write as md_write  # noqa: E402
-from fundamental_express.reporting.sections_ordinary import build_ordinary_sections  # noqa: E402
-from fundamental_express.reporting.sections_bank import build_bank_sections  # noqa: E402
-from fundamental_express.reporting.sections_reit import build_reit_sections  # noqa: E402
-
-
+# ── ORDINARY / BANK / REIT PDF REPORTS ──────────────────────────────────
+# Rendering portion (ReportLab document assembly) moved to
+# src/fundamental_express/reporting/pdf.py::render() (docs/spec/refactor-tasks.md T20).
+# Fetch/compute orchestration stays here until T21 moves it into analyzers.py.
 def build_pdf_report(
     ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, force=False,
     required_return=None,
@@ -919,381 +851,16 @@ def build_pdf_report(
     forward_outlook = compute_forward_outlook(data.get("info", {}), m.valuation.price, m.eps, m.cagr)
     catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
 
-    name = data["name"]
+    trading_ccy = data.get("trading_currency", "USD")
     price_kind = data["price_kind"]
     quote_time_label = data["quote_time_label"]
-    financial_ccy = data.get("financial_currency", "USD")
-    trading_ccy = data.get("trading_currency", "USD")
-    fx_note = (
-        f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
-        if financial_ccy != trading_ccy else ""
-    )
-    price = m.valuation.price
-    beta = m.valuation.beta
-    year_labels = m.year_labels
-    revenue = m.revenue
-    operating_income = m.operating_income
-    net_income = m.net_income
-    eps = m.eps
-    curr_assets = m.curr_assets
-    curr_liab = m.curr_liab
-    curr_ratios = m.curr_ratios
-    equity = m.equity
-    fcf = m.fcf
-    sins = m.scoring.sins
-    verdict = m.scoring.verdict
-    verdict_color = COLORS[m.scoring.verdict_color_key]
-    reasoning = m.scoring.reasoning
-    wacc = m.wacc
-    cagr = m.cagr
-    proj_years = m.proj_years
-    projected_fcfs = m.projected_fcfs
-    pv_fcfs = m.pv_fcfs
-    enterprise_value = m.enterprise_value
-    net_debt = m.net_debt
-    debt_lines = _debt_lines(m, trading_ccy)
-    cost_of_equity = m.valuation.cost_of_equity
-    cost_of_debt_after_tax = m.cost_of_debt_after_tax
-    equity_weight = m.equity_weight
-    debt_weight = m.debt_weight
-    equity_value = m.equity_value
-    fair_value_share = m.valuation.fair_value_share
-    val_status = m.valuation.val_status
-    val_color = COLORS[m.valuation.val_color_key]
-    sensitivity_headers = m.sensitivity_headers
-    sensitivity_rows = m.sensitivity_rows
-
-    chart_img_path = generate_fcf_chart(
-        year_labels, fcf.values, proj_years, projected_fcfs, ticker
-    )
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
-
-    doc = BaseDocTemplate(
-        pdf_filename,
-        pagesize=PAGE_SIZE,
-        leftMargin=MARGIN,
-        rightMargin=MARGIN,
-        topMargin=MARGIN + 15,
-        bottomMargin=MARGIN,
-    )
-
-    content_frame = Frame(
-        doc.leftMargin,
-        doc.bottomMargin,
-        USABLE_W,
-        PAGE_H - doc.topMargin - doc.bottomMargin,
-        id="main",
-    )
-
-    def on_later_pages(canvas, doc):
-        canvas.saveState()
-        canvas.setStrokeColor(COLORS["accent"])
-        canvas.setLineWidth(1.2)
-        y_rule = PAGE_H - MARGIN + 4
-        canvas.line(MARGIN, y_rule, PAGE_W - MARGIN, y_rule)
-
-        canvas.setFont(FONT_BOLD, 8)
-        canvas.setFillColor(COLORS["muted"])
-        canvas.drawString(
-            MARGIN,
-            y_rule + 4,
-            f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ И ОЦЕНКА СТОИМОСТИ: {ticker.upper()}",
-        )
-        canvas.drawRightString(PAGE_W - MARGIN, y_rule + 4, f"{name.upper()}")
-
-        y_footer = MARGIN - 24
-        canvas.setStrokeColor(COLORS["bg_alt"])
-        canvas.setLineWidth(0.4)
-        canvas.line(MARGIN, y_footer + 12, PAGE_W - MARGIN, y_footer + 12)
-
-        canvas.setFont(FONT_NAME, 8)
-        canvas.setFillColor(COLORS["muted"])
-        canvas.drawString(
-            MARGIN, y_footer, "Подготовлено ИИ-помощником фундаментального анализа"
-        )
-        canvas.drawRightString(PAGE_W - MARGIN, y_footer, f"Страница {doc.page}")
-        canvas.restoreState()
-
-    doc.addPageTemplates(
-        [PageTemplate(id="content", frames=content_frame, onPage=on_later_pages)]
-    )
-
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle(
-        "DocTitle", fontName=FONT_BOLD, fontSize=20, textColor=COLORS["heading"],
-        leading=24, spaceAfter=8,
-    )
-    subtitle_style = ParagraphStyle(
-        "DocSub", fontName=FONT_NAME, fontSize=11, textColor=COLORS["muted"],
-        leading=14, spaceAfter=15,
-    )
-    h1_style = ParagraphStyle(
-        "H1", fontName=FONT_BOLD, fontSize=12, textColor=COLORS["heading"],
-        leading=15, spaceBefore=12, spaceAfter=6, keepWithNext=True,
-    )
-    body_style = ParagraphStyle(
-        "Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"],
-        leading=13.5, spaceAfter=6, alignment=TA_JUSTIFY,
-    )
-    verdict_text_style = ParagraphStyle(
-        "VerdictText", fontName=FONT_BOLD, fontSize=12, textColor=verdict_color,
-        leading=15, spaceAfter=6,
-    )
-    callout_text_style = ParagraphStyle(
-        "CalloutText", fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13,
-    )
-
-    story = []
-
-    if excluded_sector:
-        sector_warning_style = ParagraphStyle(
-            "SectorWarning", fontName=FONT_BOLD, fontSize=10, textColor=COLORS["white"], leading=14,
-        )
-        sector_warning_text = (
-            "⚠ ВНИМАНИЕ (НЕПРИМЕНИМАЯ МЕТОДИКА): Компания относится к сектору "
-            f"<b>{escape_xml(excluded_sector)} ({escape_xml(excluded_industry)})</b>. Экспресс-оценка "
-            "ликвидности (Current Ratio) и классический расчет справедливой цены по DCF для данного "
-            "сектора могут быть некорректны и давать ложные результаты!"
-        )
-        story.append(SectorWarningBanner(sector_warning_text, USABLE_W, COLORS, sector_warning_style))
-        story.append(Spacer(1, 10))
-
-    story.append(
-        Paragraph(f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ &amp; ОЦЕНКА DCF: {ticker.upper()}", title_style)
-    )
-    story.append(
-        Paragraph(
-            f"Полный отчет по компании: <b>{name}</b> | Цена: <b>{price:.2f} {trading_ccy}</b> "
-            f"({price_kind}, Yahoo Finance, {quote_time_label})",
-            subtitle_style,
-        )
-    )
-    story.append(SectionDivider(USABLE_W, COLORS["accent"]))
-    story.append(Spacer(1, 10))
-
-    # ── SECTION 1: EXECUTIVE VERDICT ────────────────────────────────────
-    story.append(Paragraph("1. Экспресс-вердикт и оценка рисков", h1_style))
-    story.append(Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style))
-    story.append(Paragraph(verdict, verdict_text_style))
-    story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
-
-    if m.scoring.critical_sins:
-        crit_text = (
-            "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
-            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m.scoring.critical_sins)
-        )
-        story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
-        story.append(Spacer(1, 6))
-    if m.scoring.minor_sins:
-        minor_text = (
-            f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
-            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m.scoring.minor_sins)
-        )
-        story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-    if not sins:
-        story.append(
-            CalloutBox(
-                "<b>Финансовые риски:</b> Грехов не обнаружено. Финансовые показатели компании находятся в безупречной форме.",
-                USABLE_W, COLORS, callout_text_style, COLORS["success"],
-            )
-        )
-
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 2: FUNDAMENTAL TRENDS ───────────────────────────────────
-    story.append(Paragraph("2. Экспресс-анализ финансовых результатов и баланса", h1_style))
-    story.append(
-        Paragraph(
-            "Ниже представлена сводная таблица фундаментальных показателей компании за последние 4 отчетных года. "
-            f"Основной упор сделан на динамику изменения капитала, ликвидности и денежных потоков.{fx_note}",
-            body_style,
-        )
-    )
-
-    last4 = range(len(year_labels) - 4, len(year_labels))
-    fund_headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
-    fund_rows = [
-        ["Выручка (Revenue)"] + [f"{revenue.iloc[i] / 1e6:,.1f}" for i in last4],
-        ["Операционная прибыль (Operating Income)"] + [f"{operating_income.iloc[i] / 1e6:,.1f}" for i in last4],
-        ["Чистая прибыль (Net Income)"] + [f"{net_income.iloc[i] / 1e6:,.1f}" for i in last4],
-        ["Разводненная прибыль на акцию (EPS, USD)"] + [f"{eps.iloc[i]:.2f}" for i in last4],
-        ["Оборотные активы (Current Assets)"] + [f"{curr_assets.iloc[i] / 1e6:,.1f}" for i in last4],
-        ["Краткосрочные обязательства (Current Liab)"] + [f"{curr_liab.iloc[i] / 1e6:,.1f}" for i in last4],
-        ["Текущая ликвидность (Current Ratio)"] + [f"{curr_ratios.iloc[i]:.2f}" for i in last4],
-        ["Акционерный капитал (Shareholders Equity)"] + [f"{equity.iloc[i] / 1e6:,.1f}" for i in last4],
-        ["Чистый Свободный кэш (Free Cash Flow)"] + [f"{fcf.iloc[i] / 1e6:,.1f}" for i in last4],
-    ]
-
-    story.append(
-        create_reportlab_table(fund_headers, fund_rows, styles, COLORS, col_widths=[190, 70, 70, 70, 70])
-    )
-    story.append(Spacer(1, 10))
-
-    story.append(Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 3: FAIR VALUE (DCF, or DDM for Ordinary v3 - Step 4) ─────
-    # See build_markdown_report()'s twin branch and compute_metrics()'s
-    # "Ordinary v3" section for why/when DDM replaces DCF here -
-    # m.valuation.fair_value_share/val_status already reflect whichever model ran.
-    if m.valuation.valuation_model == "DDM":
-        story.append(Paragraph("3. Оценка справедливой стоимости (Модель DDM)", h1_style))
-        story.append(
-            Paragraph(
-                "⚠️ Применена модель дисконтирования дивидендов (DDM) вместо классического DCF - у компании "
-                "искажена структура капитала (отрицательный или «перегруженный» долгом акционерный капитал) на фоне "
-                "стабильной истории дивидендных выплат. Классический FCF-DCF в этом случае занижает стоимость "
-                "(лизинговые/долговые обязательства искажают WACC).",
-                body_style,
-            )
-        )
-        ke_disclosure = (
-            f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
-            if m.valuation.required_return_used
-            else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
-        )
-        ddm_info_text = (
-            f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
-            f"• <b>Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%):</b> {m.cagr_div * 100:.2f}%<br/>"
-            f"• <b>DPS последнего года (Dividends Paid / Diluted Shares):</b> {m.dps_last:.2f} {trading_ccy}<br/>"
-            f"• <b>Терминальный темп роста (Gordon Growth):</b> 2.5%<br/>"
-        )
-        story.append(CalloutBox(ddm_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
-        story.append(Spacer(1, 8))
-
-        val_banner_text = (
-            f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ ПО DDM: {fair_value_share:.2f} {trading_ccy}</b><br/>"
-            f"Текущая рыночная цена: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
-            f"| Статус: <font color='{val_color.hexval()}'><b>{val_status}</b></font>"
-        )
-        story.append(
-            CalloutBox(
-                val_banner_text, USABLE_W, COLORS,
-                ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
-                val_color,
-            )
-        )
-        story.append(Spacer(1, 12))
-    else:
-        story.append(Paragraph("3. Модель дисконтирования денежных потоков (DCF)", h1_style))
-        story.append(
-            Paragraph(
-                "Расчет справедливой стоимости на основе темпов роста FCF и средневзвешенной стоимости капитала (WACC):",
-                body_style,
-            )
-        )
-
-        debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in debt_lines)
-        ke_disclosure = (
-            f"Ke = задано инвестором (--required-return) = {cost_of_equity * 100:.2f}%"
-            if m.valuation.required_return_used
-            else f"Ke = Rf + β×ERP = 4% + {beta:.2f}×5% = {cost_of_equity * 100:.2f}%"
-        )
-        dcf_info_text = (
-            f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
-            f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {cost_of_debt_after_tax * 100:.2f}% "
-            f"(Kd=4.5%, T=21% — фиксированные допущения методики, не эффективная налоговая ставка компании)<br/>"
-            f"• <b>Веса структуры капитала:</b> E/(D+E) = {equity_weight * 100:.1f}%, D/(D+E) = {debt_weight * 100:.1f}% "
-            f"(по рыночной капитализации, не по балансовому капиталу — у компаний с отрицательным book equity вес по балансу был бы недействителен)<br/>"
-            f"• <b>Итоговый WACC:</b> {equity_weight * 100:.1f}%×{cost_of_equity * 100:.2f}% + {debt_weight * 100:.1f}%×{cost_of_debt_after_tax * 100:.2f}% = <b>{wacc * 100:.2f}%</b><br/>"
-            f"• <b>Расчетный CAGR роста потока:</b> {cagr * 100:.2f}% (среднеисторический темп роста, ограничен консервативной границей)<br/>"
-            f"• <b>Терминальный темп роста:</b> 2.5% (пожизненный темп роста компании в постпрогнозный период)<br/>"
-            f"{debt_html}<br/>"
-            f"• <b>Справедливая оценка акционерного капитала:</b> {equity_value / 1e9:,.2f} млрд. {trading_ccy} (Enterprise Value = {enterprise_value / 1e9:,.2f} млрд. {trading_ccy})<br/>"
-        )
-        story.append(CalloutBox(dcf_info_text, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
-        story.append(CalloutBox(LEASE_ASSUMPTION_NOTE, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
-        story.append(Spacer(1, 8))
-
-        val_banner_text = (
-            f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {fair_value_share:.2f} {trading_ccy}</b><br/>"
-            f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
-            f"| Статус: <font color='{val_color.hexval()}'><b>{val_status}</b></font>"
-        )
-        story.append(
-            CalloutBox(
-                val_banner_text, USABLE_W, COLORS,
-                ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
-                val_color,
-            )
-        )
-        story.append(Spacer(1, 10))
-
-        proj_headers = ["Прогнозный показатель", "Год 1", "Год 2", "Год 3", "Год 4", "Год 5"]
-        proj_rows = [
-            ["Прогнозный FCF (млн. USD)"] + [f"{v / 1e6:,.1f}" for v in projected_fcfs],
-            ["Дисконтированный FCF (PV, млн.)"] + [f"{v / 1e6:,.1f}" for v in pv_fcfs],
-        ]
-        story.append(
-            create_reportlab_table(proj_headers, proj_rows, styles, COLORS, col_widths=[170, 60, 60, 60, 60, 60])
-        )
-        story.append(Spacer(1, 12))
-
-        story.append(
-            Paragraph(
-                "<b>Матрица чувствительности цены акции (WACC vs Рост g):</b>",
-                ParagraphStyle("SensT", fontName=FONT_BOLD, fontSize=9.5, textColor=COLORS["heading"], spaceAfter=4),
-            )
-        )
-        story.append(
-            Paragraph(
-                "Таблица показывает, как меняется внутренняя стоимость одной акции при изменении ставки дисконтирования и темпов роста FCF. Позволяет оценить диапазон цен при различных сценариях развития рынка. "
-                "<b>Важно:</b> g в этой матрице — темп роста явного 5-летнего прогноза FCF, а не терминальный рост. "
-                "Терминальный рост зафиксирован отдельно на 2.5% и используется только в формуле Гордона для стоимости после 5-го года — "
-                "условие WACC &gt; g в этой матрице не требуется, оно требуется только для WACC &gt; терминальный рост (2.5%), что и проверяется отдельно.",
-                body_style,
-            )
-        )
-        story.append(create_reportlab_table(sensitivity_headers, sensitivity_rows, styles, COLORS))
-        story.append(Spacer(1, 12))
-
-    # ── SECTION 4: FORWARD OUTLOOK ──────────────────────────────────────
-    story.append(Paragraph("4. Форвардные мультипликаторы и консенсус-прогноз", h1_style))
-    story.append(
-        Paragraph(
-            "Раздел носит исключительно информационный характер и не влияет на балл экспресс-чеклиста "
-            "из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную "
-            "на экстраполяции исторических 4 лет.",
-            body_style,
-        )
-    )
-    peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
-    outlook_text = (
-        f"• <b>Forward P/E:</b> {_fmt_or_na(forward_outlook['forward_pe'])} "
-        f"[источник: {escape_xml(forward_outlook['forward_pe_source'] or 'N/A')}]<br/>"
-        f"• <b>Ожидаемый рост (консенсус):</b> {_fmt_or_na(forward_outlook['growth_pct'], '{:.1f}%')} "
-        f"[источник: {escape_xml(forward_outlook['growth_source'] or 'N/A')}]<br/>"
-        f"• <b>PEG Ratio:</b> {_fmt_or_na(forward_outlook['peg_ratio'])} — "
-        f"<font color='{COLORS[peg_color_key].hexval()}'><b>{escape_xml(peg_label)}</b></font> "
-        f"[источник: {escape_xml(forward_outlook['peg_source'] or 'N/A')}]<br/>"
-    )
-    story.append(CalloutBox(outlook_text, USABLE_W, COLORS, callout_text_style, COLORS[peg_color_key]))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 5: QUALITATIVE CATALYSTS ────────────────────────────────
-    story.append(Paragraph("5. Катализаторы и риски (качественная оценка)", h1_style))
-    catalysts_html = "<br/>".join(escape_xml(line) for line in catalysts_text.splitlines())
-    story.append(CalloutBox(catalysts_html, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
-    story.append(Spacer(1, 12))
-
-    warning_text = (
-        "<b>Важное правило методики экспресс-анализа:</b><br/>"
-        "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
-        "наилучшего момента и цены входа, фундаментальный анализ <b>обязательно должен использоваться в связке с "
-        "техническим анализом</b>. Не пытайтесь применять их отдельно! Справедливая стоимость по модели DCF часто "
-        "достигается только при возникновении катализаторов рыночного спроса или корпоративных скандалов, временно занижающих цену."
-    )
-    story.append(CalloutBox(warning_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-
-    doc.build(story)
-    print(f"Success! Comprehensive report saved to: {pdf_filename}")
 
     ordinary_sections = build_ordinary_sections(
-        m, forward_outlook, catalysts_text, trading_ccy, price_kind, quote_time_label,
+        m, forward_outlook, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker,
     )
+    pdf_filename = pdf_render(ticker, data, m, ordinary_sections, OUTPUT_DIR, excluded_sector, excluded_industry)
+    print(f"Success! Comprehensive report saved to: {pdf_filename}")
+
     md_content = md_render(ticker, data, m, ordinary_sections, excluded_sector, excluded_industry)
     md_filename = md_write(ticker, md_content, OUTPUT_DIR)
     print(f"Success! Markdown report saved to: {md_filename}")
@@ -1301,242 +868,19 @@ def build_pdf_report(
     return pdf_filename, md_filename
 
 
-# ── BANK REPORT RENDERERS (Step 2, spec Section 6) ──────────────────────
-# No WACC/Enterprise Value/Net Debt charts or tables here - the classical
-# DCF machinery above is simply not built for banks (spec Section 1).
-def _bank_valuation_disclosure(m):
-    """Plain (label, value) pairs for the DDM/ROE-P-B model disclosure -
-    shared between the PDF and Markdown bank renderers (spec Section 6.2)."""
-    ke_line = (
-        f"Ke = задано инвестором (--required-return) = {m.valuation.cost_of_equity * 100:.2f}%"
-        if m.valuation.required_return_used
-        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%"
-    )
-    if m.valuation.valuation_model == "DDM":
-        return "Модель дисконтирования дивидендов (DDM)", [
-            (ke_line, ""),
-            ("Темп роста дивидендов (CAGR_div, ограничен 1.0%-8.0%)", f"{m.cagr_div * 100:.2f}%"),
-            ("DPS последнего года (Common Dividends Paid / Diluted Shares)", f"{m.dps_last:.2f} USD"),
-            ("Терминальный темп роста (Gordon Growth)", "2.5%"),
-        ]
-    return "Модель рентабельности капитала (ROE / P/B)", [
-        (ke_line, ""),
-        ("Балансовая стоимость на акцию (BVPS)", f"{m.bvps:.2f} USD"),
-        ("Рентабельность капитала (ROE)", f"{m.roe * 100:.2f}%"),
-    ]
-
-
-def _bank_structural_rows(m, trading_ccy):
-    """Loan-portfolio / deposit-base YoY table (spec Section 6.3). 'N/A' for
-    any row yfinance doesn't expose for this bank - never a fabricated 0."""
-    def fmt(series):
-        return [
-            "N/A" if pd.isna(v) else f"{v / 1e6:,.1f}"
-            for v in series
-        ]
-
-    rows = [
-        ["Net Loans (млн.)"] + fmt(m.net_loans),
-        ["Allowance for Credit Losses (млн.)"] + fmt(m.loan_loss_allowance),
-        ["Total Deposits (млн.)"] + fmt(m.total_deposits),
-        ["LTD Ratio"] + [
-            "N/A" if pd.isna(l) or pd.isna(d) or d == 0 else f"{(l / d) * 100:.1f}%"
-            for l, d in zip(m.net_loans, m.total_deposits)
-        ],
-    ]
-    return rows
-
-
 def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
     m = compute_bank_metrics(data, required_return=required_return)
     catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
 
-    name = data["name"]
+    trading_ccy = data.get("trading_currency", "USD")
     price_kind = data["price_kind"]
     quote_time_label = data["quote_time_label"]
-    financial_ccy = data.get("financial_currency", "USD")
-    trading_ccy = data.get("trading_currency", "USD")
-    fx_note = (
-        f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
-        if financial_ccy != trading_ccy else ""
-    )
-    price = m.valuation.price
-    year_labels = m.year_labels
-    verdict = m.scoring.verdict
-    verdict_color = COLORS[m.scoring.verdict_color_key]
-    reasoning = m.scoring.reasoning
-    val_color = COLORS[m.valuation.val_color_key]
 
-    chart_img_path = generate_nii_chart(year_labels, m.net_interest_income.values, ticker)
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
-
-    doc = BaseDocTemplate(
-        pdf_filename, pagesize=PAGE_SIZE,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=MARGIN + 15, bottomMargin=MARGIN,
-    )
-    content_frame = Frame(
-        doc.leftMargin, doc.bottomMargin, USABLE_W,
-        PAGE_H - doc.topMargin - doc.bottomMargin, id="main",
-    )
-
-    def on_later_pages(canvas, doc):
-        canvas.saveState()
-        canvas.setStrokeColor(COLORS["accent"])
-        canvas.setLineWidth(1.2)
-        y_rule = PAGE_H - MARGIN + 4
-        canvas.line(MARGIN, y_rule, PAGE_W - MARGIN, y_rule)
-        canvas.setFont(FONT_BOLD, 8)
-        canvas.setFillColor(COLORS["muted"])
-        canvas.drawString(MARGIN, y_rule + 4, f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ БАНКА: {ticker.upper()}")
-        canvas.drawRightString(PAGE_W - MARGIN, y_rule + 4, f"{name.upper()}")
-        y_footer = MARGIN - 24
-        canvas.setStrokeColor(COLORS["bg_alt"])
-        canvas.setLineWidth(0.4)
-        canvas.line(MARGIN, y_footer + 12, PAGE_W - MARGIN, y_footer + 12)
-        canvas.setFont(FONT_NAME, 8)
-        canvas.setFillColor(COLORS["muted"])
-        canvas.drawString(MARGIN, y_footer, "Подготовлено ИИ-помощником фундаментального анализа")
-        canvas.drawRightString(PAGE_W - MARGIN, y_footer, f"Страница {doc.page}")
-        canvas.restoreState()
-
-    doc.addPageTemplates([PageTemplate(id="content", frames=content_frame, onPage=on_later_pages)])
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("DocTitle", fontName=FONT_BOLD, fontSize=20, textColor=COLORS["heading"], leading=24, spaceAfter=8)
-    subtitle_style = ParagraphStyle("DocSub", fontName=FONT_NAME, fontSize=11, textColor=COLORS["muted"], leading=14, spaceAfter=15)
-    h1_style = ParagraphStyle("H1", fontName=FONT_BOLD, fontSize=12, textColor=COLORS["heading"], leading=15, spaceBefore=12, spaceAfter=6, keepWithNext=True)
-    body_style = ParagraphStyle("Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6, alignment=TA_JUSTIFY)
-    verdict_text_style = ParagraphStyle("VerdictText", fontName=FONT_BOLD, fontSize=12, textColor=verdict_color, leading=15, spaceAfter=6)
-    callout_text_style = ParagraphStyle("CalloutText", fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13)
-
-    story = [
-        Paragraph(f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ БАНКА: {ticker.upper()}", title_style),
-        Paragraph(
-            f"Полный отчет по банку: <b>{name}</b> | Цена: <b>{price:.2f} {trading_ccy}</b> "
-            f"({price_kind}, Yahoo Finance, {quote_time_label})",
-            subtitle_style,
-        ),
-        SectionDivider(USABLE_W, COLORS["accent"]),
-        Spacer(1, 10),
-    ]
-
-    # ── SECTION 1: EXECUTIVE VERDICT ────────────────────────────────────
-    story.append(Paragraph("1. Экспресс-вердикт и оценка рисков (банковский чеклист)", h1_style))
-    story.append(Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style))
-    story.append(Paragraph(verdict, verdict_text_style))
-    story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
-
-    if m.scoring.critical_sins:
-        crit_text = (
-            "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
-            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m.scoring.critical_sins)
-        )
-        story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
-        story.append(Spacer(1, 6))
-    if m.scoring.minor_sins:
-        minor_text = (
-            f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
-            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m.scoring.minor_sins)
-        )
-        story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-    if not m.scoring.sins:
-        story.append(CalloutBox(
-            "<b>Финансовые риски:</b> Грехов не обнаружено. Показатели банка в безупречной форме.",
-            USABLE_W, COLORS, callout_text_style, COLORS["success"],
-        ))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 2: NII / BALANCE TRENDS ─────────────────────────────────
-    story.append(Paragraph("2. Экспресс-анализ процентного дохода и баланса", h1_style))
-    story.append(Paragraph(
-        "Вместо Revenue/Current Ratio (неприменимых к банкам) используются Net Interest Income (NII) и "
-        f"Loan-to-Deposit Ratio (LTD).{fx_note}",
-        body_style,
-    ))
-
-    last4 = range(len(year_labels) - 4, len(year_labels))
-    fund_headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
-
-    def _fmt_last4(series):
-        return [
-            "N/A" if pd.isna(series.iloc[i]) else f"{series.iloc[i] / 1e6:,.1f}"
-            for i in last4
-        ]
-
-    fund_rows = [
-        ["Net Interest Income (NII)"] + _fmt_last4(m.net_interest_income),
-        ["Комиссионный доход"] + _fmt_last4(m.commissions_income),
-        ["Резервы под потери по кредитам"] + _fmt_last4(m.credit_loss_provision),
-        ["Чистая прибыль (Net Income)"] + _fmt_last4(m.net_income),
-        ["Акционерный капитал (Shareholders Equity)"] + _fmt_last4(m.shareholders_equity),
-    ]
-    story.append(create_reportlab_table(fund_headers, fund_rows, styles, COLORS, col_widths=[190, 70, 70, 70, 70]))
-    story.append(Spacer(1, 8))
-
-    ltd_txt = "N/A" if m.ltd_ratio is None else f"{m.ltd_ratio * 100:.1f}%"
-    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
-    story.append(Paragraph(
-        f"<b>Loan-to-Deposit Ratio (LTD, последний год):</b> {ltd_txt} &nbsp;&nbsp; "
-        f"<b>Total Debt / Shareholders Equity:</b> {de_txt} "
-        "(у банков нет Enterprise Value/Net Debt в классическом смысле).",
-        body_style,
-    ))
-    story.append(Spacer(1, 8))
-    story.append(Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4))
-    story.append(Spacer(1, 10))
-
-    struct_headers = ["Показатель"] + list(year_labels)
-    struct_rows = _bank_structural_rows(m, trading_ccy)
-    story.append(Paragraph("<b>Структура кредитного портфеля и депозитной базы (YoY):</b>", body_style))
-    story.append(create_reportlab_table(struct_headers, struct_rows, styles, COLORS))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 3: FAIR VALUE (DDM / ROE-P-B) ───────────────────────────
-    model_name, model_lines = _bank_valuation_disclosure(m)
-    story.append(Paragraph(f"3. Оценка справедливой стоимости: {model_name}", h1_style))
-    model_html = "<br/>".join(
-        f"• <b>{escape_xml(label)}</b>{': ' + escape_xml(value) if value else ''}"
-        for label, value in model_lines
-    )
-    story.append(CalloutBox(model_html, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
-    story.append(Spacer(1, 8))
-
-    val_banner_text = (
-        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m.valuation.fair_value_share:.2f} {trading_ccy}</b><br/>"
-        f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
-        f"| Статус: <font color='{val_color.hexval()}'><b>{m.valuation.val_status}</b></font>"
-    )
-    story.append(CalloutBox(
-        val_banner_text, USABLE_W, COLORS,
-        ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
-        val_color,
-    ))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 4: QUALITATIVE CATALYSTS ────────────────────────────────
-    story.append(Paragraph("4. Катализаторы и риски (качественная оценка)", h1_style))
-    catalysts_html = "<br/>".join(escape_xml(line) for line in catalysts_text.splitlines())
-    story.append(CalloutBox(catalysts_html, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
-    story.append(Spacer(1, 12))
-
-    warning_text = (
-        "<b>Важное правило методики экспресс-анализа:</b><br/>"
-        "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
-        "наилучшего момента и цены входа, фундаментальный анализ <b>обязательно должен использоваться в связке с "
-        "техническим анализом</b>. Не пытайтесь применять их отдельно!<br/>"
-        "У банков отсутствуют Enterprise Value и Net Debt в классическом виде - долговая нагрузка оценивается "
-        "через Total Debt / Shareholders Equity, а не через WACC-дисконтирование FCF."
-    )
-    story.append(CalloutBox(warning_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-
-    doc.build(story)
+    bank_sections = build_bank_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker)
+    pdf_filename = pdf_render(ticker, data, m, bank_sections, OUTPUT_DIR)
     print(f"Success! Comprehensive bank report saved to: {pdf_filename}")
 
-    bank_sections = build_bank_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label)
     md_content = md_render(ticker, data, m, bank_sections)
     md_filename = md_write(ticker, md_content, OUTPUT_DIR)
     print(f"Success! Markdown bank report saved to: {md_filename}")
@@ -1544,218 +888,19 @@ def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, 
     return pdf_filename, md_filename
 
 
-# ── REIT REPORT RENDERERS (Step 3, spec Section 6.1) ────────────────────
-# No "Operating Cash Flow"/DCF sections here - FFO/AFFO/NOI and the NAV
-# bridge replace them entirely (spec Section 0: classical DCF is
-# meaningless for REITs).
-def _reit_nav_bridge_rows(m, trading_ccy):
-    """Plain (label, value) pairs for the NAV bridge - shared between the
-    PDF and Markdown REIT renderers (spec Section 6.1)."""
-    return [
-        (f"NOI (последний год)", f"{m.noi.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Применённый Cap Rate", f"{m.cap_rate * 100:.2f}% ({m.cap_rate_label})"),
-        ("Property Value = NOI / Cap Rate", f"{m.property_value / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Плюс: Cash", f"{m.cash.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Плюс: Receivables", f"{m.receivables.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Плюс: Construction in Progress", f"{m.construction_in_progress.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
-        ("Минус: Total Liabilities", f"{m.total_liab.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}" if not pd.isna(m.total_liab.iloc[-1]) else "N/A"),
-        ("= Net Asset Value (NAV)", f"{m.nav / 1e6:,.1f} млн. {trading_ccy}"),
-    ]
-
-
-def _reit_operating_rows(m):
-    def fmt(series):
-        return ["N/A" if pd.isna(v) else f"{v / 1e6:,.1f}" for v in series]
-
-    return [
-        ["FFO (млн.)"] + fmt(m.ffo),
-        ["AFFO (млн.)"] + fmt(m.affo),
-        ["NOI (млн.)"] + fmt(m.noi),
-        ["CapEx (млн.)"] + fmt(m.capex.abs()),
-        ["Dividends Paid (млн.)"] + fmt(m.dividends_paid),
-    ]
-
-
 def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
     data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
     m = compute_reit_metrics(data, required_return=required_return)
     catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
 
-    name = data["name"]
+    trading_ccy = data.get("trading_currency", "USD")
     price_kind = data["price_kind"]
     quote_time_label = data["quote_time_label"]
-    financial_ccy = data.get("financial_currency", "USD")
-    trading_ccy = data.get("trading_currency", "USD")
-    fx_note = (
-        f" (отчётность в {financial_ccy}, конвертирована в {trading_ccy} по курсу {data.get('fx_rate', 1.0):.4f})"
-        if financial_ccy != trading_ccy else ""
-    )
-    price = m.valuation.price
-    year_labels = m.year_labels
-    verdict = m.scoring.verdict
-    verdict_color = COLORS[m.scoring.verdict_color_key]
-    reasoning = m.scoring.reasoning
-    val_color = COLORS[m.valuation.val_color_key]
 
-    chart_img_path = generate_ffo_chart(year_labels, m.ffo.values, m.affo.values, ticker)
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    pdf_filename = os.path.join(OUTPUT_DIR, f"{ticker}_fundamental_report_{date_str}.pdf")
-
-    doc = BaseDocTemplate(
-        pdf_filename, pagesize=PAGE_SIZE,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=MARGIN + 15, bottomMargin=MARGIN,
-    )
-    content_frame = Frame(
-        doc.leftMargin, doc.bottomMargin, USABLE_W,
-        PAGE_H - doc.topMargin - doc.bottomMargin, id="main",
-    )
-
-    def on_later_pages(canvas, doc):
-        canvas.saveState()
-        canvas.setStrokeColor(COLORS["accent"])
-        canvas.setLineWidth(1.2)
-        y_rule = PAGE_H - MARGIN + 4
-        canvas.line(MARGIN, y_rule, PAGE_W - MARGIN, y_rule)
-        canvas.setFont(FONT_BOLD, 8)
-        canvas.setFillColor(COLORS["muted"])
-        canvas.drawString(MARGIN, y_rule + 4, f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ REIT: {ticker.upper()}")
-        canvas.drawRightString(PAGE_W - MARGIN, y_rule + 4, f"{name.upper()}")
-        y_footer = MARGIN - 24
-        canvas.setStrokeColor(COLORS["bg_alt"])
-        canvas.setLineWidth(0.4)
-        canvas.line(MARGIN, y_footer + 12, PAGE_W - MARGIN, y_footer + 12)
-        canvas.setFont(FONT_NAME, 8)
-        canvas.setFillColor(COLORS["muted"])
-        canvas.drawString(MARGIN, y_footer, "Подготовлено ИИ-помощником фундаментального анализа")
-        canvas.drawRightString(PAGE_W - MARGIN, y_footer, f"Страница {doc.page}")
-        canvas.restoreState()
-
-    doc.addPageTemplates([PageTemplate(id="content", frames=content_frame, onPage=on_later_pages)])
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("DocTitle", fontName=FONT_BOLD, fontSize=20, textColor=COLORS["heading"], leading=24, spaceAfter=8)
-    subtitle_style = ParagraphStyle("DocSub", fontName=FONT_NAME, fontSize=11, textColor=COLORS["muted"], leading=14, spaceAfter=15)
-    h1_style = ParagraphStyle("H1", fontName=FONT_BOLD, fontSize=12, textColor=COLORS["heading"], leading=15, spaceBefore=12, spaceAfter=6, keepWithNext=True)
-    body_style = ParagraphStyle("Body", fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6, alignment=TA_JUSTIFY)
-    verdict_text_style = ParagraphStyle("VerdictText", fontName=FONT_BOLD, fontSize=12, textColor=verdict_color, leading=15, spaceAfter=6)
-    callout_text_style = ParagraphStyle("CalloutText", fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13)
-
-    story = [
-        Paragraph(f"ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ REIT: {ticker.upper()}", title_style),
-        Paragraph(
-            f"Полный отчет по REIT: <b>{name}</b> | Цена: <b>{price:.2f} {trading_ccy}</b> "
-            f"({price_kind}, Yahoo Finance, {quote_time_label})",
-            subtitle_style,
-        ),
-        SectionDivider(USABLE_W, COLORS["accent"]),
-        Spacer(1, 10),
-    ]
-
-    # ── SECTION 1: EXECUTIVE VERDICT ────────────────────────────────────
-    story.append(Paragraph("1. Экспресс-вердикт и оценка рисков (чеклист REIT)", h1_style))
-    story.append(Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style))
-    story.append(Paragraph(verdict, verdict_text_style))
-    story.append(Paragraph(f"<b>Резюме и обоснование:</b> {reasoning}", body_style))
-
-    if m.scoring.critical_sins:
-        crit_text = (
-            "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
-            + "<br/>".join(f"• {escape_xml(s.message)}" for s in m.scoring.critical_sins)
-        )
-        story.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_text_style, COLORS["danger"]))
-        story.append(Spacer(1, 6))
-    if m.scoring.minor_sins:
-        minor_text = (
-            f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
-            + "<br/>".join(f"• [{s.weight:.1f}] {escape_xml(s.message)}" for s in m.scoring.minor_sins)
-        )
-        story.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-    if not m.scoring.sins:
-        story.append(CalloutBox(
-            "<b>Финансовые риски:</b> Грехов не обнаружено. Показатели REIT в безупречной форме.",
-            USABLE_W, COLORS, callout_text_style, COLORS["success"],
-        ))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 2: FFO/AFFO/NOI TRENDS ──────────────────────────────────
-    story.append(Paragraph("2. REIT Operating Performance (FFO / AFFO / NOI)", h1_style))
-    story.append(Paragraph(
-        "Net Income искажён бумажной амортизацией недвижимости - вместо него используются FFO, AFFO и NOI."
-        f"{fx_note}",
-        body_style,
-    ))
-
-    last4 = range(len(year_labels) - 4, len(year_labels))
-    fund_headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
-
-    def _fmt_last4(series):
-        return ["N/A" if pd.isna(series.iloc[i]) else f"{series.iloc[i] / 1e6:,.1f}" for i in last4]
-
-    fund_rows = [
-        ["FFO"] + _fmt_last4(m.ffo),
-        ["AFFO"] + _fmt_last4(m.affo),
-        ["NOI"] + _fmt_last4(m.noi),
-        ["CapEx"] + _fmt_last4(m.capex.abs()),
-        ["Dividends Paid"] + _fmt_last4(m.dividends_paid),
-    ]
-    story.append(create_reportlab_table(fund_headers, fund_rows, styles, COLORS, col_widths=[190, 70, 70, 70, 70]))
-    story.append(Spacer(1, 8))
-
-    payout_txt = "N/A (дивиденды не выплачиваются)" if m.affo_payout_ratio is None else (
-        "∞ (AFFO ≤ 0)" if m.affo_payout_ratio == float("inf") else f"{m.affo_payout_ratio * 100:.1f}%"
-    )
-    de_txt = "N/A" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
-    story.append(Paragraph(
-        f"<b>Occupancy Rate:</b> {m.occupancy_rate * 100:.1f}% &nbsp;&nbsp; "
-        f"<b>AFFO Payout Ratio:</b> {payout_txt} &nbsp;&nbsp; "
-        f"<b>Total Debt / Shareholders Equity:</b> {de_txt}",
-        body_style,
-    ))
-    story.append(Spacer(1, 8))
-    story.append(Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 3: NAV VALUATION BRIDGE ─────────────────────────────────
-    story.append(Paragraph("3. NAV Valuation Bridge", h1_style))
-    nav_rows = _reit_nav_bridge_rows(m, trading_ccy)
-    nav_html = "<br/>".join(f"• <b>{escape_xml(label)}:</b> {escape_xml(value)}" for label, value in nav_rows)
-    story.append(CalloutBox(nav_html, USABLE_W, COLORS, callout_text_style, COLORS["accent"]))
-    story.append(Spacer(1, 8))
-
-    val_banner_text = (
-        f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m.valuation.fair_value_share:.2f} {trading_ccy}</b><br/>"
-        f"Последняя доступная рыночная котировка: {price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
-        f"| Статус: <font color='{val_color.hexval()}'><b>{m.valuation.val_status}</b></font>"
-    )
-    story.append(CalloutBox(
-        val_banner_text, USABLE_W, COLORS,
-        ParagraphStyle("ValB", parent=callout_text_style, fontSize=10, leading=14),
-        val_color,
-    ))
-    story.append(Spacer(1, 12))
-
-    # ── SECTION 4: QUALITATIVE CATALYSTS ────────────────────────────────
-    story.append(Paragraph("4. Катализаторы и риски (качественная оценка)", h1_style))
-    catalysts_html = "<br/>".join(escape_xml(line) for line in catalysts_text.splitlines())
-    story.append(CalloutBox(catalysts_html, USABLE_W, COLORS, callout_text_style, COLORS["muted"]))
-    story.append(Spacer(1, 12))
-
-    warning_text = (
-        "<b>Важное правило методики экспресс-анализа:</b><br/>"
-        "Фундаментальный анализ дает нам ответ на вопрос <b>что именно</b> покупать. Однако для определения "
-        "наилучшего момента и цены входа, фундаментальный анализ <b>обязательно должен использоваться в связке с "
-        "техническим анализом</b>. Не пытайтесь применять их отдельно!<br/>"
-        "Классический DCF неприменим к REIT - справедливая стоимость оценивается по методу NAV на базе NOI и "
-        "отраслевой ставки капитализации (Cap Rate), а не через WACC-дисконтирование FCF."
-    )
-    story.append(CalloutBox(warning_text, USABLE_W, COLORS, callout_text_style, COLORS["warning"]))
-
-    doc.build(story)
+    reit_sections = build_reit_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker)
+    pdf_filename = pdf_render(ticker, data, m, reit_sections, OUTPUT_DIR)
     print(f"Success! Comprehensive REIT report saved to: {pdf_filename}")
 
-    reit_sections = build_reit_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label)
     md_content = md_render(ticker, data, m, reit_sections)
     md_filename = md_write(ticker, md_content, OUTPUT_DIR)
     print(f"Success! Markdown REIT report saved to: {md_filename}")
