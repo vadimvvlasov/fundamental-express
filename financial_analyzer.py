@@ -468,18 +468,72 @@ def compute_metrics(data, required_return=None):
 # parallel engine, not a variant of compute_metrics(): different checklist
 # weights, different valuation models (DDM or ROE/P-B), never called from the
 # Ordinary path.
-BANK_MINOR_SIN_WEIGHTS = {
-    "nii_declining": 1.0,
-    "provision_spike": 1.0,
-    "dilution": 1.0,
-    "ltd_imbalance": 0.5,
-    "dead_cash": 0.5,
-    "negative_jaws": 0.5,
-    "commissions_declining": 0.3,
-    "net_income_declining": 0.3,
-}
-BANK_BUYBACK_BONUS_WEIGHT = -0.5
-BANK_MAX_MINOR_SCORE = sum(BANK_MINOR_SIN_WEIGHTS.values())
+# Bank sin weight table (BANK_MINOR_SIN_WEIGHTS, BANK_BUYBACK_BONUS_WEIGHT)
+# moved into the declarative registry in
+# src/fundamental_express/domain/sins.py (docs/spec/refactor-tasks.md T11,
+# wired in by T14). BANK_MAX_MINOR_SCORE is re-exported under its original
+# name since tests/test_bank_analyzer.py imports it directly.
+from fundamental_express.domain.sins import (  # noqa: E402
+    BANK_MAX_MINOR_SCORE,
+    BANK_SIN_REGISTRY,
+    BANK_REASONING,
+    score,
+)
+from fundamental_express.domain.bank import check_bank_sins  # noqa: E402
+from fundamental_express.domain.metrics import BankMetrics  # noqa: E402
+
+
+def _bank_metrics_to_dict(m):
+    """Dict-shape adapter, kept only until T16 rewires every caller onto
+    attribute access (docs/spec/refactor-tasks.md T14/T16) - reconstructs
+    compute_bank_metrics()'s original dict from a BankMetrics."""
+    return {
+        "kind": "bank",
+        "year_labels": m.year_labels,
+        "interest_income": m.interest_income,
+        "interest_expense": m.interest_expense,
+        "net_interest_income": m.net_interest_income,
+        "commissions_income": m.commissions_income,
+        "trading_income": m.trading_income,
+        "credit_loss_provision": m.credit_loss_provision,
+        "non_interest_expense": m.non_interest_expense,
+        "net_income": m.net_income,
+        "preferred_dividends": m.preferred_dividends,
+        "cash_and_equiv": m.cash_and_equiv,
+        "trading_assets": m.trading_assets,
+        "htm_securities": m.htm_securities,
+        "net_loans": m.net_loans,
+        "loan_loss_allowance": m.loan_loss_allowance,
+        "total_deposits": m.total_deposits,
+        "total_borrowings": m.total_borrowings,
+        "shareholders_equity": m.shareholders_equity,
+        "diluted_shares": m.diluted_shares,
+        "ltd_ratio": m.ltd_ratio,
+        "debt_to_equity": m.debt_to_equity,
+        "sins": m.scoring.sins,
+        "critical_sins": m.scoring.critical_sins,
+        "minor_sins": m.scoring.minor_sins,
+        "minor_score": m.scoring.minor_score,
+        "max_minor_score": m.scoring.max_minor_score,
+        "verdict": m.scoring.verdict,
+        "verdict_color_key": m.scoring.verdict_color_key,
+        "reasoning": m.scoring.reasoning,
+        "beta": m.valuation.beta,
+        "cost_of_equity": m.valuation.cost_of_equity,
+        "required_return_used": m.valuation.required_return_used,
+        "valuation_model": m.valuation.valuation_model,
+        "cagr_div": m.cagr_div,
+        "dps_last": m.dps_last,
+        "bvps": m.bvps,
+        "roe": m.roe,
+        "price": m.valuation.price,
+        "fair_value_share": m.valuation.fair_value_share,
+        "over_under_pct": m.valuation.over_under_pct,
+        "val_status": m.valuation.val_status,
+        "val_color_key": m.valuation.val_color_key,
+        "current_ratio": m.current_ratio,
+        "net_margin_pct": m.net_margin_pct,
+    }
 
 
 def compute_bank_metrics(data, required_return=None):
@@ -591,141 +645,21 @@ def compute_bank_metrics(data, required_return=None):
         shareholders_equity = shareholders_equity * fx_rate
         common_dividends_paid = common_dividends_paid * fx_rate
 
-    latest_nii = net_interest_income.iloc[-1]
-    latest_equity = shareholders_equity.iloc[-1]
-
-    # ── Section 4.1: Critical sins (any one -> immediate SKIP) ──────────
-    sins = []
-    if not pd.isna(latest_nii) and latest_nii <= 0:
-        sins.append(Sin(
-            "nii_non_positive", "critical", 0.0,
-            f"Чистый процентный убыток: NII последнего года ({latest_nii / 1e6:,.0f} млн) ≤ 0 - "
-            "банк привлекает депозиты дороже, чем размещает кредиты.",
-        ))
-    if not pd.isna(latest_equity) and latest_equity <= 0:
-        sins.append(Sin(
-            "equity_negative", "critical", 0.0,
-            f"Отрицательный регуляторный капитал: Shareholders Equity ({latest_equity / 1e6:,.0f} млн) ≤ 0 - "
-            "угроза немедленного отзыва лицензии регулятором.",
-        ))
-    critical_sins = [s for s in sins if s.tier == "critical"]
-
-    # ── Section 4.2: Minor sins ──────────────────────────────────────────
-    # Per spec: any critical hit interrupts the detailed minor scoring, so
-    # minor sins are only evaluated when no critical sin fired.
-    ltd_ratio = None
-    debt_to_equity = None
-    if not critical_sins:
-        if len(net_interest_income) >= 2 and net_interest_income.iloc[-1] < net_interest_income.iloc[-2]:
-            sins.append(Sin(
-                "nii_declining", "minor", BANK_MINOR_SIN_WEIGHTS["nii_declining"],
-                f"Падение процентного дохода: NII с {net_interest_income.iloc[-2] / 1e6:,.0f} до "
-                f"{net_interest_income.iloc[-1] / 1e6:,.0f} млн.",
-            ))
-        if (
-            len(credit_loss_provision) >= 2
-            and credit_loss_provision.iloc[-1] > 1.15 * credit_loss_provision.iloc[-2]
-        ):
-            sins.append(Sin(
-                "provision_spike", "minor", BANK_MINOR_SIN_WEIGHTS["provision_spike"],
-                f"Опасный рост резервов: Provision for Credit Losses вырос с "
-                f"{credit_loss_provision.iloc[-2] / 1e6:,.0f} до {credit_loss_provision.iloc[-1] / 1e6:,.0f} млн "
-                "(YoY > 15%).",
-            ))
-        if (
-            not diluted_shares.isna().any()
-            and len(diluted_shares) >= 2
-            and diluted_shares.iloc[-2] != 0
-        ):
-            shares_ratio = diluted_shares.iloc[-1] / diluted_shares.iloc[-2]
-            if shares_ratio > 1.015:
-                sins.append(Sin(
-                    "dilution", "minor", BANK_MINOR_SIN_WEIGHTS["dilution"],
-                    f"Размытие долей акционеров: среднее число акций выросло с {diluted_shares.iloc[-2]:,.0f} "
-                    f"до {diluted_shares.iloc[-1]:,.0f} ({(shares_ratio - 1) * 100:.1f}%).",
-                ))
-            elif shares_ratio < (1 / 1.015):
-                sins.append(Sin(
-                    "buyback_bonus", "minor", BANK_BUYBACK_BONUS_WEIGHT,
-                    f"Бонус за байбэк: число акций сократилось с {diluted_shares.iloc[-2]:,.0f} "
-                    f"до {diluted_shares.iloc[-1]:,.0f} ({(1 - shares_ratio) * 100:.1f}%).",
-                ))
-        latest_loans = net_loans.iloc[-1] if len(net_loans) else float("nan")
-        latest_deposits = total_deposits.iloc[-1] if len(total_deposits) else float("nan")
-        if not pd.isna(latest_loans) and not pd.isna(latest_deposits) and latest_deposits != 0:
-            ltd_ratio = latest_loans / latest_deposits
-            if ltd_ratio > 1.0 or ltd_ratio < 0.6:
-                sins.append(Sin(
-                    "ltd_imbalance", "minor", BANK_MINOR_SIN_WEIGHTS["ltd_imbalance"],
-                    f"Дисбаланс Loan-to-Deposit: LTD = {ltd_ratio * 100:.1f}% "
-                    f"({'выше 100%, риск дефицита ликвидности' if ltd_ratio > 1.0 else 'ниже 60%, пассивная работа с депозитами'}).",
-                ))
-        if (
-            len(cash_and_equiv) >= 2 and len(net_loans) >= 2
-            and not pd.isna(cash_and_equiv.iloc[-1]) and not pd.isna(cash_and_equiv.iloc[-2])
-            and not pd.isna(net_loans.iloc[-1]) and not pd.isna(net_loans.iloc[-2])
-            and cash_and_equiv.iloc[-1] > 1.30 * cash_and_equiv.iloc[-2]
-            and net_loans.iloc[-1] < net_loans.iloc[-2]
-        ):
-            sins.append(Sin(
-                "dead_cash", "minor", BANK_MINOR_SIN_WEIGHTS["dead_cash"],
-                f"Накопление мёртвого кэша: денежные средства выросли с {cash_and_equiv.iloc[-2] / 1e6:,.0f} "
-                f"до {cash_and_equiv.iloc[-1] / 1e6:,.0f} млн (>+30%), при этом кредитный портфель сократился.",
-            ))
-        net_op_income = net_interest_income + commissions_income
-        if (
-            len(non_interest_expense) >= 2 and len(net_op_income) >= 2
-            and non_interest_expense.iloc[-2] != 0 and net_op_income.iloc[-2] != 0
-        ):
-            opex_growth = non_interest_expense.iloc[-1] / non_interest_expense.iloc[-2] - 1
-            net_op_income_growth = net_op_income.iloc[-1] / net_op_income.iloc[-2] - 1
-            if opex_growth > net_op_income_growth:
-                sins.append(Sin(
-                    "negative_jaws", "minor", BANK_MINOR_SIN_WEIGHTS["negative_jaws"],
-                    f"Отрицательный JAWS: операционные расходы выросли на {opex_growth * 100:.1f}%, "
-                    f"опережая рост NII+комиссий ({net_op_income_growth * 100:.1f}%).",
-                ))
-        if len(commissions_income) >= 2 and commissions_income.iloc[-1] < commissions_income.iloc[-2]:
-            sins.append(Sin(
-                "commissions_declining", "minor", BANK_MINOR_SIN_WEIGHTS["commissions_declining"],
-                f"Падение комиссионных доходов: с {commissions_income.iloc[-2] / 1e6:,.0f} до "
-                f"{commissions_income.iloc[-1] / 1e6:,.0f} млн.",
-            ))
-        if len(net_income) >= 2 and net_income.iloc[-1] < net_income.iloc[-2]:
-            sins.append(Sin(
-                "net_income_declining", "minor", BANK_MINOR_SIN_WEIGHTS["net_income_declining"],
-                f"Падение чистой прибыли: с {net_income.iloc[-2] / 1e6:,.0f} до "
-                f"{net_income.iloc[-1] / 1e6:,.0f} млн.",
-            ))
-        if not pd.isna(latest_equity) and latest_equity > 0 and not pd.isna(total_borrowings.iloc[-1]):
-            debt_to_equity = total_borrowings.iloc[-1] / latest_equity
-
-    minor_sins = [s for s in sins if s.tier == "minor"]
-    minor_score = max(0.0, sum(s.weight for s in minor_sins))
-
-    if critical_sins:
-        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
-        verdict_color_key = "danger"
-        crit_labels = ", ".join(s.id for s in critical_sins)
-        reasoning = (
-            f"Обнаружен(ы) критический(е) банковский(е) фактор(ы) риска ({crit_labels}). "
-            "Любой из них по отдельности делает инвестицию рискованной вне зависимости от прочих показателей."
-        )
-    elif minor_score <= 1.0:
-        verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
-        verdict_color_key = "success"
-        reasoning = "Банк демонстрирует устойчивую динамику процентного дохода, качества кредитного портфеля и структуры фондирования. Риски минимальны."
-    elif minor_score <= 2.5:
-        verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
-        verdict_color_key = "warning"
-        reasoning = "Банк сохраняет жизнеспособную бизнес-модель, однако в динамике процентной маржи, резервов или структуры баланса присутствуют умеренные погрешности."
-    else:
-        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
-        verdict_color_key = "danger"
-        reasoning = (
-            f"Взвешенный балл второстепенных банковских нарушений составил {minor_score:.1f} из "
-            f"{BANK_MAX_MINOR_SCORE:.1f}. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
-        )
+    # ── Bank sins checklist (condition checks + registry-driven scoring) ──
+    # Moved to src/fundamental_express/domain/bank.py (condition checks) and
+    # domain/sins.py (scoring) - docs/spec/refactor-tasks.md T14.
+    sins, latest_equity, ltd_ratio, debt_to_equity = check_bank_sins(
+        net_interest_income, shareholders_equity, credit_loss_provision,
+        diluted_shares, net_loans, total_deposits, cash_and_equiv,
+        non_interest_expense, commissions_income, net_income, total_borrowings,
+    )
+    scoring = score(sins, BANK_SIN_REGISTRY, BANK_REASONING)
+    critical_sins = scoring.critical_sins
+    minor_sins = scoring.minor_sins
+    minor_score = scoring.minor_score
+    verdict = scoring.verdict
+    verdict_color_key = scoring.verdict_color_key
+    reasoning = scoring.reasoning
 
     # ── Section 5: Fair value (DDM or ROE/P-B) ──────────────────────────
     # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12d).
@@ -744,53 +678,38 @@ def compute_bank_metrics(data, required_return=None):
     bvps = val_extras["bvps"]
     roe = val_extras["roe"]
 
-    return {
-        "kind": "bank",
-        "year_labels": year_labels,
-        "interest_income": interest_income,
-        "interest_expense": interest_expense,
-        "net_interest_income": net_interest_income,
-        "commissions_income": commissions_income,
-        "trading_income": trading_income,
-        "credit_loss_provision": credit_loss_provision,
-        "non_interest_expense": non_interest_expense,
-        "net_income": net_income,
-        "preferred_dividends": preferred_dividends,
-        "cash_and_equiv": cash_and_equiv,
-        "trading_assets": trading_assets,
-        "htm_securities": htm_securities,
-        "net_loans": net_loans,
-        "loan_loss_allowance": loan_loss_allowance,
-        "total_deposits": total_deposits,
-        "total_borrowings": total_borrowings,
-        "shareholders_equity": shareholders_equity,
-        "diluted_shares": diluted_shares,
-        "ltd_ratio": ltd_ratio,
-        "debt_to_equity": debt_to_equity,
-        "sins": sins,
-        "critical_sins": critical_sins,
-        "minor_sins": minor_sins,
-        "minor_score": minor_score,
-        "max_minor_score": BANK_MAX_MINOR_SCORE,
-        "verdict": verdict,
-        "verdict_color_key": verdict_color_key,
-        "reasoning": reasoning,
-        "beta": beta,
-        "cost_of_equity": cost_of_equity,
-        "required_return_used": required_return is not None,
-        "valuation_model": valuation_model,
-        "cagr_div": cagr_div,
-        "dps_last": dps_last,
-        "bvps": bvps,
-        "roe": roe,
-        "price": price,
-        "fair_value_share": fair_value_share,
-        "over_under_pct": over_under,
-        "val_status": val_status,
-        "val_color_key": val_color_key,
-        "current_ratio": None,
-        "net_margin_pct": None,
-    }
+    metrics = BankMetrics(
+        scoring=scoring,
+        valuation=valuation,
+        year_labels=year_labels,
+        interest_income=interest_income,
+        interest_expense=interest_expense,
+        net_interest_income=net_interest_income,
+        commissions_income=commissions_income,
+        trading_income=trading_income,
+        credit_loss_provision=credit_loss_provision,
+        non_interest_expense=non_interest_expense,
+        net_income=net_income,
+        preferred_dividends=preferred_dividends,
+        cash_and_equiv=cash_and_equiv,
+        trading_assets=trading_assets,
+        htm_securities=htm_securities,
+        net_loans=net_loans,
+        loan_loss_allowance=loan_loss_allowance,
+        total_deposits=total_deposits,
+        total_borrowings=total_borrowings,
+        shareholders_equity=shareholders_equity,
+        diluted_shares=diluted_shares,
+        ltd_ratio=ltd_ratio,
+        debt_to_equity=debt_to_equity,
+        cagr_div=cagr_div,
+        dps_last=dps_last,
+        bvps=bvps,
+        roe=roe,
+    )
+    # Dict-shape return boundary, kept only until T16 rewires every caller
+    # onto attribute access - see docs/spec/refactor-tasks.md T14/T16.
+    return _bank_metrics_to_dict(metrics)
 
 
 # ── REIT-SPECIFIC ENGINE (Step 3, docs/spec/step3-reit-analyzer-implementation-spec.md) ──
