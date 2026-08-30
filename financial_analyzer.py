@@ -50,37 +50,13 @@ class Sin:
     message: str
 
 
-MINOR_SIN_WEIGHTS = {
-    "equity_declining": 1.0,
-    "fcf_declining": 1.0,
-    "revenue_declining": 1.0,
-    "operating_income_declining": 1.0,
-    "dilution": 1.0,
-    "cr_below_1_bypassed": 1.0,
-    "cr_declining": 0.5,
-    "gross_margin_declining": 0.5,
-    "operating_margin_declining": 0.5,
-    "net_income_declining": 0.3,
-    "net_margin_declining": 0.3,
-}
-# Buyback bonus is a reduction, not a badness ceiling - deliberately excluded
-# from MAX_MINOR_SCORE (which sums only the positive weights above).
-BUYBACK_BONUS_WEIGHT = -0.5
-MAX_MINOR_SCORE = sum(MINOR_SIN_WEIGHTS.values())
-
-# Ordinary v3 (Step 4, docs/spec/step4-ordinary-v3-implementation-spec.md
-# Section 2.1/2.2.1) - technical_negative_equity/technical_lt_insolvency are
-# the minor sins substituted in when the matching CRITICAL sin is smart-
-# bypassed for a buyback-distorted balance sheet. Deliberately kept OUT of
-# MINOR_SIN_WEIGHTS/MAX_MINOR_SCORE (same reasoning as BUYBACK_BONUS_WEIGHT
-# above): each is mutually exclusive with its own critical sin AND with the
-# corresponding "*_declining" minor sin (equity_declining only fires when
-# equity > 0; these only fire when equity <= 0 / lt-insolvent), so folding
-# them into the theoretical worst-case ceiling would overstate a combination
-# that can never actually occur - and it would silently break the existing
-# test asserting MAX_MINOR_SCORE == 8.1.
-TECHNICAL_NEGATIVE_EQUITY_WEIGHT = 1.0
-TECHNICAL_LT_INSOLVENCY_WEIGHT = 1.0
+# Ordinary sin weight tables (MINOR_SIN_WEIGHTS, BUYBACK_BONUS_WEIGHT,
+# TECHNICAL_NEGATIVE_EQUITY_WEIGHT, TECHNICAL_LT_INSOLVENCY_WEIGHT) moved
+# into the declarative registry in src/fundamental_express/domain/sins.py
+# (docs/spec/refactor-tasks.md T11, wired in by T13). MAX_MINOR_SCORE is
+# re-exported under its original name since tests/test_verdict_scoring.py
+# imports it directly.
+from fundamental_express.domain.sins import ORDINARY_MAX_MINOR_SCORE as MAX_MINOR_SCORE  # noqa: E402
 
 # ── VISUAL THEME (colors, fonts, page geometry) ─────────────────────────
 # Moved to src/fundamental_express/reporting/theme.py (docs/spec/refactor-tasks.md T02).
@@ -153,6 +129,77 @@ from fundamental_express.domain.valuation import (  # noqa: E402
     bank_valuation,
     reit_nav_valuation,
 )
+
+# Ordinary sins checklist + registry-driven scoring - moved to
+# src/fundamental_express/domain/ordinary.py and domain/sins.py
+# (docs/spec/refactor-tasks.md T13).
+from fundamental_express.domain.ordinary import check_ordinary_sins  # noqa: E402
+from fundamental_express.domain.sins import (  # noqa: E402
+    ORDINARY_SIN_REGISTRY,
+    ORDINARY_REASONING,
+    score,
+)
+from fundamental_express.domain.metrics import OrdinaryMetrics  # noqa: E402
+
+
+def _ordinary_metrics_to_dict(m):
+    """Dict-shape adapter, kept only until T16 rewires every caller onto
+    attribute access (docs/spec/refactor-tasks.md T13/T16) - reconstructs
+    compute_metrics()'s original ~48-key dict from an OrdinaryMetrics."""
+    return {
+        "year_labels": m.year_labels,
+        "revenue": m.revenue,
+        "operating_income": m.operating_income,
+        "net_income": m.net_income,
+        "eps": m.eps,
+        "curr_assets": m.curr_assets,
+        "curr_liab": m.curr_liab,
+        "curr_ratios": m.curr_ratios,
+        "equity": m.equity,
+        "fcf": m.fcf,
+        "net_margin": m.net_margin,
+        "sins": m.scoring.sins,
+        "critical_sins": m.scoring.critical_sins,
+        "minor_sins": m.scoring.minor_sins,
+        "minor_score": m.scoring.minor_score,
+        "max_minor_score": m.scoring.max_minor_score,
+        "verdict": m.scoring.verdict,
+        "verdict_color_key": m.scoring.verdict_color_key,
+        "reasoning": m.scoring.reasoning,
+        "beta": m.valuation.beta,
+        "wacc": m.wacc,
+        "cost_of_equity": m.valuation.cost_of_equity,
+        "required_return_used": m.valuation.required_return_used,
+        "cost_of_debt_after_tax": m.cost_of_debt_after_tax,
+        "equity_weight": m.equity_weight,
+        "debt_weight": m.debt_weight,
+        "cagr": m.cagr,
+        "proj_years": m.proj_years,
+        "projected_fcfs": m.projected_fcfs,
+        "pv_fcfs": m.pv_fcfs,
+        "enterprise_value": m.enterprise_value,
+        "net_debt": m.net_debt,
+        "net_debt_source": m.net_debt_source,
+        "interest_bearing_debt": m.interest_bearing_debt,
+        "lease_liabilities": m.lease_liabilities,
+        "total_debt_incl_leases": m.total_debt_incl_leases,
+        "cash_balance": m.cash_balance,
+        "equity_value": m.equity_value,
+        "price": m.valuation.price,
+        "fair_value_share": m.valuation.fair_value_share,
+        "over_under_pct": m.valuation.over_under_pct,
+        "val_status": m.valuation.val_status,
+        "val_color_key": m.valuation.val_color_key,
+        "sensitivity_headers": m.sensitivity_headers,
+        "sensitivity_rows": m.sensitivity_rows,
+        "current_ratio": m.current_ratio,
+        "net_margin_pct": m.net_margin_pct,
+        # Ordinary v3 (Step 4): "DCF" unless the auto-switch above fired.
+        "valuation_model": m.valuation.valuation_model,
+        "cagr_div": m.cagr_div,
+        "dps_last": m.dps_last,
+        "debt_to_equity_ratio": m.debt_to_equity_ratio,
+    }
 
 
 # ── CORE ANALYSIS: EXPRESS "SINS" CHECKLIST + DCF ───────────────────────
@@ -325,251 +372,22 @@ def compute_metrics(data, required_return=None):
         net_debt = latest_debt - latest_cash
         net_debt_source = "computed"
 
-    # ── "Sins" checklist (express algorithm from the lecture, two-tier) ──
-    sins = []
-
-    latest_fcf = fcf.iloc[-1]
-    latest_cr = curr_ratios.iloc[-1]
-    # Ordinary v3 (Step 4, spec Section 2.1/2.2.1): a stable, mature company
-    # can show negative book equity or "long-term insolvency" purely from
-    # decades of buybacks (Treasury Stock), not operating distress. Both
-    # the equity_negative and lt_insolvency critical sins below check this
-    # SAME three-condition proof before being smart-bypassed to a minor sin
-    # instead: positive Operating Income and FCF in every available year
-    # (up to 4), plus an actively shrinking share count (proof of buyback,
-    # not just an assertion).
-    buyback_distortion_bypass = (
-        len(operating_income) > 0 and bool((operating_income > 0).all())
-        and len(fcf) > 0 and bool((fcf > 0).all())
-        and not diluted_shares.isna().any()
-        and len(diluted_shares) >= 2
-        and diluted_shares.iloc[-1] < diluted_shares.iloc[-2]
+    # ── "Sins" checklist (Ordinary condition checks + registry-driven scoring) ─
+    # Moved to src/fundamental_express/domain/ordinary.py (condition checks) and
+    # domain/sins.py (scoring) - docs/spec/refactor-tasks.md T13.
+    sins, latest_equity, latest_cr = check_ordinary_sins(
+        revenue, operating_income, net_income, curr_ratios, equity, fcf,
+        gross_margin, operating_margin, net_margin, diluted_shares,
+        current_debt, cash, interest_expense, net_debt,
+        long_term_assets_adj, long_term_liab,
     )
-    # Smart bypass: a Current Ratio below 1.0 driven by, say, deferred revenue
-    # or accounts payable isn't the same red flag as an inability to service
-    # actual near-term debt. Two independent scenarios grant leniency
-    # (Ordinary v3, Step 4 Section 2.2 adds Scenario 2 alongside the
-    # original Scenario 1) - either is sufficient on its own:
-    #   Scenario 1: FCF-positive and cash alone covers short-term debt.
-    #     Never granted on missing current_debt data - leniency requires
-    #     proof, not the absence of a red flag.
-    #   Scenario 2: FCF-positive, overall leverage is safe (Net Debt /
-    #     Operating Income < 4.0 - the 3.0 spec default is raised to 4.0
-    #     since Operating Income/EBIT proxies EBITDA and over-penalizes
-    #     capital-intensive real-estate-heavy businesses), and interest
-    #     coverage is strong (Operating Income / Interest Expense > 4.0 -
-    #     an objective proxy for investment-grade debt, since yfinance.info
-    #     carries no credit-rating field for virtually any ticker). A
-    #     company with no interest-bearing debt at all (Interest Expense
-    #     missing/0/NaN) auto-passes the coverage leg - silence there is
-    #     never treated as a red flag. Requires a genuine net debt balance
-    #     (net_debt > 0): a net-CASH company isn't what this leverage-grade
-    #     scenario is for, and it belongs to Scenario 1's territory instead
-    #     if it wants credit for having more cash than short-term debt.
-    cr_bypass_scenario1 = (
-        latest_cr < 1.0
-        and latest_fcf > 0
-        and not pd.isna(current_debt.iloc[-1])
-        and not pd.isna(cash.iloc[-1])
-        and cash.iloc[-1] > current_debt.iloc[-1]
-    )
-    latest_op_inc = operating_income.iloc[-1]
-    latest_interest_expense = interest_expense.iloc[-1] if len(interest_expense) else float("nan")
-    icr_ok = (
-        pd.isna(latest_interest_expense)
-        or latest_interest_expense == 0
-        or (latest_op_inc / latest_interest_expense) > 4.0
-    )
-    cr_bypass_scenario2 = (
-        latest_cr < 1.0
-        and latest_fcf > 0
-        and latest_op_inc > 0
-        and not pd.isna(net_debt)
-        and net_debt > 0
-        and (net_debt / latest_op_inc) < 4.0
-        and icr_ok
-    )
-    cr_bypass_eligible = cr_bypass_scenario1 or cr_bypass_scenario2
-    if latest_cr < 1.0 and not cr_bypass_eligible:
-        sins.append(Sin(
-            "cr_below_1", "critical", 0.0,
-            f"Критическая ликвидность: коэффициент текущей ликвидности (Current Ratio) ниже 1.0 ({latest_cr:.2f}).",
-        ))
-    elif latest_cr < 1.0 and cr_bypass_eligible:
-        reasons = []
-        if cr_bypass_scenario1:
-            reasons.append(
-                f"FCF положительный ({latest_fcf / 1e6:,.0f} млн) и денежные средства "
-                f"({cash.iloc[-1] / 1e6:,.0f} млн) превышают краткосрочный долг "
-                f"({current_debt.iloc[-1] / 1e6:,.0f} млн)"
-            )
-        if cr_bypass_scenario2:
-            icr_txt = (
-                "∞ (процентного долга нет)"
-                if pd.isna(latest_interest_expense) or latest_interest_expense == 0
-                else f"{latest_op_inc / latest_interest_expense:.2f}"
-            )
-            reasons.append(
-                f"безопасный уровень долговой нагрузки (Net Debt / Operating Income = "
-                f"{net_debt / latest_op_inc:.2f}, < 4.0) при сильном покрытии процентов "
-                f"(Interest Coverage Ratio = {icr_txt}, > 4.0)"
-            )
-        sins.append(Sin(
-            "cr_below_1_bypassed", "minor", MINOR_SIN_WEIGHTS["cr_below_1_bypassed"],
-            f"Ликвидность ниже 1.0 ({latest_cr:.2f}), но не критична: " + "; ".join(reasons) + ".",
-        ))
-    # A CR decline is only flagged if the company also isn't comfortably
-    # liquid (CR >= 2.0) after the decline - dropping from, say, 4.0 to 3.0
-    # isn't a red flag on its own. Requiring latest_cr >= 1.0 here keeps this
-    # mutually exclusive with the two branches above - a CR crash below 1.0
-    # is already captured (critical or bypassed) and must not also
-    # double-count as a minor "declining trend" sin on the same fact.
-    elif (
-        len(curr_ratios) >= 2
-        and curr_ratios.iloc[-1] < curr_ratios.iloc[-2]
-        and latest_cr < 2.0
-    ):
-        sins.append(Sin(
-            "cr_declining", "minor", MINOR_SIN_WEIGHTS["cr_declining"],
-            f"Снижающийся тренд ликвидности: Current Ratio с {curr_ratios.iloc[-2]:.2f} до {curr_ratios.iloc[-1]:.2f}.",
-        ))
-
-    if long_term_liab is not None:
-        latest_lt_assets = long_term_assets_adj.iloc[-1]
-        latest_lt_liab = long_term_liab.iloc[-1]
-        if latest_lt_assets < latest_lt_liab and buyback_distortion_bypass:
-            # Ordinary v3 (Step 4, Section 2.2.1): same buyback-distortion
-            # story as equity_negative below - book long-term assets fall
-            # under liabilities purely from accumulated Treasury Stock, not
-            # from operating distress (proven by the same 3 conditions).
-            sins.append(Sin(
-                "technical_lt_insolvency", "minor", TECHNICAL_LT_INSOLVENCY_WEIGHT,
-                "Техническая долгосрочная неплатежеспособность в результате активного выкупа акций "
-                "(Buyback) при сильной операционной рентабельности.",
-            ))
-        elif latest_lt_assets < latest_lt_liab:
-            sins.append(Sin(
-                "lt_insolvency", "critical", 0.0,
-                f"Долгосрочная неплатёжеспособность: скорректированные (за вычетом Goodwill) "
-                f"долгосрочные активы ({latest_lt_assets / 1e6:,.0f} млн) меньше долгосрочных "
-                f"обязательств ({latest_lt_liab / 1e6:,.0f} млн).",
-            ))
-
-    latest_equity = equity.iloc[-1]
-    if latest_equity <= 0 and buyback_distortion_bypass:
-        # Ordinary v3 (Step 4, Section 2.1): negative book equity purely
-        # from decades of buybacks (Treasury Stock), not operating losses -
-        # proven by positive Operating Income/FCF every available year plus
-        # an actively shrinking share count (buyback_distortion_bypass).
-        sins.append(Sin(
-            "technical_negative_equity", "minor", TECHNICAL_NEGATIVE_EQUITY_WEIGHT,
-            "Технический отрицательный капитал в результате активного выкупа акций (Buyback) при "
-            "стабильно сильных операционных и денежных результатах.",
-        ))
-    elif latest_equity <= 0:
-        sins.append(Sin(
-            "equity_negative", "critical", 0.0,
-            "Отрицательный акционерный капитал: обязательств больше, чем реальных активов.",
-        ))
-    elif len(equity) >= 2 and equity.iloc[-1] < equity.iloc[-2]:
-        sins.append(Sin(
-            "equity_declining", "minor", MINOR_SIN_WEIGHTS["equity_declining"],
-            "Тренд падения капитала: Shareholder Equity снизился за последний год.",
-        ))
-
-    if latest_fcf <= 0:
-        sins.append(Sin(
-            "fcf_negative", "critical", 0.0,
-            "Сжигание денежных средств: отрицательный Free Cash Flow.",
-        ))
-    elif len(fcf) >= 2 and fcf.iloc[-1] < fcf.iloc[-2]:
-        sins.append(Sin(
-            "fcf_declining", "minor", MINOR_SIN_WEIGHTS["fcf_declining"],
-            "Падение денежного потока: снижение FCF за последний год.",
-        ))
-
-    if len(revenue) >= 2 and revenue.iloc[-1] < revenue.iloc[-2]:
-        sins.append(Sin(
-            "revenue_declining", "minor", MINOR_SIN_WEIGHTS["revenue_declining"],
-            "Снижение выручки за последний год.",
-        ))
-    if len(operating_income) >= 2 and operating_income.iloc[-1] < operating_income.iloc[-2]:
-        sins.append(Sin(
-            "operating_income_declining", "minor", MINOR_SIN_WEIGHTS["operating_income_declining"],
-            "Падение операционной прибыли за последний год.",
-        ))
-    if len(net_income) >= 2 and net_income.iloc[-1] < net_income.iloc[-2]:
-        sins.append(Sin(
-            "net_income_declining", "minor", MINOR_SIN_WEIGHTS["net_income_declining"],
-            "Падение чистой прибыли за последний год.",
-        ))
-    if gross_margin is not None and len(gross_margin) >= 2 and gross_margin.iloc[-1] < gross_margin.iloc[-2]:
-        sins.append(Sin(
-            "gross_margin_declining", "minor", MINOR_SIN_WEIGHTS["gross_margin_declining"],
-            f"Падение валовой маржи: Gross Margin с {gross_margin.iloc[-2]:.1f}% до {gross_margin.iloc[-1]:.1f}%.",
-        ))
-    if len(operating_margin) >= 2 and operating_margin.iloc[-1] < operating_margin.iloc[-2]:
-        sins.append(Sin(
-            "operating_margin_declining", "minor", MINOR_SIN_WEIGHTS["operating_margin_declining"],
-            f"Падение операционной маржи: Operating Margin с {operating_margin.iloc[-2]:.1f}% до {operating_margin.iloc[-1]:.1f}%.",
-        ))
-    if len(net_margin) >= 2 and net_margin.iloc[-1] < net_margin.iloc[-2]:
-        sins.append(Sin(
-            "net_margin_declining", "minor", MINOR_SIN_WEIGHTS["net_margin_declining"],
-            f"Падение рентабельности: чистая маржа с {net_margin.iloc[-2]:.1f}% до {net_margin.iloc[-1]:.1f}%.",
-        ))
-
-    # Dilution / buyback bonus: share-count changes economically equivalent
-    # to a per-share earnings cut (dilution) or a shareholder-friendly boost
-    # (buyback), mutually exclusive since a >1.5% YoY move can only go one
-    # direction. Skipped silently if diluted_shares wasn't found for this
-    # ticker's statements (default_val=NaN) - never guessed from a partial row.
-    if (
-        not diluted_shares.isna().any()
-        and len(diluted_shares) >= 2
-        and diluted_shares.iloc[-2] != 0
-    ):
-        shares_ratio = diluted_shares.iloc[-1] / diluted_shares.iloc[-2]
-        if shares_ratio > 1.015:
-            sins.append(Sin(
-                "dilution", "minor", MINOR_SIN_WEIGHTS["dilution"],
-                f"Размытие долей: средневзвешенное число акций выросло с {diluted_shares.iloc[-2]:,.0f} "
-                f"до {diluted_shares.iloc[-1]:,.0f} ({(shares_ratio - 1) * 100:.1f}%).",
-            ))
-        elif shares_ratio < (1 / 1.015):
-            sins.append(Sin(
-                "buyback_bonus", "minor", BUYBACK_BONUS_WEIGHT,
-                f"Бонус за байбэк: число акций сократилось с {diluted_shares.iloc[-2]:,.0f} "
-                f"до {diluted_shares.iloc[-1]:,.0f} ({(1 - shares_ratio) * 100:.1f}%).",
-            ))
-
-    critical_sins = [s for s in sins if s.tier == "critical"]
-    minor_sins = [s for s in sins if s.tier == "minor"]
-    minor_score = max(0.0, sum(s.weight for s in minor_sins))
-
-    if critical_sins:
-        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
-        verdict_color_key = "danger"
-        crit_labels = ", ".join(s.id for s in critical_sins)
-        reasoning = (
-            f"Обнаружен(ы) критический(е) фактор(ы) риска ({crit_labels}) — см. список ниже. "
-            "Любой из них по отдельности делает инвестицию рискованной вне зависимости от прочих показателей."
-        )
-    elif minor_score <= 1.0:
-        verdict = "🟢 КУПИТЬ / СИЛЬНЫЙ КАНДИДАТ"
-        verdict_color_key = "success"
-        reasoning = "Компания демонстрирует эталонную финансовую устойчивость, растущую выручку, отличную маржинальность и растущий свободный денежный поток. Риски минимальны."
-    elif minor_score <= 2.5:
-        verdict = "🟡 НАБЛЮДАТЬ / ОГРАНИЧЕННАЯ ДОЛЯ"
-        verdict_color_key = "warning"
-        reasoning = "Отличный сильный бизнес, однако в финансовых трендах присутствуют умеренные погрешности. Рекомендуется покупка только ограниченной долей."
-    else:
-        verdict = "🔴 ПРОПУСТИТЬ / ВЫСОКИЙ РИСК"
-        verdict_color_key = "danger"
-        reasoning = (
-            f"Взвешенный балл второстепенных нарушений составил {minor_score:.1f} из {MAX_MINOR_SCORE:.1f} — "
-            "см. список ниже. Совокупность этих факторов делает инвестицию рискованной на текущем этапе."
-        )
+    scoring = score(sins, ORDINARY_SIN_REGISTRY, ORDINARY_REASONING)
+    critical_sins = scoring.critical_sins
+    minor_sins = scoring.minor_sins
+    minor_score = scoring.minor_score
+    verdict = scoring.verdict
+    verdict_color_key = scoring.verdict_color_key
+    reasoning = scoring.reasoning
 
     # ── DCF valuation (CAPM WACC, Ordinary v3 DDM auto-switch, sensitivity) ─
     # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c).
@@ -599,60 +417,48 @@ def compute_metrics(data, required_return=None):
     dps_last = val_extras["dps_last"]
     debt_to_equity_ratio = val_extras["debt_to_equity_ratio"]
 
-    return {
-        "year_labels": year_labels,
-        "revenue": revenue,
-        "operating_income": operating_income,
-        "net_income": net_income,
-        "eps": eps,
-        "curr_assets": curr_assets,
-        "curr_liab": curr_liab,
-        "curr_ratios": curr_ratios,
-        "equity": equity,
-        "fcf": fcf,
-        "net_margin": net_margin,
-        "sins": sins,
-        "critical_sins": critical_sins,
-        "minor_sins": minor_sins,
-        "minor_score": minor_score,
-        "max_minor_score": MAX_MINOR_SCORE,
-        "verdict": verdict,
-        "verdict_color_key": verdict_color_key,
-        "reasoning": reasoning,
-        "beta": beta,
-        "wacc": wacc,
-        "cost_of_equity": cost_of_equity,
-        "required_return_used": required_return is not None,
-        "cost_of_debt_after_tax": after_tax_debt,
-        "equity_weight": w_equity,
-        "debt_weight": w_debt,
-        "cagr": cagr,
-        "proj_years": proj_years,
-        "projected_fcfs": projected_fcfs,
-        "pv_fcfs": pv_fcfs,
-        "enterprise_value": enterprise_value,
-        "net_debt": net_debt,
-        "net_debt_source": net_debt_source,
-        "interest_bearing_debt": latest_debt,
-        "lease_liabilities": latest_lease_liabilities,
-        "total_debt_incl_leases": latest_total_debt_incl_leases,
-        "cash_balance": latest_cash,
-        "equity_value": equity_value,
-        "price": price,
-        "fair_value_share": fair_value_share,
-        "over_under_pct": over_under,
-        "val_status": val_status,
-        "val_color_key": val_color_key,
-        "sensitivity_headers": sensitivity_headers,
-        "sensitivity_rows": sensitivity_rows,
-        "current_ratio": float(latest_cr),
-        "net_margin_pct": float(net_margin.iloc[-1]) if not pd.isna(net_margin.iloc[-1]) else None,
-        # Ordinary v3 (Step 4): "DCF" unless the auto-switch above fired.
-        "valuation_model": valuation_model,
-        "cagr_div": cagr_div,
-        "dps_last": dps_last,
-        "debt_to_equity_ratio": debt_to_equity_ratio,
-    }
+    metrics = OrdinaryMetrics(
+        scoring=scoring,
+        valuation=valuation,
+        year_labels=year_labels,
+        revenue=revenue,
+        operating_income=operating_income,
+        net_income=net_income,
+        eps=eps,
+        curr_assets=curr_assets,
+        curr_liab=curr_liab,
+        curr_ratios=curr_ratios,
+        equity=equity,
+        fcf=fcf,
+        net_margin=net_margin,
+        wacc=wacc,
+        cost_of_debt_after_tax=after_tax_debt,
+        equity_weight=w_equity,
+        debt_weight=w_debt,
+        cagr=cagr,
+        proj_years=proj_years,
+        projected_fcfs=projected_fcfs,
+        pv_fcfs=pv_fcfs,
+        enterprise_value=enterprise_value,
+        net_debt=net_debt,
+        net_debt_source=net_debt_source,
+        interest_bearing_debt=latest_debt,
+        lease_liabilities=latest_lease_liabilities,
+        total_debt_incl_leases=latest_total_debt_incl_leases,
+        cash_balance=latest_cash,
+        equity_value=equity_value,
+        sensitivity_headers=sensitivity_headers,
+        sensitivity_rows=sensitivity_rows,
+        current_ratio=float(latest_cr),
+        net_margin_pct=float(net_margin.iloc[-1]) if not pd.isna(net_margin.iloc[-1]) else None,
+        cagr_div=cagr_div,
+        dps_last=dps_last,
+        debt_to_equity_ratio=debt_to_equity_ratio,
+    )
+    # Dict-shape return boundary, kept only until T16 rewires every caller
+    # (renderers, portfolio_analyzer.py, all 87+ pre-existing tests) onto
+    # attribute access - see docs/spec/refactor-tasks.md T13/T16.
+    return _ordinary_metrics_to_dict(metrics)
 
 
 # ── BANK-SPECIFIC ENGINE (Step 2, docs/spec/step2-bank-analyzer-implementation-spec.md) ──
