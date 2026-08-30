@@ -1168,32 +1168,13 @@ REIT_MINOR_SIN_WEIGHTS = {
 REIT_BUYBACK_BONUS_WEIGHT = -0.5
 REIT_MAX_MINOR_SCORE = sum(REIT_MINOR_SIN_WEIGHTS.values())
 
-REIT_CAP_RATE_MATRIX = [
-    (("industrial", "logistic", "warehouse"), 0.055, "Industrial / Logistics"),
-    (("residential", "apartment"), 0.060, "Residential"),
-    (("healthcare", "medical", "health care"), 0.065, "Healthcare / Medical"),
-    (("office", "retail", "mall"), 0.070, "Office / Retail / Malls"),
-]
-REIT_DEFAULT_CAP_RATE = 0.065
-REIT_DEFAULT_CAP_RATE_LABEL = "Default"
-
-
-def _reit_cap_rate(info):
-    """Cap Rate lookup (spec Section 5.1) - an explicit info['capRate'] first
-    (yfinance never actually populates this, but the spec asks to check),
-    then a conservative median-by-specialization matrix keyed off industry/
-    sector keywords, first match wins. Never invents a company-specific
-    rate beyond this - real REITs report their own portfolio cap rate in
-    investor materials, not through yfinance."""
-    info = info or {}
-    explicit = info.get("capRate")
-    if explicit:
-        return float(explicit), "Explicit (info.capRate)"
-    haystack = " ".join(str(info.get(k) or "") for k in ("industry", "sector", "longBusinessSummary")).lower()
-    for keywords, rate, label in REIT_CAP_RATE_MATRIX:
-        if any(kw in haystack for kw in keywords):
-            return rate, label
-    return REIT_DEFAULT_CAP_RATE, REIT_DEFAULT_CAP_RATE_LABEL
+# Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12b).
+from fundamental_express.domain.valuation import (  # noqa: E402
+    REIT_CAP_RATE_MATRIX,
+    REIT_DEFAULT_CAP_RATE,
+    REIT_DEFAULT_CAP_RATE_LABEL,
+    _reit_cap_rate,
+)
 
 
 def compute_reit_metrics(data, required_return=None):
