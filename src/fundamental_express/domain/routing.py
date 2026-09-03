@@ -28,3 +28,23 @@ def _is_reit(info):
     industry = str(info.get("industry") or "").lower()
     sector = str(info.get("sector") or "").lower()
     return "reit" in industry or "real estate investment trust" in industry or "real estate investment trust" in sector
+
+
+_LEASE_HEAVY_KEYWORDS = (
+    "retail", "grocery", "department store", "specialty retail",
+    "airline", "restaurant",
+)
+
+
+def _is_lease_heavy(info):
+    """V04 (docs/spec/issues/V04-lease-adjusted-net-debt.md) - a small
+    starter keyword list (retail/grocery/airline/restaurant) deciding
+    which sector gets the lease-inclusive fair value as the report's
+    headline number instead of just a secondary figure. Deliberately not
+    exhaustive (hospitality, healthcare facilities, telecom towers are
+    real lease-heavy industries not covered here) - see
+    docs/spec/issues/follow-ups.md#fu-02-lease-heavy-sector-taxonomy."""
+    industry = str(info.get("industry") or "").lower()
+    sector = str(info.get("sector") or "").lower()
+    haystack = f"{industry} {sector}"
+    return any(kw in haystack for kw in _LEASE_HEAVY_KEYWORDS)

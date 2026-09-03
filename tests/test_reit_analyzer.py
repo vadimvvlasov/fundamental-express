@@ -249,8 +249,16 @@ def test_nav_bridge_matches_spec_worked_example():
     # spec Section 7.1 scenario 3: NOI=$100M, Cap Rate=5.0%, Cash=$10M,
     # Liabilities=$500M, Shares=10M -> Property Value=$2000M,
     # NAV=$2000M+$10M-$500M=$1510M, Fair Price=$151.00.
+    # NOI is flat $100M in both fixture years (V07,
+    # docs/spec/issues/V07-reit-trailing-average.md, changed
+    # property_value to a trailing-average NOI instead of the single
+    # latest year) - a flat series keeps the average equal to the spec's
+    # single-year figure, so this still exercises and pins the spec's
+    # worked numbers exactly; test_nav_bridge_averages_noi_across_years
+    # below is the one that actually exercises averaging two *different*
+    # NOI years.
     m = compute_reit_metrics(make_reit_data(
-        rental_revenue=(300.0, 400.0), property_opex=(100.0, 300.0),  # NOI = 100
+        rental_revenue=(300.0, 300.0), property_opex=(200.0, 200.0),  # NOI = 100 both years
         cash=(20.0, 10.0), receivables=(10.0, 0.0), construction_in_progress=(0.0, 0.0),
         total_liab=(800.0, 500.0),
         shares=10.0,
@@ -258,9 +266,26 @@ def test_nav_bridge_matches_spec_worked_example():
     ))
     assert m.cap_rate == pytest.approx(0.05)
     assert m.cap_rate_label == "Explicit (info.capRate)"
+    assert m.avg_noi == pytest.approx(100.0)
     assert m.property_value == pytest.approx(2000.0)
     assert m.nav == pytest.approx(1510.0)
     assert m.valuation.fair_value_share == pytest.approx(151.00, abs=0.01)
+
+
+def test_nav_bridge_averages_noi_across_years():
+    # V07: an outlier latest-year NOI must not solely drive property_value
+    # - the 2-year fixture window here averages 200 and 100 to 150, not
+    # just the latest year's 100.
+    m = compute_reit_metrics(make_reit_data(
+        rental_revenue=(300.0, 400.0), property_opex=(100.0, 300.0),  # NOI: 200, then 100
+        cash=(20.0, 10.0), receivables=(10.0, 0.0), construction_in_progress=(0.0, 0.0),
+        total_liab=(800.0, 500.0),
+        shares=10.0,
+        info={"capRate": 0.05},
+    ))
+    assert m.avg_noi == pytest.approx(150.0)  # (200 + 100) / 2, not just 100
+    assert m.property_value == pytest.approx(3000.0)  # 150 / 0.05
+    assert m.avg_noi_years == 2
 
 
 def test_cap_rate_matrix_by_industry_keyword():

@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import sys
 from datetime import datetime
@@ -70,7 +71,7 @@ from fundamental_express.data.errors import DataUnavailableError, UnsupportedSec
 
 
 # Moved to src/fundamental_express/domain/routing.py (docs/spec/refactor-tasks.md T08).
-from fundamental_express.domain.routing import check_sector_suitability  # noqa: E402
+from fundamental_express.domain.routing import check_sector_suitability, _is_lease_heavy  # noqa: E402
 
 
 # ── DATA LAYER (Yahoo Finance client, FX bridge, SAMPLE fallback) ───────
@@ -107,6 +108,7 @@ from fundamental_express.domain.valuation import (  # noqa: E402
     bank_valuation,
     reit_nav_valuation,
 )
+from fundamental_express.domain.graham import graham_number, eps_for_graham  # noqa: E402
 
 # Ordinary sins checklist + registry-driven scoring - moved to
 # src/fundamental_express/domain/ordinary.py and domain/sins.py
@@ -118,6 +120,34 @@ from fundamental_express.domain.sins import (  # noqa: E402
     score,
 )
 from fundamental_express.domain.metrics import OrdinaryMetrics  # noqa: E402
+
+
+def _nonrecurring_note(year_labels, raw, normalized, source_row):
+    """V03 (docs/spec/issues/V03-normalize-nonrecurring-items.md): a
+    human-readable disclosure line naming every year where a non-recurring
+    item (from yfinance's own "Normalized Income" row) was stripped out of
+    net income before the declining-earnings sin check - so a reviewer can
+    see which years were touched and by how much, not just trust a swapped
+    number. Returns None when the source row wasn't found or covered no
+    year with a real (non-negligible) adjustment - the common case.
+    """
+    adjustments = []
+    for i, year in enumerate(year_labels):
+        if pd.isna(source_row.iloc[i]):
+            continue
+        delta = raw.iloc[i] - normalized.iloc[i]
+        if abs(delta) > 1e6:  # ignore sub-$1M rounding noise
+            adjustments.append((year, delta))
+    if not adjustments:
+        return None
+    parts = [
+        f"{year} ({'−' if delta > 0 else '+'}{abs(delta) / 1e6:,.0f} млн)"
+        for year, delta in adjustments
+    ]
+    return (
+        "Скорректировано (для расчёта тренда прибыли): исключены разовые статьи "
+        "(Normalized Income vs. reported Net Income) за " + ", ".join(parts) + "."
+    )
 
 
 # ── CORE ANALYSIS: EXPRESS "SINS" CHECKLIST + DCF ───────────────────────
@@ -153,6 +183,13 @@ def compute_metrics(data, required_return=None):
     revenue = find_row(df_fin, ["revenue", "total revenue", "sales"])
     operating_income = find_row(df_fin, ["operating income", "operating profit", "ebit"])
     net_income = find_row(df_fin, ["net income", "net profit"])
+    # V03: yfinance's own "Normalized Income" row (nets out impairments,
+    # gains/losses on sale, restructuring, and other one-off items it
+    # identifies) - used only to normalize the net_income_declining sin
+    # input below, per-year. NaN (row missing, or that year not covered)
+    # falls back to the raw net_income for that specific year via
+    # .fillna() further down, once both are FX-converted.
+    normalized_income = find_row(df_fin, ["normalized income"], default_val=float("nan"))
     eps = find_row(df_fin, ["eps", "diluted eps", "basic eps"])
 
     revenue_cost = find_row(df_fin, ["cost of revenue"], default_val=float("nan"))
@@ -231,6 +268,7 @@ def compute_metrics(data, required_return=None):
         revenue_cost = revenue_cost * fx_rate
         operating_income = operating_income * fx_rate
         net_income = net_income * fx_rate
+        normalized_income = normalized_income * fx_rate
         curr_assets = curr_assets * fx_rate
         curr_liab = curr_liab * fx_rate
         total_assets = total_assets * fx_rate
@@ -270,6 +308,13 @@ def compute_metrics(data, required_return=None):
     # docs/spec/issues/V01-tangible-equity-distress-triggers.md).
     tangible_equity = equity - goodwill - other_intangibles
 
+    # V03: net_income_normalized feeds only the net_income_declining sin
+    # below - the raw, reported net_income in the fundamentals table and
+    # net_margin above is untouched (see
+    # docs/spec/issues/V03-normalize-nonrecurring-items.md).
+    net_income_normalized = normalized_income.fillna(net_income)
+    nonrecurring_note = _nonrecurring_note(year_labels, net_income, net_income_normalized, normalized_income)
+
     # Net debt - moved ahead of the sins checklist (Ordinary v3, Step 4):
     # the Current Ratio smart-bypass Scenario 2 needs it for the Net Debt /
     # Operating Income leverage check. Formula/values are unchanged from
@@ -299,11 +344,34 @@ def compute_metrics(data, required_return=None):
         net_debt = latest_debt - latest_cash
         net_debt_source = "computed"
 
+    # V04: lease-inclusive net debt, always computed as a secondary figure
+    # (headline for lease-heavy sectors, decided further below once
+    # Enterprise Value is available) - see
+    # docs/spec/issues/V04-lease-adjusted-net-debt.md.
+    debt_already_lease_inclusive = interest_bearing_debt.isna().all()
+    if net_debt_source != "computed":
+        # Yahoo's own reported Net Debt methodology re: leases is
+        # undocumented - don't guess, show N/A rather than silently
+        # double-count or omit (see FU-08 for the related, pre-existing
+        # inconsistency this task does not fix).
+        net_debt_incl_leases = None
+    elif debt_already_lease_inclusive:
+        # `debt` already fell back to total_debt_incl_leases (no separate
+        # Long Term Debt row for this ticker) - net_debt is already
+        # lease-inclusive, adding lease_liabilities again would double-count.
+        net_debt_incl_leases = net_debt
+    elif not pd.isna(latest_lease_liabilities):
+        net_debt_incl_leases = net_debt + latest_lease_liabilities
+    elif not pd.isna(latest_total_debt_incl_leases):
+        net_debt_incl_leases = net_debt + (latest_total_debt_incl_leases - latest_debt)
+    else:
+        net_debt_incl_leases = None
+
     # ── "Sins" checklist (Ordinary condition checks + registry-driven scoring) ─
     # Moved to src/fundamental_express/domain/ordinary.py (condition checks) and
     # domain/sins.py (scoring) - docs/spec/refactor-tasks.md T13.
     sins, latest_equity, latest_cr = check_ordinary_sins(
-        revenue, operating_income, net_income, curr_ratios, equity, fcf,
+        revenue, operating_income, net_income_normalized, curr_ratios, equity, fcf,
         gross_margin, operating_margin, net_margin, diluted_shares,
         current_debt, cash, interest_expense, net_debt,
         long_term_assets_adj, long_term_liab,
@@ -319,10 +387,22 @@ def compute_metrics(data, required_return=None):
     # ── DCF valuation (CAPM WACC, Ordinary v3 DDM auto-switch, sensitivity) ─
     # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c).
     latest_tangible_equity = tangible_equity.iloc[-1] if len(tangible_equity) else float("nan")
+    latest_interest_expense = interest_expense.iloc[-1] if len(interest_expense) else float("nan")
+
+    # V10 (docs/spec/issues/V10-graham-number-reproducible.md) - purely
+    # informational, never feeds sins/verdict/DCF. tangible_bvps reuses
+    # V01's tangible_equity rather than raw equity (goodwill-inflated
+    # raw BVPS overstates Graham's "ceiling" price).
+    graham_eps, graham_eps_label = eps_for_graham(data.get("info"), eps.iloc[-1] if len(eps) else None)
+    graham_tangible_bvps = (
+        latest_tangible_equity / shares if shares > 0 and not pd.isna(latest_tangible_equity) else None
+    )
+    graham_value = graham_number(graham_eps, graham_tangible_bvps)
     valuation, val_extras = ordinary_dcf_valuation(
         fcf, price, shares, beta, required_return, latest_debt, net_debt,
         latest_equity, diluted_shares, cash_dividends_paid, data.get("info"),
-        tangible_equity=latest_tangible_equity,
+        tangible_equity=latest_tangible_equity, interest_expense=latest_interest_expense,
+        beta_is_fallback=data.get("beta_is_fallback", False),
     )
     cost_of_equity = valuation.cost_of_equity
     fair_value_share = valuation.fair_value_share
@@ -332,6 +412,10 @@ def compute_metrics(data, required_return=None):
     valuation_model = valuation.valuation_model
     wacc = val_extras["wacc"]
     after_tax_debt = val_extras["cost_of_debt_after_tax"]
+    cost_of_debt = val_extras["cost_of_debt"]
+    cost_of_debt_is_implied = val_extras["cost_of_debt_is_implied"]
+    terminal_g = val_extras["terminal_g"]
+    terminal_g_label = val_extras["terminal_g_label"]
     w_equity = val_extras["equity_weight"]
     w_debt = val_extras["debt_weight"]
     cagr = val_extras["cagr"]
@@ -345,6 +429,42 @@ def compute_metrics(data, required_return=None):
     cagr_div = val_extras["cagr_div"]
     dps_last = val_extras["dps_last"]
     debt_to_equity_ratio = val_extras["debt_to_equity_ratio"]
+
+    # V04: lease-inclusive fair value - EV doesn't depend on net_debt (only
+    # equity_value = EV - net_debt does), so this is a cheap second
+    # subtraction, not a second DCF run. Only meaningful on the FCF-DCF
+    # path (valuation_model == "DCF") - DDM discounts dividends directly
+    # and has no EV/net_debt concept to re-net. Always computed and always
+    # shown as a secondary figure in the report; only promoted to headline
+    # for a lease-heavy sector (see docs/spec/issues/V04-lease-adjusted-net-debt.md).
+    fair_value_share_incl_leases = None
+    if valuation_model == "DCF" and net_debt_incl_leases is not None and shares > 0:
+        equity_value_incl_leases = enterprise_value - net_debt_incl_leases
+        fair_value_share_incl_leases = equity_value_incl_leases / shares
+    # Saved before any headline override below, so the report can always
+    # show whichever of the two (excl/incl leases) is NOT the headline.
+    fair_value_share_excl_leases = fair_value_share if valuation_model == "DCF" else None
+
+    lease_heavy_sector = _is_lease_heavy(data.get("info") or {})
+    if lease_heavy_sector and fair_value_share_incl_leases is not None and valuation_model == "DCF":
+        fair_value_share = fair_value_share_incl_leases
+        over_under = (fair_value_share - price) / price * 100 if price else 0.0
+        if over_under > 10.0:
+            val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
+            val_color_key = "success"
+        elif over_under < -10.0:
+            val_status = f"ПЕРЕОЦЕНЕНА на {abs(over_under):.1f}% (Завышенная стоимость)"
+            val_color_key = "danger"
+        else:
+            val_status = f"ОЦЕНЕНА СПРАВЕДЛИВО (Отклонение {over_under:.1f}%)"
+            val_color_key = "warning"
+        # ValuationResult is frozen - the headline swap above must also
+        # replace the object OrdinaryMetrics.valuation actually stores,
+        # not just these loose locals (which nothing downstream reads).
+        valuation = dataclasses.replace(
+            valuation, fair_value_share=fair_value_share, over_under_pct=over_under,
+            val_status=val_status, val_color_key=val_color_key,
+        )
 
     metrics = OrdinaryMetrics(
         scoring=scoring,
@@ -383,6 +503,19 @@ def compute_metrics(data, required_return=None):
         cagr_div=cagr_div,
         dps_last=dps_last,
         debt_to_equity_ratio=debt_to_equity_ratio,
+        nonrecurring_note=nonrecurring_note,
+        net_debt_incl_leases=net_debt_incl_leases,
+        fair_value_share_incl_leases=fair_value_share_incl_leases,
+        fair_value_share_excl_leases=fair_value_share_excl_leases,
+        lease_heavy_sector=lease_heavy_sector,
+        cost_of_debt=cost_of_debt,
+        cost_of_debt_is_implied=cost_of_debt_is_implied,
+        terminal_g=terminal_g,
+        terminal_g_label=terminal_g_label,
+        graham_value=graham_value,
+        graham_eps=graham_eps,
+        graham_eps_label=graham_eps_label,
+        graham_tangible_bvps=graham_tangible_bvps,
     )
     return metrics
 
@@ -451,11 +584,17 @@ def compute_bank_metrics(data, required_return=None):
         "Salaries and Employee Benefits",
     ])
     net_income = find_row(df_fin, ["Net Income", "NetIncome", "Net Income Common Stockholders"])
+    # V03: same "Normalized Income" normalization as compute_metrics() -
+    # see docs/spec/issues/V03-normalize-nonrecurring-items.md.
+    normalized_income = find_row(df_fin, ["Normalized Income"], default_val=float("nan"))
     preferred_dividends = find_row(df_fin, ["Preferred Stock Dividends", "Preferred Dividends"])
     diluted_shares = find_row(
         df_fin, ["Diluted Average Shares", "Diluted Shares Outstanding", "Average Shares"],
         default_val=float("nan"),
     )
+    # V10 (docs/spec/issues/V10-graham-number-reproducible.md) - not parsed
+    # anywhere in the Bank path before this.
+    eps = find_row(df_fin, ["Diluted EPS", "Basic EPS"], default_val=float("nan"))
 
     # ── Section 3.2: Balance sheet ──────────────────────────────────────
     # Missing-row default is NaN (not 0.0) for every balance-sheet line that
@@ -514,6 +653,7 @@ def compute_bank_metrics(data, required_return=None):
         credit_loss_provision = credit_loss_provision * fx_rate
         non_interest_expense = non_interest_expense * fx_rate
         net_income = net_income * fx_rate
+        normalized_income = normalized_income * fx_rate
         preferred_dividends = preferred_dividends * fx_rate
         cash_and_equiv = cash_and_equiv * fx_rate
         trading_assets = trading_assets * fx_rate
@@ -527,13 +667,19 @@ def compute_bank_metrics(data, required_return=None):
         other_intangibles = other_intangibles * fx_rate
         common_dividends_paid = common_dividends_paid * fx_rate
 
+    # V03: net_income_normalized feeds only the net_income_declining sin
+    # below - reported (raw) net_income elsewhere is untouched (see
+    # docs/spec/issues/V03-normalize-nonrecurring-items.md).
+    net_income_normalized = normalized_income.fillna(net_income)
+    nonrecurring_note = _nonrecurring_note(year_labels, net_income, net_income_normalized, normalized_income)
+
     # ── Bank sins checklist (condition checks + registry-driven scoring) ──
     # Moved to src/fundamental_express/domain/bank.py (condition checks) and
     # domain/sins.py (scoring) - docs/spec/refactor-tasks.md T14.
     sins, latest_equity, ltd_ratio, debt_to_equity = check_bank_sins(
         net_interest_income, shareholders_equity, credit_loss_provision,
         diluted_shares, net_loans, total_deposits, cash_and_equiv,
-        non_interest_expense, commissions_income, net_income, total_borrowings,
+        non_interest_expense, commissions_income, net_income_normalized, total_borrowings,
     )
     scoring = score(sins, BANK_SIN_REGISTRY, BANK_REASONING)
     critical_sins = scoring.critical_sins
@@ -549,10 +695,20 @@ def compute_bank_metrics(data, required_return=None):
     latest_tangible_equity = (
         tangible_equity_series.iloc[-1] if len(tangible_equity_series) else float("nan")
     )
+
+    # V10 (docs/spec/issues/V10-graham-number-reproducible.md) - see the
+    # identical Ordinary computation for the reasoning.
+    graham_eps, graham_eps_label = eps_for_graham(info, eps.iloc[-1] if len(eps) else None)
+    graham_tangible_bvps = (
+        latest_tangible_equity / shares if shares > 0 and not pd.isna(latest_tangible_equity) else None
+    )
+    graham_value = graham_number(graham_eps, graham_tangible_bvps)
+
     valuation, val_extras = bank_valuation(
         required_return, beta, info, common_dividends_paid, diluted_shares,
         latest_equity, shares, net_income, price,
         tangible_equity=latest_tangible_equity,
+        beta_is_fallback=data.get("beta_is_fallback", False),
     )
     cost_of_equity = valuation.cost_of_equity
     fair_value_share = valuation.fair_value_share
@@ -564,6 +720,8 @@ def compute_bank_metrics(data, required_return=None):
     dps_last = val_extras["dps_last"]
     bvps = val_extras["bvps"]
     roe = val_extras["roe"]
+    terminal_g = val_extras["terminal_g"]
+    terminal_g_label = val_extras["terminal_g_label"]
 
     metrics = BankMetrics(
         scoring=scoring,
@@ -593,6 +751,13 @@ def compute_bank_metrics(data, required_return=None):
         dps_last=dps_last,
         bvps=bvps,
         roe=roe,
+        nonrecurring_note=nonrecurring_note,
+        terminal_g=terminal_g,
+        terminal_g_label=terminal_g_label,
+        graham_value=graham_value,
+        graham_eps=graham_eps,
+        graham_eps_label=graham_eps_label,
+        graham_tangible_bvps=graham_tangible_bvps,
     )
     return metrics
 
@@ -622,7 +787,7 @@ from fundamental_express.domain.metrics import ReitMetrics  # noqa: E402
 # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12b).
 from fundamental_express.domain.valuation import (  # noqa: E402
     REIT_CAP_RATE_MATRIX,
-    REIT_DEFAULT_CAP_RATE,
+    REIT_DEFAULT_CAP_RATE_SPREAD,
     REIT_DEFAULT_CAP_RATE_LABEL,
     _reit_cap_rate,
 )
@@ -752,6 +917,8 @@ def compute_reit_metrics(data, required_return=None):
     cap_rate = val_extras["cap_rate"]
     cap_rate_label = val_extras["cap_rate_label"]
     property_value = val_extras["property_value"]
+    avg_noi = val_extras["avg_noi"]
+    avg_noi_years = val_extras["avg_noi_years"]
     nav = val_extras["nav"]
     ffo_per_share = val_extras["ffo_per_share"]
     p_ffo = val_extras["p_ffo"]
@@ -784,6 +951,8 @@ def compute_reit_metrics(data, required_return=None):
         cap_rate=cap_rate,
         cap_rate_label=cap_rate_label,
         property_value=property_value,
+        avg_noi=avg_noi,
+        avg_noi_years=avg_noi_years,
         nav=nav,
         ffo_per_share=ffo_per_share,
         p_ffo=p_ffo,

@@ -33,6 +33,7 @@ def make_bank_data(
     credit_loss_provision=(30.0, 30.0, 30.0, 30.0),
     non_interest_expense=(200.0, 200.0, 200.0, 200.0),
     net_income=(150.0, 150.0, 150.0, 150.0),
+    normalized_income=None,
     preferred_dividends=(0.0, 0.0, 0.0, 0.0),
     diluted_shares=(100.0, 100.0, 100.0, 100.0),
     cash_and_equiv=(300.0, 300.0, 300.0, 300.0),
@@ -63,6 +64,8 @@ def make_bank_data(
         "Preferred Stock Dividends": list(preferred_dividends),
         "Diluted Average Shares": list(diluted_shares),
     }
+    if normalized_income is not None:
+        fin_rows["Normalized Income"] = list(normalized_income)
     if net_interest_income is not None:
         fin_rows["Net Interest Income"] = list(net_interest_income)
     bal_rows = {

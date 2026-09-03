@@ -31,17 +31,20 @@ _CALLOUT_TEXT = dict(fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], l
 def _bank_valuation_disclosure(m):
     """Plain (label, value) pairs for the DDM/ROE-P-B model disclosure -
     shared between the markdown and flowables renderings of Section 3."""
+    # V08 (docs/spec/issues/V08-beta-sanity-check.md): see the identical
+    # note in sections_ordinary.py::_valuation_section.
+    beta_note = " (β скорректирована — исходное значение вне разумного диапазона)" if m.valuation.beta_is_fallback else ""
     ke_line = (
         f"Ke = задано инвестором (--required-return) = {m.valuation.cost_of_equity * 100:.2f}%"
         if m.valuation.required_return_used
-        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%"
+        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%{beta_note}"
     )
     if m.valuation.valuation_model == "DDM":
         return "Модель дисконтирования дивидендов (DDM)", [
             (ke_line, ""),
             ("Темп роста дивидендов (CAGR_div, лог-регрессия по годам, ограничен 1.0%-8.0%)", f"{m.cagr_div * 100:.2f}%"),
             ("DPS последнего года (Common Dividends Paid / Diluted Shares)", f"{m.dps_last:.2f} USD"),
-            ("Терминальный темп роста (Gordon Growth)", "2.5%"),
+            ("Терминальный темп роста (Gordon Growth)", f"{m.terminal_g * 100:.2f}% ({m.terminal_g_label})"),
         ]
     return "Модель рентабельности капитала (ROE / P/B)", [
         (ke_line, ""),
@@ -140,6 +143,7 @@ def _fundamentals_section(m, trading_ccy, ticker):
     struct_rows = _bank_structural_rows(m, trading_ccy)
 
     def markdown():
+        note = f"\n\n> {m.nonrecurring_note}" if m.nonrecurring_note else ""
         return f"""## 2. Экспресс-анализ процентного дохода и баланса
 
 Показатели в млн. {trading_ccy}. Вместо Revenue/Current Ratio для банков используются NII и Loan-to-Deposit (LTD).
@@ -150,7 +154,7 @@ def _fundamentals_section(m, trading_ccy, ticker):
 {row("Комиссионный доход", m.commissions_income / 1e6)}
 {row("Резервы под потери по кредитам (Provision)", m.credit_loss_provision / 1e6)}
 {row("Чистая прибыль (Net Income)", m.net_income / 1e6)}
-{row("Акционерный капитал (Shareholders Equity)", m.shareholders_equity / 1e6)}
+{row("Акционерный капитал (Shareholders Equity)", m.shareholders_equity / 1e6)}{note}
 
 **Loan-to-Deposit Ratio (LTD, последний год): {ltd_txt}** | **Total Debt / Shareholders Equity: {de_txt}**
 
@@ -176,6 +180,9 @@ def _fundamentals_section(m, trading_ccy, ticker):
             ["Акционерный капитал (Shareholders Equity)"] + fmt_last4(m.shareholders_equity),
         ]
         chart_img_path = generate_nii_chart(year_labels, m.net_interest_income.values, ticker)
+        nonrecurring_flowables = (
+            [Spacer(1, 6), Paragraph(m.nonrecurring_note, body_style)] if m.nonrecurring_note else []
+        )
         return [
             Paragraph(
                 "Вместо Revenue/Current Ratio (неприменимых к банкам) используются Net Interest Income (NII) и "
@@ -183,6 +190,7 @@ def _fundamentals_section(m, trading_ccy, ticker):
                 body_style,
             ),
             create_reportlab_table(headers, rows, {}, COLORS, col_widths=[190, 70, 70, 70, 70]),
+            *nonrecurring_flowables,
             Spacer(1, 8),
             Paragraph(
                 f"<b>Loan-to-Deposit Ratio (LTD, последний год):</b> {ltd_txt} &nbsp;&nbsp; "
@@ -200,6 +208,24 @@ def _fundamentals_section(m, trading_ccy, ticker):
     return Section("Экспресс-анализ процентного дохода и баланса", markdown, flowables)
 
 
+def _graham_note(m, trading_ccy):
+    """V10 (docs/spec/issues/V10-graham-number-reproducible.md) - identical
+    to sections_ordinary.py's _graham_note(), duplicated for the same
+    reason other per-asset-class report helpers are (T17/T18 pattern)."""
+    if m.graham_value is None:
+        return (
+            "Справочно (вне основной методики): Число Грэма недоступно "
+            f"(EPS({m.graham_eps_label}) ≤ 0 или tangible BVPS ≤ 0)."
+        )
+    deviation = (m.graham_value - m.valuation.price) / m.valuation.price * 100 if m.valuation.price else 0.0
+    verdict = "недооценена" if deviation > 0 else "переоценена"
+    return (
+        f"Справочно (вне основной методики): Число Грэма = √(22.5 × EPS({m.graham_eps_label}) × "
+        f"tangible BVPS) = {m.graham_value:.2f} {trading_ccy} (EPS={m.graham_eps:.2f}, tangible BVPS="
+        f"{m.graham_tangible_bvps:.2f}) — цена {verdict} относительно Числа Грэма на {abs(deviation):.1f}%."
+    )
+
+
 def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
     model_name, model_lines = _bank_valuation_disclosure(m)
     model_block = "\n".join(f"- {label}{': ' + value if value else ''}" for label, value in model_lines)
@@ -210,9 +236,12 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
 {model_block}
 
 **Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
-Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) | Статус: **{m.valuation.val_status}**"""
+Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) | Статус: **{m.valuation.val_status}**
+
+> {_graham_note(m, trading_ccy)}"""
 
     def flowables():
+        body_style = ParagraphStyle("Body", **_BODY)
         callout_style = ParagraphStyle("CalloutText", **_CALLOUT_TEXT)
         val_color = COLORS[m.valuation.val_color_key]
         model_html = "<br/>".join(
@@ -230,6 +259,8 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 val_banner_text, USABLE_W, COLORS,
                 ParagraphStyle("ValB", parent=callout_style, fontSize=10, leading=14), val_color,
             ),
+            Spacer(1, 6),
+            Paragraph(_graham_note(m, trading_ccy), body_style),
         ]
 
     return Section(f"Оценка справедливой стоимости: {model_name}", markdown, flowables)

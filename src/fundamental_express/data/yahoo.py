@@ -3,6 +3,7 @@ issuers, and the retrying public entry point (get_company_data). Moved
 verbatim out of financial_analyzer.py (docs/spec/refactor-tasks.md T09).
 """
 
+import math
 import time
 from datetime import datetime
 
@@ -30,6 +31,30 @@ def _fx_rate(from_ccy, to_ccy):
     except Exception:
         pass
     return None
+
+
+FALLBACK_BETA = 1.1
+_BETA_LO, _BETA_HI = -1.0, 3.0
+
+
+def _sanitize_beta(raw_beta):
+    """V08 (docs/spec/issues/V08-beta-sanity-check.md): the old `info.get
+    ("beta") or FALLBACK_BETA` only ever caught falsy values (None/0/0.0) -
+    NaN is truthy in Python (`float("nan") or 1.1` evaluates to nan, not
+    1.1), and a beta far outside any plausible equity range (negative, or
+    >3 - usually a low-liquidity/small-float regression artifact) passed
+    straight through into Ke = Rf + β×ERP with no signal anything was
+    adjusted. Returns (beta, beta_is_fallback) - the latter lets the
+    report disclose which case applied."""
+    if not raw_beta:  # None, 0, 0.0, "" - yfinance's own "no data" signal, preserved from the pre-V08 `or` idiom
+        return FALLBACK_BETA, True
+    try:
+        beta_f = float(raw_beta)
+    except (TypeError, ValueError):
+        beta_f = float("nan")
+    if math.isnan(beta_f) or beta_f < _BETA_LO or beta_f > _BETA_HI:
+        return FALLBACK_BETA, True
+    return beta_f, False
 
 
 # ── FINANCIAL DATA COLLECTOR ────────────────────────────────────────────
@@ -77,7 +102,7 @@ def _fetch_once(ticker):
         else:
             quote_time_label = f"{datetime.now().strftime('%Y-%m-%d %H:%M')} (время запуска скрипта, не биржевое время)"
 
-        beta = info.get("beta") or 1.1
+        beta, beta_is_fallback = _sanitize_beta(info.get("beta"))
         name = info.get("longName") or info.get("shortName") or ticker
 
         # Foreign issuers (e.g. TSM/TSMC) often report financial statements in
@@ -100,6 +125,7 @@ def _fetch_once(ticker):
             "price": float(price),
             "shares": int(shares),
             "beta": float(beta),
+            "beta_is_fallback": beta_is_fallback,
             "financials": financials,
             "balance": balance,
             "cashflow": cashflow,

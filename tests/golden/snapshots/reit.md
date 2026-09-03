@@ -29,7 +29,8 @@
 ## 3. NAV Valuation Bridge
 
 - NOI (последний год): 200.0 млн. USD
-- Применённый Cap Rate: 6.50% (Default)
+- NOI, использован в Property Value (среднее за 2 года): 200.0 млн. USD
+- Применённый Cap Rate: 6.50% (Default: 2.5% spread + 4.0% Rf)
 - Property Value = NOI / Cap Rate: 3,076.9 млн. USD
 - Плюс: Cash: 20.0 млн. USD
 - Плюс: Receivables: 10.0 млн. USD

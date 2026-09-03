@@ -29,6 +29,7 @@ def make_data(
     revenue=(1000.0, 1000.0, 1000.0, 1000.0),
     operating_income=(200.0, 200.0, 200.0, 200.0),
     net_income=(150.0, 150.0, 150.0, 150.0),
+    normalized_income=None,
     eps=(2.0, 2.0, 2.0, 2.0),
     interest_expense=None,
     curr_assets=(500.0, 500.0, 500.0, 500.0),
@@ -38,6 +39,7 @@ def make_data(
     goodwill=(0.0, 0.0, 0.0, 0.0),
     equity=(1200.0, 1200.0, 1200.0, 1200.0),
     long_term_debt=(100.0, 100.0, 100.0, 100.0),
+    lease_liabilities=None,
     cash=(300.0, 300.0, 300.0, 300.0),
     fcf=(180.0, 180.0, 180.0, 180.0),
     diluted_shares=(105.0, 104.0, 102.0, 100.0),
@@ -45,6 +47,8 @@ def make_data(
     cash_dividends_paid=None,
     dividend_yield=0.0,
     dividend_rate=0.0,
+    industry="",
+    sector="",
 ):
     """Flat, healthy 4-year baseline with a steadily shrinking share count
     (buyback in progress) by default - zero sins otherwise, DCF valuation,
@@ -59,6 +63,8 @@ def make_data(
     }
     if interest_expense is not None:
         fin_rows["Interest Expense"] = list(interest_expense)
+    if normalized_income is not None:
+        fin_rows["Normalized Income"] = list(normalized_income)
     bal_rows = {
         "Total Current Assets": list(curr_assets),
         "Total Current Liabilities": list(curr_liab),
@@ -69,6 +75,8 @@ def make_data(
         "Long Term Debt": list(long_term_debt),
         "Cash And Cash Equivalents": list(cash),
     }
+    if lease_liabilities is not None:
+        bal_rows["Long Term Capital Lease Obligation"] = list(lease_liabilities)
     if current_debt is not None:
         bal_rows["Current Debt"] = list(current_debt)
     cf_rows = {"Free Cash Flow": list(fcf)}
@@ -81,7 +89,10 @@ def make_data(
         "price": 50.0,
         "shares": 100.0,
         "beta": 1.0,
-        "info": {"dividendYield": dividend_yield, "dividendRate": dividend_rate},
+        "info": {
+            "dividendYield": dividend_yield, "dividendRate": dividend_rate,
+            "industry": industry, "sector": sector,
+        },
     }
 
 

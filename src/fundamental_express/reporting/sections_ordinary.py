@@ -152,11 +152,12 @@ def _fundamentals_section(m, trading_ccy, ticker):
             row("Акционерный капитал", [v / 1e6 for v in m.equity]),
             row("Free Cash Flow", [v / 1e6 for v in m.fcf]),
         ])
+        note = f"\n\n> {m.nonrecurring_note}" if m.nonrecurring_note else ""
         return f"""## 2. Экспресс-анализ финансовых результатов и баланса
 
 Показатели в млн. {trading_ccy}.
 
-{table_rows}"""
+{table_rows}{note}"""
 
     def flowables():
         body_style = ParagraphStyle("Body", **_BODY)
@@ -176,27 +177,67 @@ def _fundamentals_section(m, trading_ccy, ticker):
             ["Чистый Свободный кэш (Free Cash Flow)"] + [f"{m.fcf.iloc[i] / 1e6:,.1f}" for i in last4],
         ]
         chart_img_path = generate_fcf_chart(year_labels, m.fcf.values, m.proj_years, m.projected_fcfs, ticker)
-        return [
+        flowable_items = [
             Paragraph(
                 "Ниже представлена сводная таблица фундаментальных показателей компании за последние 4 отчетных года. "
                 "Основной упор сделан на динамику изменения капитала, ликвидности и денежных потоков.",
                 body_style,
             ),
             create_reportlab_table(headers, rows, {}, COLORS, col_widths=[190, 70, 70, 70, 70]),
+        ]
+        if m.nonrecurring_note:
+            flowable_items.append(Spacer(1, 6))
+            flowable_items.append(Paragraph(m.nonrecurring_note, body_style))
+        flowable_items += [
             Spacer(1, 10),
             Image(chart_img_path, width=USABLE_W, height=USABLE_W * 0.4),
         ]
+        return flowable_items
 
     return Section("Экспресс-анализ финансовых результатов и баланса", markdown, flowables)
 
 
+def _graham_note(m, trading_ccy):
+    """V10 (docs/spec/issues/V10-graham-number-reproducible.md): plain text
+    for the Graham Number line - справочно, вне основной методики, never
+    feeds the sins checklist or the DCF/DDM verdict. Shared between the
+    markdown and flowables renderings below."""
+    if m.graham_value is None:
+        return (
+            "Справочно (вне основной методики): Число Грэма недоступно "
+            f"(EPS({m.graham_eps_label}) ≤ 0 или tangible BVPS ≤ 0)."
+        )
+    deviation = (m.graham_value - m.valuation.price) / m.valuation.price * 100 if m.valuation.price else 0.0
+    verdict = "недооценена" if deviation > 0 else "переоценена"
+    return (
+        f"Справочно (вне основной методики): Число Грэма = √(22.5 × EPS({m.graham_eps_label}) × "
+        f"tangible BVPS) = {m.graham_value:.2f} {trading_ccy} (EPS={m.graham_eps:.2f}, tangible BVPS="
+        f"{m.graham_tangible_bvps:.2f}) — цена {verdict} относительно Числа Грэма на {abs(deviation):.1f}%."
+    )
+
+
 def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
+    # V08 (docs/spec/issues/V08-beta-sanity-check.md): flags when beta was
+    # replaced by the 1.1 sanity fallback (source value NaN, <-1.0, >3.0),
+    # so a reader isn't left trusting a Ke built on a broken beta with no
+    # visible sign anything was adjusted.
+    beta_note = " (β скорректирована — исходное значение вне разумного диапазона)" if m.valuation.beta_is_fallback else ""
     ke_disclosure = (
         f"Ke = задано инвестором (--required-return) = {m.valuation.cost_of_equity * 100:.2f}%"
         if m.valuation.required_return_used
-        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%"
+        else f"Ke = Rf + β×ERP = 4% + {m.valuation.beta:.2f}×5% = {m.valuation.cost_of_equity * 100:.2f}%{beta_note}"
     )
     is_ddm = m.valuation.valuation_model == "DDM"
+    # V05 (docs/spec/issues/V05-implied-cost-of-debt.md): distinguishes an
+    # implied Kd (from the company's own Interest Expense / Debt) from the
+    # flat-fallback Kd, so two tickers that happen to land on the same Kd
+    # value aren't shown identically when one arrived there by calculation
+    # and the other by fallback.
+    kd_source_note = (
+        f"{m.cost_of_debt * 100:.2f}% implied по компании (Interest Expense / Долг)"
+        if m.cost_of_debt_is_implied
+        else f"{m.cost_of_debt * 100:.2f}% fallback методики (нет данных по Interest Expense/Долгу)"
+    )
 
     def markdown():
         if is_ddm:
@@ -207,10 +248,35 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
 - {ke_disclosure}
 - Темп роста дивидендов (CAGR_div, лог-регрессия по годам, ограничен 2.0%-10.0%): {m.cagr_div * 100:.2f}%
 - DPS последнего года (Dividends Paid / Diluted Shares): {m.dps_last:.2f} {trading_ccy}
-- Терминальный темп роста (Gordon Growth): 2.5%
+- Терминальный темп роста (Gordon Growth): {m.terminal_g * 100:.2f}% ({m.terminal_g_label})
 
 **Справедливая стоимость по DDM: {m.valuation.fair_value_share:.2f} {trading_ccy}**
-Текущая рыночная цена: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) | Статус: **{m.valuation.val_status}**"""
+Текущая рыночная цена: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) | Статус: **{m.valuation.val_status}**
+
+> {_graham_note(m, trading_ccy)}"""
+
+        # V04: lease-inclusive fair value - always a secondary figure when
+        # computable, promoted to headline for a lease-heavy sector (see
+        # docs/spec/issues/V04-lease-adjusted-net-debt.md). The two labels
+        # below always show whichever number is NOT already the headline
+        # "Справедливая стоимость акции" line above, so a reviewer always
+        # sees both, never just one.
+        lease_incl_line = ""
+        lease_headline_suffix = ""
+        if m.fair_value_share_incl_leases is not None:
+            if m.lease_heavy_sector:
+                lease_incl_line = (
+                    f"\n- Fair value без учёта аренды как долга (справочно): "
+                    f"{m.fair_value_share_excl_leases:.2f} {trading_ccy}"
+                )
+                lease_headline_suffix = (
+                    " (headline - с учётом обязательств по аренде как долга: лизинг-тяжёлый сектор)"
+                )
+            else:
+                lease_incl_line = (
+                    f"\n- Fair value с учётом аренды как долга (справочно): "
+                    f"{m.fair_value_share_incl_leases:.2f} {trading_ccy}"
+                )
 
         debt_block = "\n".join(f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy))
         sens_header = "| " + " | ".join(m.sensitivity_headers) + " |"
@@ -219,23 +285,25 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
         return f"""## 3. Модель дисконтирования денежных потоков (DCF)
 
 - Стоимость собственного капитала: {ke_disclosure}
-- Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
+- Стоимость долга после налога: Kd×(1-T) = {m.cost_of_debt * 100:.2f}%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% (Kd={kd_source_note}; T=21% — фиксированное допущение методики, не эффективная налоговая ставка компании)
 - Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m.equity_weight * 100:.1f}%, D/(D+E) = {m.debt_weight * 100:.1f}%
 - **WACC:** {m.equity_weight * 100:.1f}%×{m.valuation.cost_of_equity * 100:.2f}% + {m.debt_weight * 100:.1f}%×{m.cost_of_debt_after_tax * 100:.2f}% = **{m.wacc * 100:.2f}%**
 - CAGR роста FCF: {m.cagr * 100:.2f}% (лог-регрессия по годам, ограничена 2-15%)
-- Терминальный темп роста: 2.5%
+- Терминальный темп роста: {m.terminal_g * 100:.2f}% ({m.terminal_g_label})
 
 {debt_block}
 
 > {LEASE_ASSUMPTION_NOTE}
 
 - Enterprise Value: {m.enterprise_value / 1e9:,.2f} млрд. {trading_ccy}
-- Equity Value: {m.equity_value / 1e9:,.2f} млрд. {trading_ccy}
+- Equity Value: {m.equity_value / 1e9:,.2f} млрд. {trading_ccy}{lease_incl_line}
 
-**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**
+**Справедливая стоимость акции: {m.valuation.fair_value_share:.2f} {trading_ccy}**{lease_headline_suffix}
 Последняя доступная рыночная котировка: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) | Статус: **{m.valuation.val_status}**
 
-### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на 2.5% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
+> {_graham_note(m, trading_ccy)}
+
+### Матрица чувствительности (г — рост явного 5-летнего прогноза FCF; терминальный рост фиксирован на {m.terminal_g * 100:.2f}% и используется только в формуле Гордона — условие WACC > g не требуется для этой матрицы)
 
 {sens_header}
 {sens_sep}
@@ -251,7 +319,7 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
                 f"• <b>Темп роста дивидендов (CAGR_div, лог-регрессия по годам, ограничен 2.0%-10.0%):</b> {m.cagr_div * 100:.2f}%<br/>"
                 f"• <b>DPS последнего года (Dividends Paid / Diluted Shares):</b> {m.dps_last:.2f} {trading_ccy}<br/>"
-                f"• <b>Терминальный темп роста (Gordon Growth):</b> 2.5%<br/>"
+                f"• <b>Терминальный темп роста (Gordon Growth):</b> {m.terminal_g * 100:.2f}% ({m.terminal_g_label})<br/>"
             )
             val_banner_text = (
                 f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ ПО DDM: {m.valuation.fair_value_share:.2f} {trading_ccy}</b><br/>"
@@ -265,20 +333,27 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                     val_banner_text, USABLE_W, COLORS,
                     ParagraphStyle("ValB", parent=callout_style, fontSize=10, leading=14), val_color,
                 ),
+                Spacer(1, 6),
+                Paragraph(_graham_note(m, trading_ccy), body_style),
             ]
 
         debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in _debt_lines(m, trading_ccy))
         dcf_info_text = (
             f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
-            f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = 4.5%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% "
-            f"(Kd=4.5%, T=21% — фиксированные допущения методики, не эффективная налоговая ставка компании)<br/>"
+            f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = {m.cost_of_debt * 100:.2f}%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% "
+            f"(Kd={kd_source_note}; T=21% фиксированное допущение)<br/>"
             f"• <b>Веса структуры капитала:</b> E/(D+E) = {m.equity_weight * 100:.1f}%, D/(D+E) = {m.debt_weight * 100:.1f}% "
             f"(по рыночной капитализации, не по балансовому капиталу — у компаний с отрицательным book equity вес по балансу был бы недействителен)<br/>"
             f"• <b>Итоговый WACC:</b> {m.equity_weight * 100:.1f}%×{m.valuation.cost_of_equity * 100:.2f}% + {m.debt_weight * 100:.1f}%×{m.cost_of_debt_after_tax * 100:.2f}% = <b>{m.wacc * 100:.2f}%</b><br/>"
             f"• <b>Расчетный CAGR роста потока:</b> {m.cagr * 100:.2f}% (лог-регрессия по годам, ограничен консервативной границей)<br/>"
-            f"• <b>Терминальный темп роста:</b> 2.5% (пожизненный темп роста компании в постпрогнозный период)<br/>"
+            f"• <b>Терминальный темп роста:</b> {m.terminal_g * 100:.2f}% ({m.terminal_g_label}, пожизненный темп роста компании в постпрогнозный период)<br/>"
             f"{debt_html}<br/>"
             f"• <b>Справедливая оценка акционерного капитала:</b> {m.equity_value / 1e9:,.2f} млрд. {trading_ccy} (Enterprise Value = {m.enterprise_value / 1e9:,.2f} млрд. {trading_ccy})<br/>"
+            + (
+                f"• <b>Fair value {'без' if m.lease_heavy_sector else 'с'} учётом аренды как долга (справочно):</b> "
+                f"{(m.fair_value_share_excl_leases if m.lease_heavy_sector else m.fair_value_share_incl_leases):.2f} {trading_ccy}<br/>"
+                if m.fair_value_share_incl_leases is not None else ""
+            )
         )
         val_banner_text = (
             f"<b>СПРАВЕДЛИВАЯ СТОИМОСТЬ АКЦИИ: {m.valuation.fair_value_share:.2f} {trading_ccy}</b><br/>"
@@ -297,6 +372,8 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 val_banner_text, USABLE_W, COLORS,
                 ParagraphStyle("ValB", parent=callout_style, fontSize=10, leading=14), val_color,
             ),
+            Spacer(1, 6),
+            Paragraph(_graham_note(m, trading_ccy), body_style),
             Spacer(1, 10),
             create_reportlab_table(
                 ["Прогнозный показатель", "Год 1", "Год 2", "Год 3", "Год 4", "Год 5"],

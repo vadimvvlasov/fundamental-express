@@ -50,6 +50,10 @@ class ValuationResult:
     valuation_model: str | None = None
     cost_of_equity: float | None = None
     required_return_used: bool | None = None
+    # V08 (docs/spec/issues/V08-beta-sanity-check.md): True when `beta`
+    # above is the 1.1 sanity fallback (source beta was NaN, <-1.0, or
+    # >3.0), not Yahoo's raw value - lets the Ke disclosure say so.
+    beta_is_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,19 @@ class OrdinaryMetrics:
     cagr_div: float | None
     dps_last: float | None
     debt_to_equity_ratio: float | None
+    nonrecurring_note: str | None = None
+    net_debt_incl_leases: float | None = None
+    fair_value_share_incl_leases: float | None = None
+    fair_value_share_excl_leases: float | None = None
+    lease_heavy_sector: bool = False
+    cost_of_debt: float | None = None
+    cost_of_debt_is_implied: bool = False
+    terminal_g: float = 0.025
+    terminal_g_label: str = "Default"
+    graham_value: float | None = None
+    graham_eps: float | None = None
+    graham_eps_label: str = "FY"
+    graham_tangible_bvps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +141,13 @@ class BankMetrics:
     current_ratio: None = None
     net_margin_pct: None = None
     kind: str = "bank"
+    nonrecurring_note: str | None = None
+    terminal_g: float = 0.025
+    terminal_g_label: str = "Default"
+    graham_value: float | None = None
+    graham_eps: float | None = None
+    graham_eps_label: str = "FY"
+    graham_tangible_bvps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -161,3 +185,5 @@ class ReitMetrics:
     current_ratio: None = None
     net_margin_pct: None = None
     kind: str = "reit"
+    avg_noi: float | None = None
+    avg_noi_years: int = 1

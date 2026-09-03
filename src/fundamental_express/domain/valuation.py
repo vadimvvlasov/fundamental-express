@@ -18,6 +18,44 @@ import pandas as pd
 
 from fundamental_express.domain.metrics import ValuationResult
 
+# V06 (docs/spec/issues/V06-reit-cap-rate-rate-regime.md): a single shared
+# risk-free rate - before this, ordinary_dcf_valuation and bank_valuation
+# each hardcoded the same 0.04 literal independently (not a shared
+# constant, just the same number typed twice), so editing one had zero
+# effect on the other. Now both read this, and REIT_CAP_RATE_MATRIX's
+# spreads (below) are defined relative to it too - changing RF_RATE moves
+# Ordinary/Bank Ke *and* REIT cap rates together.
+RF_RATE = 0.04
+
+# V09 (docs/spec/issues/V09-sector-terminal-growth.md): terminal (Gordon
+# Growth) rate by sector/industry keyword, first match wins - mirrors
+# REIT_CAP_RATE_MATRIX's shape/lookup pattern below. An unmatched
+# sector/industry resolves to TERMINAL_GROWTH_DEFAULT (2.5%) - the exact
+# pre-V09 flat rate every ticker got, so this task is a byte-identical
+# no-op for anything that doesn't match a bucket. Shared by
+# ordinary_dcf_valuation and bank_valuation (both take `info`) - if
+# bank-specific buckets ever prove necessary, that's a refinement to this
+# matrix's entries, not a reason to fork two matrices without evidence.
+TERMINAL_GROWTH_MATRIX = [
+    (("utilities", "utility"), 0.015, "Utilities — зрелый регулируемый сектор"),
+    (("consumer staples", "consumer defensive", "food", "beverage", "household"), 0.020, "Consumer Staples — стабильный спрос"),
+    (("technology", "software", "semiconductor", "communication services", "internet"), 0.030, "Technology/Communication — структурный рост"),
+]
+TERMINAL_GROWTH_DEFAULT = 0.025
+TERMINAL_GROWTH_DEFAULT_LABEL = "Default"
+
+
+def _terminal_growth(info):
+    """Sector-bucketed terminal growth lookup (V09) - same keyword-matching
+    convention as _reit_cap_rate() below (first match wins, matrix order
+    matters on overlap). Returns (rate, label)."""
+    info = info or {}
+    haystack = " ".join(str(info.get(k) or "") for k in ("industry", "sector")).lower()
+    for keywords, rate, label in TERMINAL_GROWTH_MATRIX:
+        if any(kw in haystack for kw in keywords):
+            return rate, label
+    return TERMINAL_GROWTH_DEFAULT, TERMINAL_GROWTH_DEFAULT_LABEL
+
 
 def _regression_cagr(values, lo, hi, default):
     """Multi-year log-linear regression CAGR (V02,
@@ -55,10 +93,14 @@ def _regression_cagr(values, lo, hi, default):
     return max(lo, min(hi, growth))
 
 
+FALLBACK_COST_OF_DEBT = 0.045
+_COST_OF_DEBT_LO, _COST_OF_DEBT_HI = 0.02, 0.12
+
+
 def ordinary_dcf_valuation(
     fcf, price, shares, beta, required_return, latest_debt, net_debt,
     latest_equity, diluted_shares, cash_dividends_paid, info,
-    tangible_equity=None,
+    tangible_equity=None, interest_expense=None, beta_is_fallback=False,
 ):
     """CAPM/WACC/DCF fair value, with the Ordinary v3 auto-switch to DDM
     for a dividend-paying company with a distorted capital structure (spec
@@ -78,12 +120,26 @@ def ordinary_dcf_valuation(
     fcf_values = fcf.values
     cagr = _regression_cagr(fcf_values, 0.02, 0.15, 0.05)
 
-    rf_rate = 0.04
+    rf_rate = RF_RATE
     erp = 0.05
     # --required-return lets the investor override CAPM entirely with their
     # own required rate of return, bypassing the beta-driven Ke formula.
     cost_of_equity = required_return if required_return is not None else rf_rate + beta * erp
-    cost_of_debt = 0.045
+
+    # V05 (docs/spec/issues/V05-implied-cost-of-debt.md): implied Kd from
+    # the company's own Interest Expense / Debt, clamped to a sane range -
+    # falls back to the flat FALLBACK_COST_OF_DEBT when either input is
+    # missing/non-positive. cost_of_debt_is_implied feeds the report
+    # disclosure so a reviewer can tell which case applied, not just see
+    # a number that happens to match the fallback by coincidence.
+    cost_of_debt_is_implied = (
+        interest_expense is not None and not pd.isna(interest_expense)
+        and interest_expense > 0 and not pd.isna(latest_debt) and latest_debt > 0
+    )
+    if cost_of_debt_is_implied:
+        cost_of_debt = max(_COST_OF_DEBT_LO, min(_COST_OF_DEBT_HI, interest_expense / latest_debt))
+    else:
+        cost_of_debt = FALLBACK_COST_OF_DEBT
     tax_rate = 0.21
     after_tax_debt = cost_of_debt * (1 - tax_rate)
 
@@ -109,7 +165,7 @@ def ordinary_dcf_valuation(
         pv_fcfs.append(pv_fcf)
 
     sum_pv_fcfs = sum(pv_fcfs)
-    terminal_g = 0.025
+    terminal_g, terminal_g_label = _terminal_growth(info)
     terminal_val = (
         projected_fcfs[-1] * (1 + terminal_g) / (wacc - terminal_g)
         if wacc > terminal_g
@@ -230,13 +286,18 @@ def ordinary_dcf_valuation(
         valuation_model=valuation_model,
         cost_of_equity=cost_of_equity,
         required_return_used=required_return is not None,
+        beta_is_fallback=beta_is_fallback,
     )
     extras = {
         "wacc": wacc,
+        "cost_of_debt": cost_of_debt,
+        "cost_of_debt_is_implied": cost_of_debt_is_implied,
         "cost_of_debt_after_tax": after_tax_debt,
         "equity_weight": w_equity,
         "debt_weight": w_debt,
         "cagr": cagr,
+        "terminal_g": terminal_g,
+        "terminal_g_label": terminal_g_label,
         "proj_years": proj_years,
         "projected_fcfs": projected_fcfs,
         "pv_fcfs": pv_fcfs,
@@ -253,7 +314,7 @@ def ordinary_dcf_valuation(
 
 def bank_valuation(
     required_return, beta, info, common_dividends_paid, diluted_shares, latest_equity, shares, net_income, price,
-    tangible_equity=None,
+    tangible_equity=None, beta_is_fallback=False,
 ):
     """DDM (dividend-paying bank) or ROE/P-B (non-payer) fair value (spec
     Section 5, docs/spec/step2-bank-analyzer-implementation-spec.md). Moved
@@ -266,11 +327,11 @@ def bank_valuation(
     def _cost_of_equity():
         if required_return is not None:
             return required_return
-        ke = 0.04 + beta * 0.05
+        ke = RF_RATE + beta * 0.05
         return max(0.05, min(0.15, ke))
 
     cost_of_equity = _cost_of_equity()
-    terminal_g = 0.025
+    terminal_g, terminal_g_label = _terminal_growth(info)
 
     dividend_yield = info.get("dividendYield") or 0.0
     latest_common_div_paid = (
@@ -348,23 +409,31 @@ def bank_valuation(
         valuation_model=valuation_model,
         cost_of_equity=cost_of_equity,
         required_return_used=required_return is not None,
+        beta_is_fallback=beta_is_fallback,
     )
     extras = {
         "cagr_div": cagr_div,
         "dps_last": dps_last,
         "bvps": bvps,
         "roe": roe,
+        "terminal_g": terminal_g,
+        "terminal_g_label": terminal_g_label,
     }
     return valuation, extras
 
 
+# V06 (docs/spec/issues/V06-reit-cap-rate-rate-regime.md): values here are
+# SPREADS over RF_RATE, not standalone cap rates - cap_rate = spread +
+# RF_RATE (composed in _reit_cap_rate() below). With RF_RATE at 0.04 these
+# spreads reproduce the exact pre-V06 hardcoded rates (5.5%/6.0%/6.5%/7.0%)
+# - this task changes what the number is derived from, not its value.
 REIT_CAP_RATE_MATRIX = [
-    (("industrial", "logistic", "warehouse"), 0.055, "Industrial / Logistics"),
-    (("residential", "apartment"), 0.060, "Residential"),
-    (("healthcare", "medical", "health care"), 0.065, "Healthcare / Medical"),
-    (("office", "retail", "mall"), 0.070, "Office / Retail / Malls"),
+    (("industrial", "logistic", "warehouse"), 0.015, "Industrial / Logistics"),
+    (("residential", "apartment"), 0.020, "Residential"),
+    (("healthcare", "medical", "health care"), 0.025, "Healthcare / Medical"),
+    (("office", "retail", "mall"), 0.030, "Office / Retail / Malls"),
 ]
-REIT_DEFAULT_CAP_RATE = 0.065
+REIT_DEFAULT_CAP_RATE_SPREAD = 0.025
 REIT_DEFAULT_CAP_RATE_LABEL = "Default"
 
 
@@ -374,16 +443,25 @@ def _reit_cap_rate(info):
     then a conservative median-by-specialization matrix keyed off industry/
     sector keywords, first match wins. Never invents a company-specific
     rate beyond this - real REITs report their own portfolio cap rate in
-    investor materials, not through yfinance."""
+    investor materials, not through yfinance.
+
+    Returns (cap_rate, label) - label is a plain category name for the
+    explicit/matrix-miss cases, or a composed "spread + Rf" string for a
+    matrix hit, so the report can show the rate's makeup (V06) rather than
+    one opaque percentage."""
     info = info or {}
     explicit = info.get("capRate")
     if explicit:
         return float(explicit), "Explicit (info.capRate)"
     haystack = " ".join(str(info.get(k) or "") for k in ("industry", "sector", "longBusinessSummary")).lower()
-    for keywords, rate, label in REIT_CAP_RATE_MATRIX:
+    for keywords, spread, category_label in REIT_CAP_RATE_MATRIX:
         if any(kw in haystack for kw in keywords):
-            return rate, label
-    return REIT_DEFAULT_CAP_RATE, REIT_DEFAULT_CAP_RATE_LABEL
+            cap_rate = spread + RF_RATE
+            label = f"{category_label}: {spread * 100:.1f}% spread + {RF_RATE * 100:.1f}% Rf"
+            return cap_rate, label
+    cap_rate = REIT_DEFAULT_CAP_RATE_SPREAD + RF_RATE
+    label = f"{REIT_DEFAULT_CAP_RATE_LABEL}: {REIT_DEFAULT_CAP_RATE_SPREAD * 100:.1f}% spread + {RF_RATE * 100:.1f}% Rf"
+    return cap_rate, label
 
 
 def reit_nav_valuation(info, noi, cash, receivables, construction_in_progress, total_liab, shares, price, ffo, diluted_shares, beta):
@@ -399,8 +477,18 @@ def reit_nav_valuation(info, noi, cash, receivables, construction_in_progress, t
     cap_rate_label/property_value/nav/ffo_per_share/p_ffo.
     """
     cap_rate, cap_rate_label = _reit_cap_rate(info)
-    latest_noi = noi.iloc[-1]
-    property_value = latest_noi / cap_rate if cap_rate else 0.0
+    # V07 (docs/spec/issues/V07-reit-trailing-average.md): trailing
+    # 3-year average NOI instead of a single snapshot year - a one-off
+    # vacancy spike or lease-expiration cluster in the latest year alone
+    # otherwise moves the entire property_value (and so most of NAV), since
+    # it's by far the largest term below. Degrades gracefully to whatever
+    # years are actually available (1-2 years -> average of those).
+    # ffo/ffo_per_share/p_ffo deliberately still use the single latest year
+    # (see the module docstring correction in V07's issue) - only NOI
+    # (which alone feeds property_value/fair value) is smoothed here.
+    noi_window = noi.dropna().iloc[-3:]
+    avg_noi = noi_window.mean() if len(noi_window) else noi.iloc[-1]
+    property_value = avg_noi / cap_rate if cap_rate else 0.0
     latest_cash = cash.iloc[-1] if not pd.isna(cash.iloc[-1]) else 0.0
     latest_receivables = receivables.iloc[-1] if not pd.isna(receivables.iloc[-1]) else 0.0
     latest_cip = construction_in_progress.iloc[-1] if not pd.isna(construction_in_progress.iloc[-1]) else 0.0
@@ -438,6 +526,8 @@ def reit_nav_valuation(info, noi, cash, receivables, construction_in_progress, t
         "cap_rate": cap_rate,
         "cap_rate_label": cap_rate_label,
         "property_value": property_value,
+        "avg_noi": avg_noi,
+        "avg_noi_years": len(noi_window) if len(noi_window) else 1,
         "nav": nav,
         "ffo_per_share": ffo_per_share,
         "p_ffo": p_ffo,

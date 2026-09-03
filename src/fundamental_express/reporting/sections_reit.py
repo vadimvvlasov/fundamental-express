@@ -32,6 +32,11 @@ def _reit_nav_bridge_rows(m, trading_ccy):
     markdown and flowables renderings of Section 3."""
     return [
         ("NOI (последний год)", f"{m.noi.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
+        (
+            f"NOI, использован в Property Value (среднее за {m.avg_noi_years} "
+            f"{'год' if m.avg_noi_years == 1 else 'года' if m.avg_noi_years < 5 else 'лет'})",
+            f"{m.avg_noi / 1e6:,.1f} млн. {trading_ccy}",
+        ),
         ("Применённый Cap Rate", f"{m.cap_rate * 100:.2f}% ({m.cap_rate_label})"),
         ("Property Value = NOI / Cap Rate", f"{m.property_value / 1e6:,.1f} млн. {trading_ccy}"),
         ("Плюс: Cash", f"{m.cash.iloc[-1] / 1e6:,.1f} млн. {trading_ccy}"),
