@@ -1,4 +1,4 @@
-# Fundamental Express Analyzer
+clrkf# Fundamental Express Analyzer
 
 Автоматизированный фундаментальный анализ по методике экспресс-анализа (чеклист «грехов» баланса/кэш-флоу)
 + DCF-оценка справедливой стоимости (CAPM WACC). Данные — только реальные, с Yahoo Finance

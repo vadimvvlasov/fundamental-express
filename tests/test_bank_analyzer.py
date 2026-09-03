@@ -40,6 +40,7 @@ def make_bank_data(
     total_deposits=(2500.0, 2500.0, 2500.0, 2500.0),
     total_borrowings=(400.0, 400.0, 400.0, 400.0),
     shareholders_equity=(1000.0, 1000.0, 1000.0, 1000.0),
+    goodwill=(0.0, 0.0, 0.0, 0.0),
     cash_dividends_paid=(-50.0, -50.0, -50.0, -50.0),
     price=50.0,
     shares=100.0,
@@ -70,6 +71,7 @@ def make_bank_data(
         "Total Deposits": list(total_deposits),
         "Long Term Debt": list(total_borrowings),
         "Stockholders Equity": list(shareholders_equity),
+        "Goodwill": list(goodwill),
     }
     cf_rows = {}
     if cash_dividends_paid is not None:
@@ -143,6 +145,38 @@ def test_roe_pb_liquidation_discount_when_roe_non_positive():
     assert m.roe <= 0
     bvps = 1000.0 / 100.0
     assert m.valuation.fair_value_share == pytest.approx(0.1 * bvps)
+
+
+# ── V01: tangible equity (goodwill-adjusted) drives the roe<=0 floor ────
+
+def test_roe_pb_liquidation_discount_uses_tangible_bvps_not_raw():
+    # Raw bvps = 1000/100 = 10.0; tangible bvps = (1000-400)/100 = 6.0.
+    # Floor must use the tangible figure, not the goodwill-inflated raw one.
+    m = compute_bank_metrics(make_bank_data(
+        cash_dividends_paid=None, dividend_yield=0.0,
+        net_income=(150.0, 150.0, 150.0, -20.0),
+        goodwill=(400.0, 400.0, 400.0, 400.0),
+    ))
+    assert m.valuation.valuation_model == "ROE_PB"
+    assert m.roe <= 0
+    tangible_bvps = (1000.0 - 400.0) / 100.0
+    assert m.valuation.fair_value_share == pytest.approx(0.1 * tangible_bvps)
+
+
+def test_roe_pb_main_branch_is_noop_regardless_of_goodwill():
+    # roe > 0 branch: bvps * (roe/Ke) - equity cancels out algebraically
+    # (bvps=equity/shares, roe=NI/equity), so goodwill must NOT move the
+    # fair value here, only the displayed BVPS/roe would differ if raw
+    # figures were swapped for tangible ones (they aren't, by design).
+    baseline = compute_bank_metrics(make_bank_data(cash_dividends_paid=None, dividend_yield=0.0))
+    with_goodwill = compute_bank_metrics(make_bank_data(
+        cash_dividends_paid=None, dividend_yield=0.0,
+        goodwill=(400.0, 400.0, 400.0, 400.0),
+    ))
+    assert with_goodwill.valuation.valuation_model == "ROE_PB"
+    assert with_goodwill.valuation.fair_value_share == pytest.approx(baseline.valuation.fair_value_share)
+    # Displayed BVPS stays raw (unadjusted) in the main branch either way.
+    assert with_goodwill.bvps == pytest.approx(baseline.bvps)
 
 
 def test_ddm_selected_via_dividend_yield_even_with_zero_cash_div_paid():

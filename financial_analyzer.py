@@ -162,6 +162,9 @@ def compute_metrics(data, required_return=None):
     total_assets = find_row(df_bal, ["total assets"])
     total_liab = find_row(df_bal, ["total liabilities"], default_val=float("nan"))
     goodwill = find_row(df_bal, ["goodwill"])
+    # V01: separate "Other Intangible Assets" row, when yfinance exposes one
+    # distinctly from Goodwill - feeds tangible_equity below alongside it.
+    other_intangibles = find_row(df_bal, ["other intangible assets"], default_val=0.0)
     equity = find_row(df_bal, ["stockholders equity", "total stockholders equity"])
     # "Total Debt" from yfinance bundles in capitalized lease obligations
     # (ASC 842) alongside interest-bearing debt. We treat interest-bearing
@@ -233,6 +236,7 @@ def compute_metrics(data, required_return=None):
         total_assets = total_assets * fx_rate
         total_liab = total_liab * fx_rate
         goodwill = goodwill * fx_rate
+        other_intangibles = other_intangibles * fx_rate
         equity = equity * fx_rate
         debt = debt * fx_rate
         cash = cash * fx_rate
@@ -260,6 +264,11 @@ def compute_metrics(data, required_return=None):
     # comparing long-term assets to long-term liabilities.
     long_term_assets_adj = (total_assets - curr_assets) - goodwill
     long_term_liab = (total_liab - curr_liab) if not total_liab.isna().all() else None
+
+    # V01: tangible equity - same goodwill exclusion as long_term_assets_adj
+    # above, now also feeding the DCF's D/E distress trigger (see
+    # docs/spec/issues/V01-tangible-equity-distress-triggers.md).
+    tangible_equity = equity - goodwill - other_intangibles
 
     # Net debt - moved ahead of the sins checklist (Ordinary v3, Step 4):
     # the Current Ratio smart-bypass Scenario 2 needs it for the Net Debt /
@@ -309,9 +318,11 @@ def compute_metrics(data, required_return=None):
 
     # ── DCF valuation (CAPM WACC, Ordinary v3 DDM auto-switch, sensitivity) ─
     # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12c).
+    latest_tangible_equity = tangible_equity.iloc[-1] if len(tangible_equity) else float("nan")
     valuation, val_extras = ordinary_dcf_valuation(
         fcf, price, shares, beta, required_return, latest_debt, net_debt,
         latest_equity, diluted_shares, cash_dividends_paid, data.get("info"),
+        tangible_equity=latest_tangible_equity,
     )
     cost_of_equity = valuation.cost_of_equity
     fair_value_share = valuation.fair_value_share
@@ -474,6 +485,13 @@ def compute_bank_metrics(data, required_return=None):
     shareholders_equity = find_row(df_bal, [
         "Stockholders Equity", "Total Stockholders Equity", "Shareholders Equity",
     ], default_val=float("nan"))
+    # V01: goodwill wasn't parsed anywhere in the Bank path before this -
+    # only Ordinary's compute_metrics() had it. Feeds tangible_equity below,
+    # used by bank_valuation()'s roe<=0 floor (a goodwill-heavy bank's raw
+    # bvps otherwise inflates that floor - see
+    # docs/spec/issues/V01-tangible-equity-distress-triggers.md).
+    goodwill = find_row(df_bal, ["Goodwill"], default_val=0.0)
+    other_intangibles = find_row(df_bal, ["Other Intangible Assets"], default_val=0.0)
 
     # ── Common dividends paid (for DDM DPS) ─────────────────────────────
     # yfinance has no dedicated "Common Dividends Paid" line for banks - only
@@ -505,6 +523,8 @@ def compute_bank_metrics(data, required_return=None):
         total_deposits = total_deposits * fx_rate
         total_borrowings = total_borrowings * fx_rate
         shareholders_equity = shareholders_equity * fx_rate
+        goodwill = goodwill * fx_rate
+        other_intangibles = other_intangibles * fx_rate
         common_dividends_paid = common_dividends_paid * fx_rate
 
     # ── Bank sins checklist (condition checks + registry-driven scoring) ──
@@ -525,9 +545,14 @@ def compute_bank_metrics(data, required_return=None):
 
     # ── Section 5: Fair value (DDM or ROE/P-B) ──────────────────────────
     # Moved to src/fundamental_express/domain/valuation.py (docs/spec/refactor-tasks.md T12d).
+    tangible_equity_series = shareholders_equity - goodwill - other_intangibles
+    latest_tangible_equity = (
+        tangible_equity_series.iloc[-1] if len(tangible_equity_series) else float("nan")
+    )
     valuation, val_extras = bank_valuation(
         required_return, beta, info, common_dividends_paid, diluted_shares,
         latest_equity, shares, net_income, price,
+        tangible_equity=latest_tangible_equity,
     )
     cost_of_equity = valuation.cost_of_equity
     fair_value_share = valuation.fair_value_share
@@ -774,18 +799,6 @@ from fundamental_express.domain.valuation import (  # noqa: E402
     _peg_assessment,
 )
 
-# ── UNIFIED MARKDOWN/PDF RENDERERS (docs/spec/refactor-tasks.md T19/T20) ─
-# build_markdown_report()/build_bank_markdown_report()/build_reit_markdown_report()
-# and the ReportLab document-assembly portion of build_pdf_report()/
-# build_bank_pdf_report()/build_reit_pdf_report() are deleted - replaced by
-# one render()/write() per format, driven by each asset class's Section list.
-from fundamental_express.reporting.markdown import render as md_render, write as md_write  # noqa: E402
-from fundamental_express.reporting.pdf import render as pdf_render  # noqa: E402
-from fundamental_express.reporting.sections_ordinary import build_ordinary_sections  # noqa: E402
-from fundamental_express.reporting.sections_bank import build_bank_sections  # noqa: E402
-from fundamental_express.reporting.sections_reit import build_reit_sections  # noqa: E402
-
-
 # Moved to src/fundamental_express/cli/catalysts.py and cli/args.py
 # (docs/spec/refactor-tasks.md T22). Re-exported under their original names -
 # analyzers.py imports CATALYSTS_PLACEHOLDER from here, and
@@ -795,76 +808,15 @@ from fundamental_express.cli.args import required_return_type  # noqa: E402
 
 
 # ── ORDINARY / BANK / REIT PDF REPORTS ──────────────────────────────────
-# Rendering portion (ReportLab document assembly) moved to
-# src/fundamental_express/reporting/pdf.py::render() (docs/spec/refactor-tasks.md T20).
-# Fetch/compute orchestration stays here - only cli/single_ticker.py's CLI
-# still calls these; AnalyzerFactory's analyzers (T21) call pdf_render()/
-# md_render() directly on self.data/self.metrics instead.
-def build_pdf_report(
-    ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, force=False,
-    required_return=None,
-):
-    data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
-    excluded_sector, excluded_industry = check_sector_suitability(ticker, data.get("info", {}), force)
-    m = compute_metrics(data, required_return=required_return)
-    forward_outlook = compute_forward_outlook(data.get("info", {}), m.valuation.price, m.eps, m.cagr)
-    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
-
-    trading_ccy = data.get("trading_currency", "USD")
-    price_kind = data["price_kind"]
-    quote_time_label = data["quote_time_label"]
-
-    ordinary_sections = build_ordinary_sections(
-        m, forward_outlook, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker,
-    )
-    pdf_filename = pdf_render(ticker, data, m, ordinary_sections, OUTPUT_DIR, excluded_sector, excluded_industry)
-    print(f"Success! Comprehensive report saved to: {pdf_filename}")
-
-    md_content = md_render(ticker, data, m, ordinary_sections, excluded_sector, excluded_industry)
-    md_filename = md_write(ticker, md_content, OUTPUT_DIR)
-    print(f"Success! Markdown report saved to: {md_filename}")
-
-    return pdf_filename, md_filename
-
-
-def build_bank_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
-    data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
-    m = compute_bank_metrics(data, required_return=required_return)
-    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
-
-    trading_ccy = data.get("trading_currency", "USD")
-    price_kind = data["price_kind"]
-    quote_time_label = data["quote_time_label"]
-
-    bank_sections = build_bank_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker)
-    pdf_filename = pdf_render(ticker, data, m, bank_sections, OUTPUT_DIR)
-    print(f"Success! Comprehensive bank report saved to: {pdf_filename}")
-
-    md_content = md_render(ticker, data, m, bank_sections)
-    md_filename = md_write(ticker, md_content, OUTPUT_DIR)
-    print(f"Success! Markdown bank report saved to: {md_filename}")
-
-    return pdf_filename, md_filename
-
-
-def build_reit_pdf_report(ticker, retries=5, retry_delay=5, allow_sample=False, catalysts_text=None, required_return=None):
-    data = get_company_data(ticker, retries=retries, retry_delay=retry_delay, allow_sample=allow_sample)
-    m = compute_reit_metrics(data, required_return=required_return)
-    catalysts_text = catalysts_text or CATALYSTS_PLACEHOLDER
-
-    trading_ccy = data.get("trading_currency", "USD")
-    price_kind = data["price_kind"]
-    quote_time_label = data["quote_time_label"]
-
-    reit_sections = build_reit_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker)
-    pdf_filename = pdf_render(ticker, data, m, reit_sections, OUTPUT_DIR)
-    print(f"Success! Comprehensive REIT report saved to: {pdf_filename}")
-
-    md_content = md_render(ticker, data, m, reit_sections)
-    md_filename = md_write(ticker, md_content, OUTPUT_DIR)
-    print(f"Success! Markdown REIT report saved to: {md_filename}")
-
-    return pdf_filename, md_filename
+# build_pdf_report()/build_bank_pdf_report()/build_reit_pdf_report() (one
+# per asset class, each hardcoded to its own compute_*_metrics()) are gone -
+# cli/single_ticker.py used to call build_pdf_report() unconditionally for
+# every ticker regardless of sector (a bug: a Financial Services/REIT
+# ticker silently got the Ordinary CAPM/WACC FCF-DCF instead of its real
+# DDM/ROE-P-B or NAV model - EV/Net Debt/FCF are not meaningful for a
+# bank's balance sheet). cli/single_ticker.py now routes through
+# analyzers.AnalyzerFactory, same as cli/portfolio.py, so both entry points
+# always agree on which model a given ticker gets.
 
 
 # Moved to src/fundamental_express/cli/single_ticker.py (docs/spec/refactor-tasks.md T22).

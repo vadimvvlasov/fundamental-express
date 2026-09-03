@@ -205,7 +205,7 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
 ⚠️ **Внимание:** Применена модель дисконтирования дивидендов (DDM) вместо классического DCF - у компании искажена структура капитала (отрицательный или "перегруженный" долгом акционерный капитал) на фоне стабильной истории дивидендных выплат. Классический FCF-DCF в этом случае занижает стоимость (лизинговые/долговые обязательства искажают WACC).
 
 - {ke_disclosure}
-- Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%): {m.cagr_div * 100:.2f}%
+- Темп роста дивидендов (CAGR_div, лог-регрессия по годам, ограничен 2.0%-10.0%): {m.cagr_div * 100:.2f}%
 - DPS последнего года (Dividends Paid / Diluted Shares): {m.dps_last:.2f} {trading_ccy}
 - Терминальный темп роста (Gordon Growth): 2.5%
 
@@ -222,7 +222,7 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
 - Стоимость долга после налога: Kd×(1-T) = 4.5%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% (Kd=4.5% и T=21% — фиксированные допущения методики, не специфичны для компании и не эффективная налоговая ставка компании)
 - Веса структуры капитала (по рыночной капитализации): E/(D+E) = {m.equity_weight * 100:.1f}%, D/(D+E) = {m.debt_weight * 100:.1f}%
 - **WACC:** {m.equity_weight * 100:.1f}%×{m.valuation.cost_of_equity * 100:.2f}% + {m.debt_weight * 100:.1f}%×{m.cost_of_debt_after_tax * 100:.2f}% = **{m.wacc * 100:.2f}%**
-- CAGR роста FCF: {m.cagr * 100:.2f}% (историческая, ограничена 2-15%)
+- CAGR роста FCF: {m.cagr * 100:.2f}% (лог-регрессия по годам, ограничена 2-15%)
 - Терминальный темп роста: 2.5%
 
 {debt_block}
@@ -249,7 +249,7 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
         if is_ddm:
             ddm_info_text = (
                 f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
-                f"• <b>Темп роста дивидендов (CAGR_div, ограничен 2.0%-10.0%):</b> {m.cagr_div * 100:.2f}%<br/>"
+                f"• <b>Темп роста дивидендов (CAGR_div, лог-регрессия по годам, ограничен 2.0%-10.0%):</b> {m.cagr_div * 100:.2f}%<br/>"
                 f"• <b>DPS последнего года (Dividends Paid / Diluted Shares):</b> {m.dps_last:.2f} {trading_ccy}<br/>"
                 f"• <b>Терминальный темп роста (Gordon Growth):</b> 2.5%<br/>"
             )
@@ -275,7 +275,7 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
             f"• <b>Веса структуры капитала:</b> E/(D+E) = {m.equity_weight * 100:.1f}%, D/(D+E) = {m.debt_weight * 100:.1f}% "
             f"(по рыночной капитализации, не по балансовому капиталу — у компаний с отрицательным book equity вес по балансу был бы недействителен)<br/>"
             f"• <b>Итоговый WACC:</b> {m.equity_weight * 100:.1f}%×{m.valuation.cost_of_equity * 100:.2f}% + {m.debt_weight * 100:.1f}%×{m.cost_of_debt_after_tax * 100:.2f}% = <b>{m.wacc * 100:.2f}%</b><br/>"
-            f"• <b>Расчетный CAGR роста потока:</b> {m.cagr * 100:.2f}% (среднеисторический темп роста, ограничен консервативной границей)<br/>"
+            f"• <b>Расчетный CAGR роста потока:</b> {m.cagr * 100:.2f}% (лог-регрессия по годам, ограничен консервативной границей)<br/>"
             f"• <b>Терминальный темп роста:</b> 2.5% (пожизненный темп роста компании в постпрогнозный период)<br/>"
             f"{debt_html}<br/>"
             f"• <b>Справедливая оценка акционерного капитала:</b> {m.equity_value / 1e9:,.2f} млрд. {trading_ccy} (Enterprise Value = {m.enterprise_value / 1e9:,.2f} млрд. {trading_ccy})<br/>"

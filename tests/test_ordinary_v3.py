@@ -267,6 +267,34 @@ def test_ddm_not_triggered_when_capital_is_healthy():
     assert m.valuation.valuation_model == "DCF"
 
 
+# ── V01: tangible equity (goodwill-adjusted) drives the D/E trigger ─────
+
+def test_ddm_triggers_on_high_tangible_debt_to_equity_masked_by_goodwill():
+    # Raw D/E = 2500/2000 = 1.25 (< 2.0, would NOT trigger pre-V01).
+    # Tangible D/E = 2500/(2000-1200) = 2500/800 = 3.125 (> 2.0, DOES trigger).
+    m = compute_metrics(make_data(
+        equity=(2000.0, 2000.0, 2000.0, 2000.0),
+        goodwill=(1200.0, 1200.0, 1200.0, 1200.0),
+        long_term_debt=(2500.0, 2500.0, 2500.0, 2500.0),
+        cash_dividends_paid=(-200.0, -210.0, -220.0, -230.0),
+        dividend_rate=1.5,
+    ))
+    assert m.debt_to_equity_ratio == pytest.approx(2500.0 / 800.0)
+    assert m.valuation.valuation_model == "DDM"
+
+
+def test_ddm_not_triggered_when_goodwill_is_zero_no_op():
+    # Same shape as test_ddm_not_triggered_when_capital_is_healthy but
+    # explicit goodwill=0 - confirms tangible_equity == raw equity is a
+    # true no-op, not just an accident of the default fixture.
+    m = compute_metrics(make_data(
+        equity=(1200.0, 1200.0, 1200.0, 1200.0),
+        goodwill=(0.0, 0.0, 0.0, 0.0),
+        cash_dividends_paid=(-200.0, -210.0, -220.0, -230.0), dividend_yield=0.03,
+    ))
+    assert m.valuation.valuation_model == "DCF"
+
+
 def test_ddm_cagr_div_clamped_to_10_pct_ceiling():
     m = compute_metrics(make_data(
         equity=(-50.0, -60.0, -70.0, -80.0),

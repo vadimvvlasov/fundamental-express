@@ -1,14 +1,24 @@
 """financial_analyzer.py's __main__ argparse block, moved out
 (docs/spec/refactor-tasks.md T22). financial_analyzer.py itself keeps
-compute_metrics()/build_pdf_report()/etc. - only the CLI entry point moved;
-financial_analyzer.py's own `if __name__ == "__main__":` now just calls
-main() here so `python financial_analyzer.py <ticker>` keeps working
-unchanged.
+compute_metrics()/etc. - only the CLI entry point moved; financial_analyzer.py's
+own `if __name__ == "__main__":` now just calls main() here so
+`python financial_analyzer.py <ticker>` keeps working unchanged.
+
+Routes through analyzers.AnalyzerFactory (same probe-fetch-then-route
+pattern as cli/portfolio.py's analyze_holdings()) instead of calling a
+hardcoded Ordinary build_pdf_report() - that used to send every ticker
+through the Ordinary CAPM/WACC FCF-DCF regardless of sector, silently
+giving a Financial Services/REIT ticker a fair value from a model that
+doesn't fit its balance sheet (EV/Net Debt/FCF aren't meaningful for a
+bank) instead of its real DDM/ROE-P-B or NAV model. Routing through the
+same factory portfolio.py uses keeps both entry points agreeing on which
+model a given ticker gets.
 """
 
 import argparse
 
-from financial_analyzer import build_pdf_report, DataUnavailableError, UnsupportedSectorError
+from analyzers import AnalyzerFactory
+from financial_analyzer import DataUnavailableError, UnsupportedSectorError, get_company_data
 from fundamental_express.cli.args import required_return_type
 from fundamental_express.cli.catalysts import resolve_catalysts_text
 
@@ -51,14 +61,27 @@ def main():
     )
     args = parser.parse_args()
 
-    catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
+    args.catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
+    ticker = args.ticker
 
     try:
-        build_pdf_report(
-            args.ticker, retries=args.retries, retry_delay=args.retry_delay,
-            allow_sample=args.allow_sample, catalysts_text=catalysts_text, force=args.force,
-            required_return=args.required_return,
+        # One fetch to get `info` for AnalyzerFactory's routing decision -
+        # analyzer.data is set directly from it below instead of calling
+        # analyzer.fetch_data(), which would trigger a wasteful second full
+        # fetch of the same ticker (mirrors cli/portfolio.py's pattern).
+        data = get_company_data(
+            ticker, retries=args.retries, retry_delay=args.retry_delay, allow_sample=args.allow_sample,
         )
+        analyzer = AnalyzerFactory.get_analyzer(ticker, args, data.get("info", {}))
+        analyzer.data = data
+        analyzer.calculate_metrics()
+        analyzer.calculate_fair_value()
+
+        pdf_filename = analyzer.generate_pdf_report()
+        print(f"Success! Comprehensive report saved to: {pdf_filename}")
+
+        md_filename = analyzer.generate_markdown_report()
+        print(f"Success! Markdown report saved to: {md_filename}")
     except DataUnavailableError as e:
         print(f"FAILED: {e}")
         raise SystemExit(1)

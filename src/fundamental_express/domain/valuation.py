@@ -12,14 +12,53 @@ T12d: bank_valuation (DDM or ROE/P-B).
 T12e (this commit): reit_nav_valuation (NAV).
 """
 
+import math
+
 import pandas as pd
 
 from fundamental_express.domain.metrics import ValuationResult
 
 
+def _regression_cagr(values, lo, hi, default):
+    """Multi-year log-linear regression CAGR (V02,
+    docs/spec/issues/V02-regression-cagr.md) - replaces the old
+    endpoint-to-endpoint `(values[-1]/values[0])**(1/(n-1)) - 1` formula,
+    which ignored every year between the first and last. Fits a line to
+    log(value) vs. year index by ordinary least squares; the slope,
+    exponentiated back, is the annualized growth rate.
+
+    Degenerates to the exact old endpoint formula when len(values) == 2
+    (provable algebraically: the OLS slope on two points x=[0,1],
+    y=[log(v0), log(v1)] reduces to log(v1/v0), so exp(slope)-1 ==
+    v1/v0 - 1) - callers with only 2 historical years see no behavior
+    change.
+
+    Falls back to `default` when there are fewer than 2 values, or when
+    *any* value in the window is non-positive (log undefined) - not just
+    the first/last, unlike the old formula, which never looked at the
+    values in between anyway.
+    """
+    values = list(values)
+    if len(values) < 2 or any(v <= 0 for v in values):
+        return default
+    n = len(values)
+    xs = range(n)
+    log_ys = [math.log(v) for v in values]
+    mean_x = sum(xs) / n
+    mean_y = sum(log_ys) / n
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    if var_x == 0:
+        return default
+    cov_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, log_ys))
+    slope = cov_xy / var_x
+    growth = math.exp(slope) - 1
+    return max(lo, min(hi, growth))
+
+
 def ordinary_dcf_valuation(
     fcf, price, shares, beta, required_return, latest_debt, net_debt,
     latest_equity, diluted_shares, cash_dividends_paid, info,
+    tangible_equity=None,
 ):
     """CAPM/WACC/DCF fair value, with the Ordinary v3 auto-switch to DDM
     for a dividend-paying company with a distorted capital structure (spec
@@ -37,11 +76,7 @@ def ordinary_dcf_valuation(
     cross-asset-class shape.
     """
     fcf_values = fcf.values
-    if len(fcf_values) >= 2 and fcf_values[0] > 0 and fcf_values[-1] > 0:
-        cagr = (fcf_values[-1] / fcf_values[0]) ** (1 / (len(fcf_values) - 1)) - 1
-        cagr = max(0.02, min(0.15, cagr))
-    else:
-        cagr = 0.05
+    cagr = _regression_cagr(fcf_values, 0.02, 0.15, 0.05)
 
     rf_rate = 0.04
     erp = 0.05
@@ -115,21 +150,29 @@ def ordinary_dcf_valuation(
     dividend_yield = info.get("dividendYield") or 0.0
     dividend_rate = info.get("dividendRate") or 0.0
     pays_dividends = dividend_yield > 0 or dividend_rate > 0
-    debt_to_equity_ratio = (
-        latest_debt / latest_equity if latest_equity > 0 and not pd.isna(latest_debt) else None
+    # V01: D/E and the distress trigger use tangible equity (goodwill and
+    # other intangibles stripped out) - a goodwill-heavy balance sheet can
+    # otherwise understate D/E enough to miss the DDM switch a genuinely
+    # distressed (on a tangible basis) company should get. tangible_equity
+    # defaults to None for callers that don't pass it (falls back to raw
+    # equity - no distortion assumed when the caller has no goodwill data).
+    equity_for_de = (
+        tangible_equity if tangible_equity is not None and not pd.isna(tangible_equity) else latest_equity
     )
-    capital_distorted = latest_equity <= 0 or (debt_to_equity_ratio is not None and debt_to_equity_ratio > 2.0)
+    debt_to_equity_ratio = (
+        latest_debt / equity_for_de if equity_for_de > 0 and not pd.isna(latest_debt) else None
+    )
+    capital_distorted = (
+        latest_equity <= 0
+        or equity_for_de <= 0
+        or (debt_to_equity_ratio is not None and debt_to_equity_ratio > 2.0)
+    )
     use_ddm = pays_dividends and capital_distorted and not diluted_shares.isna().all()
 
     if use_ddm:
         dps_series = (cash_dividends_paid.abs() / diluted_shares).dropna()
         dps_window = dps_series.iloc[-4:] if len(dps_series) >= 2 else dps_series
-        if len(dps_window) < 2 or dps_window.iloc[0] <= 0 or dps_window.iloc[-1] <= 0:
-            cagr_div = 0.05
-        else:
-            n_periods = len(dps_window) - 1
-            cagr_div = (dps_window.iloc[-1] / dps_window.iloc[0]) ** (1.0 / n_periods) - 1
-            cagr_div = max(0.02, min(0.10, cagr_div))
+        cagr_div = _regression_cagr(dps_window.values, 0.02, 0.10, 0.05)
         dps_last = dps_window.iloc[-1] if len(dps_window) else 0.0
 
         ddm_proj_dps = [dps_last * ((1 + cagr_div) ** t) for t in proj_years]
@@ -208,7 +251,10 @@ def ordinary_dcf_valuation(
     return valuation, extras
 
 
-def bank_valuation(required_return, beta, info, common_dividends_paid, diluted_shares, latest_equity, shares, net_income, price):
+def bank_valuation(
+    required_return, beta, info, common_dividends_paid, diluted_shares, latest_equity, shares, net_income, price,
+    tangible_equity=None,
+):
     """DDM (dividend-paying bank) or ROE/P-B (non-payer) fair value (spec
     Section 5, docs/spec/step2-bank-analyzer-implementation-spec.md). Moved
     verbatim out of compute_bank_metrics() - every input here was already
@@ -242,12 +288,7 @@ def bank_valuation(required_return, beta, info, common_dividends_paid, diluted_s
     if pays_dividends and not diluted_shares.isna().all():
         dps_series = (common_dividends_paid / diluted_shares).dropna()
         dps_window = dps_series.iloc[-4:] if len(dps_series) >= 2 else dps_series
-        if len(dps_window) < 2 or dps_window.iloc[0] <= 0 or dps_window.iloc[-1] <= 0:
-            cagr_div = 0.03
-        else:
-            n_periods = len(dps_window) - 1
-            cagr_div = (dps_window.iloc[-1] / dps_window.iloc[0]) ** (1.0 / n_periods) - 1
-            cagr_div = max(0.01, min(0.08, cagr_div))
+        cagr_div = _regression_cagr(dps_window.values, 0.01, 0.08, 0.03)
         dps_last = dps_window.iloc[-1] if len(dps_window) else 0.0
 
         proj_years = list(range(1, 6))
@@ -272,7 +313,17 @@ def bank_valuation(required_return, beta, info, common_dividends_paid, diluted_s
             latest_net_income = net_income.iloc[-1]
             roe = latest_net_income / latest_equity
             if roe <= 0:
-                fair_value_share = 0.1 * bvps
+                # V01: the floor uses tangible bvps - equity doesn't cancel
+                # out of a flat "0.1 * bvps" the way it does in the roe>0
+                # branch below, so a goodwill-heavy bank gets an inflated
+                # floor if raw bvps is used here. Falls back to raw bvps
+                # when the caller has no goodwill data (tangible_equity=None).
+                bvps_tangible = (
+                    tangible_equity / shares
+                    if tangible_equity is not None and not pd.isna(tangible_equity) and shares > 0
+                    else bvps
+                )
+                fair_value_share = 0.1 * bvps_tangible
             else:
                 fair_value_share = bvps * (roe / cost_of_equity)
 

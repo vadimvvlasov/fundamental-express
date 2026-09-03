@@ -39,7 +39,7 @@ def _bank_valuation_disclosure(m):
     if m.valuation.valuation_model == "DDM":
         return "Модель дисконтирования дивидендов (DDM)", [
             (ke_line, ""),
-            ("Темп роста дивидендов (CAGR_div, ограничен 1.0%-8.0%)", f"{m.cagr_div * 100:.2f}%"),
+            ("Темп роста дивидендов (CAGR_div, лог-регрессия по годам, ограничен 1.0%-8.0%)", f"{m.cagr_div * 100:.2f}%"),
             ("DPS последнего года (Common Dividends Paid / Diluted Shares)", f"{m.dps_last:.2f} USD"),
             ("Терминальный темп роста (Gordon Growth)", "2.5%"),
         ]
