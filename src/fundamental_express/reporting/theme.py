@@ -64,3 +64,21 @@ def escape_xml(val):
 
 def _fmt_or_na(value, fmt="{:.2f}"):
     return fmt.format(value) if value is not None else "N/A"
+
+
+# 🟢/🟡/🔴 (U+1F7E2/1F7E1/1F534, the "large colored circle" emoji added in
+# Unicode 12) aren't in DejaVuSans.ttf's cmap - ReportLab draws a tofu
+# (empty rectangle) box for them instead of the glyph. Markdown output is
+# untouched by this (any real markdown viewer renders the emoji fine);
+# only PDF flowables need their verdict/status text routed through
+# pdf_safe() first. ⚠️/⚪ are already in the font, left alone.
+_PDF_EMOJI_FALLBACK = {"🟢": "●", "🟡": "●", "🔴": "●"}
+
+
+def pdf_safe(text):
+    """Replace emoji this font can't render with a plain circle it can -
+    the surrounding ParagraphStyle's textColor (already set per
+    verdict/status elsewhere) still carries the buy/watch/skip signal."""
+    for emoji, replacement in _PDF_EMOJI_FALLBACK.items():
+        text = text.replace(emoji, replacement)
+    return text

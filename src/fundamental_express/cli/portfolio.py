@@ -27,6 +27,8 @@ from financial_analyzer import (
 )
 from fundamental_express.cli.args import required_return_type
 from fundamental_express.cli.paths import OUTPUT_DIR
+from fundamental_express.domain.best_candidates import select_best_candidates
+from fundamental_express.reporting.theme import pdf_safe
 from reportlab.lib.enums import TA_JUSTIFY
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer
@@ -104,6 +106,90 @@ def _leverage_label(m):
     if _is_bank(m) or _is_reit(m):
         return "N/A" if m.debt_to_equity is None else f"D/E {m.debt_to_equity:.2f}x"
     return f"ND {m.net_debt / 1e9:,.2f}B"
+
+
+def _type_label(m):
+    """"Тип" column for the Best Candidates table - Bank / a REIT category
+    derived from its cap_rate_label (e.g. "Industrial / Logistics REIT",
+    "Default REIT" when unmatched, "REIT (explicit cap rate)" for the
+    info.capRate case) / "Non-financial" for Ordinary."""
+    if _is_bank(m):
+        return "Bank"
+    if _is_reit(m):
+        category = m.cap_rate_label.split(":")[0].split("(")[0].strip()
+        if category == "Explicit":
+            return "REIT (explicit cap rate)"
+        return f"{category} REIT"
+    return "Non-financial"
+
+
+def _best_candidates_data(results):
+    """Shared selection + per-row (ticker_label, type, deviation_label,
+    minor_score, leverage_label) tuples for the markdown/PDF renderers
+    below - see domain/best_candidates.py for the selection rule itself
+    (every 0-crit/BUY ticker, no cap, Ordinary/Bank/REIT together in one
+    list ranked by |deviation|). The `_type_label()` column is what keeps
+    an Ordinary DCF deviation visually distinct from a Bank DDM/ROE-P-B
+    one at a glance, since the two aren't the same kind of number (see
+    the module docstring in domain/best_candidates.py) - the narrative
+    text right after the table spells this out once for the whole table
+    instead of per row."""
+    selection = select_best_candidates(results)
+
+    def row(r):
+        m = r["metrics"]
+        ou = m.valuation.over_under_pct
+        return (
+            _ticker_label(r), _type_label(m), f"{ou:+.1f}%",
+            f"{m.scoring.minor_score:.1f}", _leverage_label(m),
+        )
+
+    return selection, row
+
+
+def _best_candidates_narrative(selection):
+    """Plain-text (not markdown/HTML) sentences shared by both renderers -
+    same content as the manually-written version this replaces, but every
+    number pulled live from `selection` instead of typed by hand."""
+    lines = []
+    if selection["candidates"]:
+        lines.append(
+            "Критерий отбора: 0 критических грехов + вердикт КУПИТЬ (чек-лист грехов), "
+            "все квалифицирующиеся тикеры, отсортированы по модулю отклонения от "
+            "DCF/DDM/NAV-модели."
+        )
+        lines.append(
+            "Знак и величина отклонения не сравнимы напрямую между типами: у Ordinary это "
+            "классический FCF-DCF (плюс = реально дёшево), у банков — DDM/ROE-P-B "
+            "(отрицательное отклонение = цена выше модельной справедливой стоимости, не "
+            "\"дёшево\"), у REIT — NAV. Вердикт КУПИТЬ идёт из чек-листа грехов, не из знака "
+            "отклонения - тикер может быть формально \"переоценен\" по своей модели и всё "
+            "равно КУПИТЬ, если фундаментальные показатели чисты. Смотри колонку «Тип»."
+        )
+    if selection["best_reit"]:
+        r = selection["best_reit"]
+        m = r["metrics"]
+        payout = (
+            "н/д" if m.affo_payout_ratio is None
+            else "∞" if m.affo_payout_ratio == float("inf")
+            else f"{m.affo_payout_ratio * 100:.0f}%"
+        )
+        de = "н/д" if m.debt_to_equity is None else f"{m.debt_to_equity:.2f}x"
+        lines.append(f"Лучший REIT — {_ticker_label(r)}. Payout {payout}, D/E {de}.")
+    if selection["bank_count"] >= 3:
+        lines.append(
+            "Осторожно: в таблице выше несколько банков. Банковский DCF здесь — "
+            "excess-return/DDM модель, чувствительнее к спреду ROE-Ke, чем классический "
+            "FCF-DCF - не концентрируй портфель в 5-6 банках разом, диверсифицируй."
+        )
+    if selection["negative_fair_value"]:
+        tickers = ", ".join(_ticker_label(r) for r in selection["negative_fair_value"])
+        lines.append(
+            f"Красные тикеры с отрицательной DCF fair value ({tickers}) — не баг: net debt "
+            "превышает Enterprise Value (тяжёлая долговая нагрузка), формула корректно "
+            "выдаёт отрицательное число как сигнал \"не покупать\", а не ошибку расчёта."
+        )
+    return lines
 
 
 def parse_holdings(args_list):
@@ -260,7 +346,7 @@ def build_comparative_pdf(results, name="Portfolio"):
         ou_label = f"{ou:+.1f}% ({'недооценена' if ou > 10 else 'переоценена' if ou < -10 else 'справедливо'})"
         rows.append([
             _ticker_label(r), w, f"${m.valuation.price:,.2f}", f"${m.valuation.fair_value_share:,.2f}",
-            ou_label, m.scoring.verdict, _sins_label(m),
+            ou_label, pdf_safe(m.scoring.verdict), _sins_label(m),
             _liquidity_label(m), _cashflow_label(m), _leverage_label(m),
         ])
     story.append(create_reportlab_table(headers, rows, styles, COLORS, col_widths=[38, 26, 48, 55, 95, 60, 60, 55, 55, 60]))
@@ -277,7 +363,18 @@ def build_comparative_pdf(results, name="Portfolio"):
         story.append(CalloutBox(FORCE_WARNING_FOOTNOTE, USABLE_W, COLORS, callout_text, COLORS["muted"]))
         story.append(Spacer(1, 8))
 
-    story.append(Paragraph("2. Детали по «грехам»", h1))
+    selection, best_row = _best_candidates_data(results)
+    if selection["candidates"]:
+        story.append(Paragraph("2. Лучшие кандидаты", h1))
+        best_headers = ["Тикер", "Тип", "Откл. от DCF", "Грехи", "Долг.нагрузка"]
+        best_rows = [list(best_row(r)) for r in selection["candidates"]]
+        story.append(create_reportlab_table(best_headers, best_rows, styles, COLORS, col_widths=[45, 90, 60, 45, 80]))
+        story.append(Spacer(1, 8))
+        for line in _best_candidates_narrative(selection):
+            story.append(Paragraph(line, body))
+        story.append(Spacer(1, 8))
+
+    story.append(Paragraph("3. Детали по «грехам»", h1))
     for r in results:
         if not r["ok"]:
             continue
@@ -336,7 +433,21 @@ def build_comparative_markdown(results, name="Portfolio"):
     if any(r.get("excluded_sector") for r in results):
         lines += [f"> {FORCE_WARNING_FOOTNOTE}", ""]
 
-    lines.append("## 2. Детали по «грехам»")
+    selection, best_row = _best_candidates_data(results)
+    if selection["candidates"]:
+        lines.append("## 2. Лучшие кандидаты")
+        lines.append("")
+        lines.append("| Тикер | Тип | Откл. от DCF | Грехи | Долг.нагрузка |")
+        lines.append("|---|---|---|---|---|")
+        for r in selection["candidates"]:
+            ticker, type_, dev, sins, lev = best_row(r)
+            lines.append(f"| {ticker} | {type_} | {dev} | {sins} | {lev} |")
+        lines.append("")
+        for line in _best_candidates_narrative(selection):
+            lines.append(line)
+            lines.append("")
+
+    lines.append("## 3. Детали по «грехам»")
     lines.append("")
     for r in results:
         if not r["ok"]:

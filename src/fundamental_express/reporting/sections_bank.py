@@ -22,7 +22,7 @@ from fundamental_express.reporting.charts import generate_nii_chart
 from fundamental_express.reporting.flowables import CalloutBox
 from fundamental_express.reporting.sections import Section
 from fundamental_express.reporting.tables import create_reportlab_table
-from fundamental_express.reporting.theme import COLORS, FONT_NAME, USABLE_W
+from fundamental_express.reporting.theme import COLORS, FONT_NAME, USABLE_W, pdf_safe
 
 _BODY = dict(fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6)
 _CALLOUT_TEXT = dict(fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13)
@@ -104,7 +104,7 @@ def _checklist_section(m):
         callout_style = ParagraphStyle("CalloutText", **_CALLOUT_TEXT)
         items = [
             Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style),
-            Paragraph(m.scoring.verdict, verdict_style),
+            Paragraph(pdf_safe(m.scoring.verdict), verdict_style),
             Paragraph(f"<b>Резюме и обоснование:</b> {m.scoring.reasoning}", body_style),
         ]
         if m.scoring.critical_sins:
