@@ -107,6 +107,8 @@ class OrdinaryMetrics:
     graham_eps: float | None = None
     graham_eps_label: str = "FY"
     graham_tangible_bvps: float | None = None
+    ddm_sensitivity_headers: list | None = None
+    ddm_sensitivity_rows: list | None = None
 
 
 @dataclass(frozen=True)

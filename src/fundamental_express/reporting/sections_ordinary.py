@@ -23,7 +23,7 @@ from reportlab.platypus import Image, Paragraph, Spacer
 from fundamental_express.domain.valuation import _peg_assessment
 from fundamental_express.reporting.charts import generate_fcf_chart
 from fundamental_express.reporting.flowables import CalloutBox
-from fundamental_express.reporting.sections import Section
+from fundamental_express.reporting.sections import Section, notes_flowables, notes_markdown_block
 from fundamental_express.reporting.tables import create_reportlab_table
 from fundamental_express.reporting.theme import COLORS, FONT_NAME, FONT_BOLD, USABLE_W, _fmt_or_na, pdf_safe
 
@@ -241,6 +241,17 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
 
     def markdown():
         if is_ddm:
+            ddm_sens_block = ""
+            if m.ddm_sensitivity_headers and m.ddm_sensitivity_rows:
+                ddm_sens_header = "| " + " | ".join(m.ddm_sensitivity_headers) + " |"
+                ddm_sens_sep = "|" + "---|" * len(m.ddm_sensitivity_headers)
+                ddm_sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m.ddm_sensitivity_rows)
+                ddm_sens_block = f"""
+### Матрица чувствительности DDM (строки — рост дивидендов CAGR_div; столбцы — ставка дисконтирования Ke; терминальный рост фиксирован на {m.terminal_g * 100:.2f}% — условие Ke > g не требуется для самой матрицы, ячейки с Ke ≤ g помечены N/A)
+
+{ddm_sens_header}
+{ddm_sens_sep}
+{ddm_sens_rows}"""
             return f"""## 3. Оценка справедливой стоимости (Модель DDM)
 
 ⚠️ **Внимание:** Применена модель дисконтирования дивидендов (DDM) вместо классического DCF - у компании искажена структура капитала (отрицательный или "перегруженный" долгом акционерный капитал) на фоне стабильной истории дивидендных выплат. Классический FCF-DCF в этом случае занижает стоимость (лизинговые/долговые обязательства искажают WACC).
@@ -252,7 +263,7 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
 
 **Справедливая стоимость по DDM: {m.valuation.fair_value_share:.2f} {trading_ccy}**
 Текущая рыночная цена: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) | Статус: **{m.valuation.val_status}**
-
+{ddm_sens_block}
 > {_graham_note(m, trading_ccy)}"""
 
         # V04: lease-inclusive fair value - always a secondary figure when
@@ -326,7 +337,7 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 f"Текущая рыночная цена: {m.valuation.price:.2f} {trading_ccy} ({price_kind}, {quote_time_label}) "
                 f"| Статус: <font color='{val_color.hexval()}'><b>{m.valuation.val_status}</b></font>"
             )
-            return [
+            items = [
                 CalloutBox(ddm_info_text, USABLE_W, COLORS, callout_style, COLORS["accent"]),
                 Spacer(1, 8),
                 CalloutBox(
@@ -336,6 +347,22 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 Spacer(1, 6),
                 Paragraph(_graham_note(m, trading_ccy), body_style),
             ]
+            if m.ddm_sensitivity_headers and m.ddm_sensitivity_rows:
+                items += [
+                    Spacer(1, 10),
+                    Paragraph(
+                        "<b>Матрица чувствительности DDM (CAGR_div vs Ke):</b>",
+                        ParagraphStyle("SensT", fontName=FONT_BOLD, fontSize=9.5, textColor=COLORS["heading"], spaceAfter=4),
+                    ),
+                    Paragraph(
+                        "Таблица показывает, как меняется справедливая стоимость при изменении темпа роста дивидендов "
+                        "и ставки дисконтирования Ke. Терминальный рост зафиксирован "
+                        f"на {m.terminal_g * 100:.2f}% (ячейки с Ke ≤ g помечены N/A).",
+                        body_style,
+                    ),
+                    create_reportlab_table(m.ddm_sensitivity_headers, m.ddm_sensitivity_rows, {}, COLORS),
+                ]
+            return items
 
         debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in _debt_lines(m, trading_ccy))
         dcf_info_text = (
@@ -460,17 +487,41 @@ def _catalysts_section(catalysts_text):
     return Section("Катализаторы и риски", markdown, flowables)
 
 
-def build_ordinary_sections(m, forward_outlook, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker):
+def _analyst_notes_section(notes_text, number):
+    """Trailing analyst-notes section - rendered verbatim (like catalysts),
+    appended only when the analyst supplied text (see
+    cli/catalysts.py:resolve_analyst_notes_text). `number` is the next free
+    section number for this asset class (6 for Ordinary, 5 for Bank/REIT).
+    Markdown headings inside the notes render as real (demoted) headings -
+    see reporting/sections.py."""
+
+    def markdown():
+        return f"""## {number}. Заметки аналитика (качественный вывод)
+
+{notes_markdown_block(notes_text)}"""
+
+    def flowables():
+        return notes_flowables(notes_text)
+
+    return Section("Заметки аналитика", markdown, flowables)
+
+
+def build_ordinary_sections(m, forward_outlook, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker,
+                            analyst_notes=None):
     """Ordered list[Section] for the Ordinary report - the five numbered
     blocks build_markdown_report()/build_pdf_report() assemble inline
     today. Sector-warning-banner handling and the closing "important rule"
     disclaimer stay out of scope here (header/footer-level concerns, not
     numbered sections - see docs/spec/refactor-architecture-spec.md
-    Section 5 and reporting/pdf.py)."""
-    return [
+    Section 5 and reporting/pdf.py). `analyst_notes`, when given, appends
+    a trailing "## 6. Заметки аналитика" section rendered verbatim."""
+    sections = [
         _checklist_section(m),
         _fundamentals_section(m, trading_ccy, ticker),
         _valuation_section(m, trading_ccy, price_kind, quote_time_label),
         _forward_outlook_section(forward_outlook),
         _catalysts_section(catalysts_text),
     ]
+    if analyst_notes:
+        sections.append(_analyst_notes_section(analyst_notes, 6))
+    return sections

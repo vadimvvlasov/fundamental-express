@@ -118,7 +118,7 @@ class OrdinaryAnalyzer(BaseAnalyzer):
         return build_ordinary_sections(
             self.metrics, forward_outlook, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
             self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
-            self.ticker,
+            self.ticker, getattr(self.args, "analyst_notes_text", None),
         )
 
     def generate_markdown_report(self):
@@ -172,7 +172,7 @@ class BankAnalyzer(BaseAnalyzer):
         return build_bank_sections(
             self.metrics, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
             self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
-            self.ticker,
+            self.ticker, getattr(self.args, "analyst_notes_text", None),
         )
 
     def generate_markdown_report(self):
@@ -218,7 +218,7 @@ class ReitAnalyzer(BaseAnalyzer):
         return build_reit_sections(
             self.metrics, getattr(self.args, "catalysts_text", None) or CATALYSTS_PLACEHOLDER,
             self.data.get("trading_currency", "USD"), self.data["price_kind"], self.data["quote_time_label"],
-            self.ticker,
+            self.ticker, getattr(self.args, "analyst_notes_text", None),
         )
 
     def generate_markdown_report(self):

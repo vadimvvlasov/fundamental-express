@@ -97,6 +97,44 @@ FALLBACK_COST_OF_DEBT = 0.045
 _COST_OF_DEBT_LO, _COST_OF_DEBT_HI = 0.02, 0.12
 
 
+def ddm_fair_value(dps_last, cagr_div, cost_of_equity, terminal_g):
+    """Single-point two-stage DDM fair value: 5 years of DPS projected at
+    `cagr_div`, discounted at `cost_of_equity`, plus a Gordon terminal value
+    at `terminal_g`. Pure function extracted from the DDM branch of
+    ordinary_dcf_valuation() below - same formula, callable for sensitivity
+    grids without re-running the whole valuation."""
+    proj_dps = [dps_last * ((1 + cagr_div) ** t) for t in range(1, 6)]
+    pv_dividends = [proj_dps[t - 1] / ((1 + cost_of_equity) ** t) for t in range(1, 6)]
+    terminal_val = (
+        proj_dps[-1] * (1 + terminal_g) / (cost_of_equity - terminal_g)
+        if cost_of_equity > terminal_g else 0.0
+    )
+    pv_terminal = terminal_val / ((1 + cost_of_equity) ** 5)
+    return sum(pv_dividends) + pv_terminal
+
+
+def ddm_sensitivity(dps_last, cagr_div, cost_of_equity, terminal_g):
+    """DDM sensitivity matrix mirroring the DCF sensitivity matrix shape:
+    rows vary the 5-year dividend growth (CAGR_div ±2/±1pp), columns vary
+    the discount rate (Ke ±1.5/±0.75pp), terminal growth fixed. Cells are
+    `"N/A"` where Ke <= terminal_g (Gordon undefined), formatted
+    `"{fv:.2f} USD"` otherwise - same cell convention as the DCF matrix."""
+    ke_vars = [cost_of_equity - 0.015, cost_of_equity - 0.0075, cost_of_equity,
+               cost_of_equity + 0.0075, cost_of_equity + 0.015]
+    cagr_vars = [cagr_div - 0.02, cagr_div - 0.01, cagr_div, cagr_div + 0.01, cagr_div + 0.02]
+    rows = []
+    for c in cagr_vars:
+        cells = []
+        for k in ke_vars:
+            if k <= terminal_g:
+                cells.append("N/A")
+                continue
+            cells.append(f"{ddm_fair_value(dps_last, c, k, terminal_g):.2f} USD")
+        rows.append([f"cagr_div = {c * 100:.1f}%"] + cells)
+    headers = ["CAGR_div / Ke"] + [f"{k * 100:.2f}%" for k in ke_vars]
+    return headers, rows
+
+
 def ordinary_dcf_valuation(
     fcf, price, shares, beta, required_return, latest_debt, net_debt,
     latest_equity, diluted_shares, cash_dividends_paid, info,
@@ -202,6 +240,8 @@ def ordinary_dcf_valuation(
     valuation_model = "DCF"
     cagr_div = None
     dps_last = None
+    ddm_sensitivity_headers = None
+    ddm_sensitivity_rows = None
     info = info or {}
     dividend_yield = info.get("dividendYield") or 0.0
     dividend_rate = info.get("dividendRate") or 0.0
@@ -242,6 +282,9 @@ def ordinary_dcf_valuation(
 
         valuation_model = "DDM"
         fair_value_share = ddm_sum_pv + ddm_pv_terminal
+        ddm_sensitivity_headers, ddm_sensitivity_rows = ddm_sensitivity(
+            dps_last, cagr_div, cost_of_equity, terminal_g,
+        )
         over_under = (fair_value_share - price) / price * 100 if price else 0.0
         if over_under > 10.0:
             val_status = f"НЕДООЦЕНЕНА на {abs(over_under):.1f}% (Потенциал роста)"
@@ -307,6 +350,8 @@ def ordinary_dcf_valuation(
         "sensitivity_rows": sensitivity_rows,
         "cagr_div": cagr_div,
         "dps_last": dps_last,
+        "ddm_sensitivity_headers": ddm_sensitivity_headers,
+        "ddm_sensitivity_rows": ddm_sensitivity_rows,
         "debt_to_equity_ratio": debt_to_equity_ratio,
     }
     return valuation, extras

@@ -31,3 +31,27 @@ def resolve_catalysts_text(catalysts=None, catalysts_file=None):
     if catalysts:
         return catalysts.strip() or CATALYSTS_PLACEHOLDER
     return CATALYSTS_PLACEHOLDER
+
+
+def resolve_analyst_notes_text(notes=None, notes_file=None):
+    """Resolve the analyst-notes text for the trailing report section.
+
+    Same contract as resolve_catalysts_text() (mutual exclusion checked
+    before any network call, missing file is a clean SystemExit), except
+    there is no placeholder: notes are purely optional, so None means
+    "no analyst-notes section in this report". Like catalysts, notes are
+    rendered verbatim and never auto-generated - they are the analyst's
+    own synthesis, not fetchable data.
+    """
+    if notes and notes_file:
+        raise SystemExit("--analyst-notes and --analyst-notes-file are mutually exclusive")
+    if notes_file:
+        try:
+            with open(notes_file, encoding="utf-8") as f:
+                text = f.read().strip()
+        except FileNotFoundError:
+            raise SystemExit(f"--analyst-notes-file not found: {notes_file}")
+        return text or None
+    if notes:
+        return notes.strip() or None
+    return None

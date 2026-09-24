@@ -20,7 +20,7 @@ import argparse
 from analyzers import AnalyzerFactory
 from financial_analyzer import DataUnavailableError, UnsupportedSectorError, get_company_data
 from fundamental_express.cli.args import required_return_type
-from fundamental_express.cli.catalysts import resolve_catalysts_text
+from fundamental_express.cli.catalysts import resolve_analyst_notes_text, resolve_catalysts_text
 
 
 def main():
@@ -59,9 +59,18 @@ def main():
         "--required-return", type=required_return_type, default=None,
         help="Персональная требуемая доходность инвестора (0.05-0.25), заменяет CAPM-расчёт Ke.",
     )
+    parser.add_argument(
+        "--analyst-notes", type=str, default=None,
+        help="Вывод аналитика по отчёту (дословно, последним разделом в PDF/MD).",
+    )
+    parser.add_argument(
+        "--analyst-notes-file", type=str, default=None,
+        help="Путь к файлу с выводом аналитика (альтернатива --analyst-notes).",
+    )
     args = parser.parse_args()
 
     args.catalysts_text = resolve_catalysts_text(args.catalysts, args.catalysts_file)
+    args.analyst_notes_text = resolve_analyst_notes_text(args.analyst_notes, args.analyst_notes_file)
     ticker = args.ticker
 
     try:

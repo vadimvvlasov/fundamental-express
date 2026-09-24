@@ -19,7 +19,7 @@ from reportlab.platypus import Image, Paragraph, Spacer
 
 from fundamental_express.reporting.charts import generate_ffo_chart
 from fundamental_express.reporting.flowables import CalloutBox
-from fundamental_express.reporting.sections import Section
+from fundamental_express.reporting.sections import Section, notes_flowables, notes_markdown_block
 from fundamental_express.reporting.tables import create_reportlab_table
 from fundamental_express.reporting.theme import COLORS, FONT_NAME, USABLE_W, pdf_safe
 
@@ -226,13 +226,36 @@ def _catalysts_section(catalysts_text):
     return Section("Катализаторы и риски", markdown, flowables)
 
 
-def build_reit_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker):
+def _analyst_notes_section(notes_text, number):
+    """Trailing analyst-notes section - rendered verbatim (like catalysts),
+    appended only when the analyst supplied text (see
+    cli/catalysts.py:resolve_analyst_notes_text). Markdown headings inside
+    the notes render as real (demoted) headings - see reporting/sections.py."""
+
+    def markdown():
+        return f"""## {number}. Заметки аналитика (качественный вывод)
+
+{notes_markdown_block(notes_text)}"""
+
+    def flowables():
+        return notes_flowables(notes_text)
+
+    return Section("Заметки аналитика", markdown, flowables)
+
+
+def build_reit_sections(m, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker,
+                        analyst_notes=None):
     """Ordered list[Section] for the REIT report - the four numbered
     blocks build_reit_markdown_report()/build_reit_pdf_report() assemble
-    inline today. No forward-outlook section (REIT has none)."""
-    return [
+    inline today. No forward-outlook section (REIT has none). `analyst_notes`,
+    when given, appends a trailing "## 5. Заметки аналитика" section rendered
+    verbatim."""
+    sections = [
         _checklist_section(m),
         _operating_section(m, trading_ccy, ticker),
         _valuation_section(m, trading_ccy, price_kind, quote_time_label),
         _catalysts_section(catalysts_text),
     ]
+    if analyst_notes:
+        sections.append(_analyst_notes_section(analyst_notes, 5))
+    return sections
