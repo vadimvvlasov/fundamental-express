@@ -23,9 +23,20 @@ from reportlab.platypus import Image, Paragraph, Spacer
 from fundamental_express.domain.valuation import _peg_assessment
 from fundamental_express.reporting.charts import generate_fcf_chart
 from fundamental_express.reporting.flowables import CalloutBox
-from fundamental_express.reporting.sections import Section, notes_flowables, notes_markdown_block
+from fundamental_express.reporting.sections import (
+    Section,
+    notes_flowables,
+    notes_markdown_block,
+)
 from fundamental_express.reporting.tables import create_reportlab_table
-from fundamental_express.reporting.theme import COLORS, FONT_NAME, FONT_BOLD, USABLE_W, _fmt_or_na, pdf_safe
+from fundamental_express.reporting.theme import (
+    COLORS,
+    FONT_BOLD,
+    FONT_NAME,
+    USABLE_W,
+    _fmt_or_na,
+    pdf_safe,
+)
 
 LEASE_ASSUMPTION_NOTE = (
     "Допущение по лизингу: в базовом DCF обязательства по аренде исключены из net debt, "
@@ -36,33 +47,49 @@ LEASE_ASSUMPTION_NOTE = (
     "Total Debt (включая аренду) вместо приведённого net debt."
 )
 
-_BODY = dict(fontName=FONT_NAME, fontSize=9.5, textColor=COLORS["body"], leading=13.5, spaceAfter=6)
-_CALLOUT_TEXT = dict(fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13)
+_BODY = dict(
+    fontName=FONT_NAME,
+    fontSize=9.5,
+    textColor=COLORS["body"],
+    leading=13.5,
+    spaceAfter=6,
+)
+_CALLOUT_TEXT = dict(
+    fontName=FONT_NAME, fontSize=9, textColor=COLORS["body"], leading=13
+)
 
 
 def _debt_lines(m, trading_ccy):
     """Plain (label, value) pairs for the debt/net-debt disclosure - shared
     between the markdown and flowables renderings of Section 3 below."""
-    lines = [(
-        "Долгосрочный долг (Long Term Debt, только процентный долг)",
-        f"{m.interest_bearing_debt / 1e9:,.2f} млрд. {trading_ccy}",
-    )]
+    lines = [
+        (
+            "Долгосрочный долг (Long Term Debt, только процентный долг)",
+            f"{m.interest_bearing_debt / 1e9:,.2f} млрд. {trading_ccy}",
+        )
+    ]
     if not pd.isna(m.lease_liabilities):
-        lines.append((
-            "Долгосрочные обязательства по аренде (Long-term lease liability, исключены из net debt ниже)",
-            f"{m.lease_liabilities / 1e9:,.2f} млрд. {trading_ccy}",
-        ))
+        lines.append(
+            (
+                "Долгосрочные обязательства по аренде (Long-term lease liability, исключены из net debt ниже)",
+                f"{m.lease_liabilities / 1e9:,.2f} млрд. {trading_ccy}",
+            )
+        )
     if not pd.isna(m.total_debt_incl_leases):
-        lines.append((
-            "Total Debt (агрегированное поле провайдера данных, включает долг и debt-like "
-            "обязательства по его классификации - может не равняться простой сумме строк "
-            "выше; справочно, не используется в DCF)",
-            f"{m.total_debt_incl_leases / 1e9:,.2f} млрд. {trading_ccy}",
-        ))
-    lines.append((
-        "Денежные средства (Cash and Cash Equivalents)",
-        f"{m.cash_balance / 1e9:,.2f} млрд. {trading_ccy}",
-    ))
+        lines.append(
+            (
+                "Total Debt (агрегированное поле провайдера данных, включает долг и debt-like "
+                "обязательства по его классификации - может не равняться простой сумме строк "
+                "выше; справочно, не используется в DCF)",
+                f"{m.total_debt_incl_leases / 1e9:,.2f} млрд. {trading_ccy}",
+            )
+        )
+    lines.append(
+        (
+            "Денежные средства (Cash and Cash Equivalents)",
+            f"{m.cash_balance / 1e9:,.2f} млрд. {trading_ccy}",
+        )
+    )
     net_debt_label = (
         "Чистый долг, использован в DCF (поле Net Debt из Yahoo Finance)"
         if m.net_debt_source == "reported"
@@ -76,11 +103,16 @@ def _checklist_section(m):
     if m.scoring.sins:
         parts = []
         if m.scoring.critical_sins:
-            parts.append("**Критические:**\n" + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins))
+            parts.append(
+                "**Критические:**\n"
+                + "\n".join(f"- {s.message}" for s in m.scoring.critical_sins)
+            )
         if m.scoring.minor_sins:
             parts.append(
                 f"**Второстепенные (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):**\n"
-                + "\n".join(f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
+                + "\n".join(
+                    f"- [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins
+                )
             )
         sins_block = "\n\n".join(parts)
     else:
@@ -99,34 +131,53 @@ def _checklist_section(m):
 
     def flowables():
         verdict_style = ParagraphStyle(
-            "VerdictText", fontName=FONT_BOLD, fontSize=12, textColor=COLORS[m.scoring.verdict_color_key],
-            leading=15, spaceAfter=6,
+            "VerdictText",
+            fontName=FONT_BOLD,
+            fontSize=12,
+            textColor=COLORS[m.scoring.verdict_color_key],
+            leading=15,
+            spaceAfter=6,
         )
         body_style = ParagraphStyle("Body", **_BODY)
         callout_style = ParagraphStyle("CalloutText", **_CALLOUT_TEXT)
         items = [
             Paragraph("<b>Итоговое решение по алгоритму:</b>", body_style),
             Paragraph(pdf_safe(m.scoring.verdict), verdict_style),
-            Paragraph(f"<b>Резюме и обоснование:</b> {m.scoring.reasoning}", body_style),
+            Paragraph(
+                f"<b>Резюме и обоснование:</b> {m.scoring.reasoning}", body_style
+            ),
         ]
         if m.scoring.critical_sins:
             crit_text = (
                 "<b>Критические риски (любой из них — основание для ПРОПУСТИТЬ):</b><br/>"
                 + "<br/>".join(f"• {s.message}" for s in m.scoring.critical_sins)
             )
-            items.append(CalloutBox(crit_text, USABLE_W, COLORS, callout_style, COLORS["danger"]))
+            items.append(
+                CalloutBox(crit_text, USABLE_W, COLORS, callout_style, COLORS["danger"])
+            )
             items.append(Spacer(1, 6))
         if m.scoring.minor_sins:
             minor_text = (
                 f"<b>Второстепенные риски (балл {m.scoring.minor_score:.1f} из {m.scoring.max_minor_score:.1f}):</b><br/>"
-                + "<br/>".join(f"• [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins)
+                + "<br/>".join(
+                    f"• [{s.weight:.1f}] {s.message}" for s in m.scoring.minor_sins
+                )
             )
-            items.append(CalloutBox(minor_text, USABLE_W, COLORS, callout_style, COLORS["warning"]))
+            items.append(
+                CalloutBox(
+                    minor_text, USABLE_W, COLORS, callout_style, COLORS["warning"]
+                )
+            )
         if not m.scoring.sins:
-            items.append(CalloutBox(
-                "<b>Финансовые риски:</b> Грехов не обнаружено. Финансовые показатели компании находятся в безупречной форме.",
-                USABLE_W, COLORS, callout_style, COLORS["success"],
-            ))
+            items.append(
+                CalloutBox(
+                    "<b>Финансовые риски:</b> Грехов не обнаружено. Финансовые показатели компании находятся в безупречной форме.",
+                    USABLE_W,
+                    COLORS,
+                    callout_style,
+                    COLORS["success"],
+                )
+            )
         return items
 
     return Section("Экспресс-вердикт и оценка рисков", markdown, flowables)
@@ -139,19 +190,21 @@ def _fundamentals_section(m, trading_ccy, ticker):
         return f"| {label} | " + " | ".join(fmt.format(v) for v in series) + " |"
 
     def markdown():
-        table_rows = "\n".join([
-            f"| Показатель | {' | '.join(year_labels)} |",
-            "|---|" + "---|" * len(year_labels),
-            row("Выручка (Revenue)", [v / 1e6 for v in m.revenue]),
-            row("Операционная прибыль", [v / 1e6 for v in m.operating_income]),
-            row("Чистая прибыль (Net Income)", [v / 1e6 for v in m.net_income]),
-            row("Разводненная EPS, USD", list(m.eps), fmt="{:.2f}"),
-            row("Оборотные активы", [v / 1e6 for v in m.curr_assets]),
-            row("Краткосрочные обязательства", [v / 1e6 for v in m.curr_liab]),
-            row("Current Ratio", list(m.curr_ratios), fmt="{:.2f}"),
-            row("Акционерный капитал", [v / 1e6 for v in m.equity]),
-            row("Free Cash Flow", [v / 1e6 for v in m.fcf]),
-        ])
+        table_rows = "\n".join(
+            [
+                f"| Показатель | {' | '.join(year_labels)} |",
+                "|---|" + "---|" * len(year_labels),
+                row("Выручка (Revenue)", [v / 1e6 for v in m.revenue]),
+                row("Операционная прибыль", [v / 1e6 for v in m.operating_income]),
+                row("Чистая прибыль (Net Income)", [v / 1e6 for v in m.net_income]),
+                row("Разводненная EPS, USD", list(m.eps), fmt="{:.2f}"),
+                row("Оборотные активы", [v / 1e6 for v in m.curr_assets]),
+                row("Краткосрочные обязательства", [v / 1e6 for v in m.curr_liab]),
+                row("Current Ratio", list(m.curr_ratios), fmt="{:.2f}"),
+                row("Акционерный капитал", [v / 1e6 for v in m.equity]),
+                row("Free Cash Flow", [v / 1e6 for v in m.fcf]),
+            ]
+        )
         note = f"\n\n> {m.nonrecurring_note}" if m.nonrecurring_note else ""
         return f"""## 2. Экспресс-анализ финансовых результатов и баланса
 
@@ -163,27 +216,60 @@ def _fundamentals_section(m, trading_ccy, ticker):
         body_style = ParagraphStyle("Body", **_BODY)
         # PDF space is tighter than markdown - the table windows to the
         # last 4 years, matching build_pdf_report()'s existing behavior.
-        last4 = range(len(year_labels) - 4, len(year_labels))
-        headers = [f"Показатель (в млн. {trading_ccy})"] + [year_labels[i] for i in last4]
+        # Guard: some tickers have fewer than 4 years of data available,
+        # and some series (fcf, curr_assets) may be shorter than year_labels
+        # when Yahoo returns partial cashflow / balance data.
+        _series_lens = [
+            len(m.revenue),
+            len(m.operating_income),
+            len(m.net_income),
+            len(m.eps),
+            len(m.curr_assets),
+            len(m.curr_liab),
+            len(m.curr_ratios),
+            len(m.equity),
+            len(m.fcf),
+        ]
+        n_years = min(len(year_labels), *_series_lens)
+        last4 = range(max(0, n_years - 4), n_years)
+        headers = [f"Показатель (в млн. {trading_ccy})"] + [
+            year_labels[i] for i in last4
+        ]
         rows = [
             ["Выручка (Revenue)"] + [f"{m.revenue.iloc[i] / 1e6:,.1f}" for i in last4],
-            ["Операционная прибыль (Operating Income)"] + [f"{m.operating_income.iloc[i] / 1e6:,.1f}" for i in last4],
-            ["Чистая прибыль (Net Income)"] + [f"{m.net_income.iloc[i] / 1e6:,.1f}" for i in last4],
-            ["Разводненная прибыль на акцию (EPS, USD)"] + [f"{m.eps.iloc[i]:.2f}" for i in last4],
-            ["Оборотные активы (Current Assets)"] + [f"{m.curr_assets.iloc[i] / 1e6:,.1f}" for i in last4],
-            ["Краткосрочные обязательства (Current Liab)"] + [f"{m.curr_liab.iloc[i] / 1e6:,.1f}" for i in last4],
-            ["Текущая ликвидность (Current Ratio)"] + [f"{m.curr_ratios.iloc[i]:.2f}" for i in last4],
-            ["Акционерный капитал (Shareholders Equity)"] + [f"{m.equity.iloc[i] / 1e6:,.1f}" for i in last4],
-            ["Чистый Свободный кэш (Free Cash Flow)"] + [f"{m.fcf.iloc[i] / 1e6:,.1f}" for i in last4],
+            ["Операционная прибыль (Operating Income)"]
+            + [f"{m.operating_income.iloc[i] / 1e6:,.1f}" for i in last4],
+            ["Чистая прибыль (Net Income)"]
+            + [f"{m.net_income.iloc[i] / 1e6:,.1f}" for i in last4],
+            ["Разводненная прибыль на акцию (EPS, USD)"]
+            + [f"{m.eps.iloc[i]:.2f}" for i in last4],
+            ["Оборотные активы (Current Assets)"]
+            + [f"{m.curr_assets.iloc[i] / 1e6:,.1f}" for i in last4],
+            ["Краткосрочные обязательства (Current Liab)"]
+            + [f"{m.curr_liab.iloc[i] / 1e6:,.1f}" for i in last4],
+            ["Текущая ликвидность (Current Ratio)"]
+            + [f"{m.curr_ratios.iloc[i]:.2f}" for i in last4],
+            ["Акционерный капитал (Shareholders Equity)"]
+            + [f"{m.equity.iloc[i] / 1e6:,.1f}" for i in last4],
+            ["Чистый Свободный кэш (Free Cash Flow)"]
+            + [f"{m.fcf.iloc[i] / 1e6:,.1f}" for i in last4],
         ]
-        chart_img_path = generate_fcf_chart(year_labels, m.fcf.values, m.proj_years, m.projected_fcfs, ticker)
+        chart_img_path = generate_fcf_chart(
+            year_labels[-len(m.fcf) :],
+            m.fcf.values,
+            m.proj_years,
+            m.projected_fcfs,
+            ticker,
+        )
         flowable_items = [
             Paragraph(
                 "Ниже представлена сводная таблица фундаментальных показателей компании за последние 4 отчетных года. "
                 "Основной упор сделан на динамику изменения капитала, ликвидности и денежных потоков.",
                 body_style,
             ),
-            create_reportlab_table(headers, rows, {}, COLORS, col_widths=[190, 70, 70, 70, 70]),
+            create_reportlab_table(
+                headers, rows, {}, COLORS, col_widths=[190] + [70] * len(last4)
+            ),
         ]
         if m.nonrecurring_note:
             flowable_items.append(Spacer(1, 6))
@@ -194,7 +280,9 @@ def _fundamentals_section(m, trading_ccy, ticker):
         ]
         return flowable_items
 
-    return Section("Экспресс-анализ финансовых результатов и баланса", markdown, flowables)
+    return Section(
+        "Экспресс-анализ финансовых результатов и баланса", markdown, flowables
+    )
 
 
 def _graham_note(m, trading_ccy):
@@ -207,7 +295,11 @@ def _graham_note(m, trading_ccy):
             "Справочно (вне основной методики): Число Грэма недоступно "
             f"(EPS({m.graham_eps_label}) ≤ 0 или tangible BVPS ≤ 0)."
         )
-    deviation = (m.graham_value - m.valuation.price) / m.valuation.price * 100 if m.valuation.price else 0.0
+    deviation = (
+        (m.graham_value - m.valuation.price) / m.valuation.price * 100
+        if m.valuation.price
+        else 0.0
+    )
     verdict = "недооценена" if deviation > 0 else "переоценена"
     return (
         f"Справочно (вне основной методики): Число Грэма = √(22.5 × EPS({m.graham_eps_label}) × "
@@ -221,7 +313,11 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
     # replaced by the 1.1 sanity fallback (source value NaN, <-1.0, >3.0),
     # so a reader isn't left trusting a Ke built on a broken beta with no
     # visible sign anything was adjusted.
-    beta_note = " (β скорректирована — исходное значение вне разумного диапазона)" if m.valuation.beta_is_fallback else ""
+    beta_note = (
+        " (β скорректирована — исходное значение вне разумного диапазона)"
+        if m.valuation.beta_is_fallback
+        else ""
+    )
     ke_disclosure = (
         f"Ke = задано инвестором (--required-return) = {m.valuation.cost_of_equity * 100:.2f}%"
         if m.valuation.required_return_used
@@ -245,7 +341,9 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
             if m.ddm_sensitivity_headers and m.ddm_sensitivity_rows:
                 ddm_sens_header = "| " + " | ".join(m.ddm_sensitivity_headers) + " |"
                 ddm_sens_sep = "|" + "---|" * len(m.ddm_sensitivity_headers)
-                ddm_sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m.ddm_sensitivity_rows)
+                ddm_sens_rows = "\n".join(
+                    "| " + " | ".join(r) + " |" for r in m.ddm_sensitivity_rows
+                )
                 ddm_sens_block = f"""
 ### Матрица чувствительности DDM (строки — рост дивидендов CAGR_div; столбцы — ставка дисконтирования Ke; терминальный рост фиксирован на {m.terminal_g * 100:.2f}% — условие Ke > g не требуется для самой матрицы, ячейки с Ke ≤ g помечены N/A)
 
@@ -280,16 +378,16 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                     f"\n- Fair value без учёта аренды как долга (справочно): "
                     f"{m.fair_value_share_excl_leases:.2f} {trading_ccy}"
                 )
-                lease_headline_suffix = (
-                    " (headline - с учётом обязательств по аренде как долга: лизинг-тяжёлый сектор)"
-                )
+                lease_headline_suffix = " (headline - с учётом обязательств по аренде как долга: лизинг-тяжёлый сектор)"
             else:
                 lease_incl_line = (
                     f"\n- Fair value с учётом аренды как долга (справочно): "
                     f"{m.fair_value_share_incl_leases:.2f} {trading_ccy}"
                 )
 
-        debt_block = "\n".join(f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy))
+        debt_block = "\n".join(
+            f"- {label}: {value}" for label, value in _debt_lines(m, trading_ccy)
+        )
         sens_header = "| " + " | ".join(m.sensitivity_headers) + " |"
         sens_sep = "|" + "---|" * len(m.sensitivity_headers)
         sens_rows = "\n".join("| " + " | ".join(r) + " |" for r in m.sensitivity_rows)
@@ -338,11 +436,18 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 f"| Статус: <font color='{val_color.hexval()}'><b>{m.valuation.val_status}</b></font>"
             )
             items = [
-                CalloutBox(ddm_info_text, USABLE_W, COLORS, callout_style, COLORS["accent"]),
+                CalloutBox(
+                    ddm_info_text, USABLE_W, COLORS, callout_style, COLORS["accent"]
+                ),
                 Spacer(1, 8),
                 CalloutBox(
-                    val_banner_text, USABLE_W, COLORS,
-                    ParagraphStyle("ValB", parent=callout_style, fontSize=10, leading=14), val_color,
+                    val_banner_text,
+                    USABLE_W,
+                    COLORS,
+                    ParagraphStyle(
+                        "ValB", parent=callout_style, fontSize=10, leading=14
+                    ),
+                    val_color,
                 ),
                 Spacer(1, 6),
                 Paragraph(_graham_note(m, trading_ccy), body_style),
@@ -352,7 +457,13 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                     Spacer(1, 10),
                     Paragraph(
                         "<b>Матрица чувствительности DDM (CAGR_div vs Ke):</b>",
-                        ParagraphStyle("SensT", fontName=FONT_BOLD, fontSize=9.5, textColor=COLORS["heading"], spaceAfter=4),
+                        ParagraphStyle(
+                            "SensT",
+                            fontName=FONT_BOLD,
+                            fontSize=9.5,
+                            textColor=COLORS["heading"],
+                            spaceAfter=4,
+                        ),
                     ),
                     Paragraph(
                         "Таблица показывает, как меняется справедливая стоимость при изменении темпа роста дивидендов "
@@ -360,11 +471,15 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                         f"на {m.terminal_g * 100:.2f}% (ячейки с Ke ≤ g помечены N/A).",
                         body_style,
                     ),
-                    create_reportlab_table(m.ddm_sensitivity_headers, m.ddm_sensitivity_rows, {}, COLORS),
+                    create_reportlab_table(
+                        m.ddm_sensitivity_headers, m.ddm_sensitivity_rows, {}, COLORS
+                    ),
                 ]
             return items
 
-        debt_html = "<br/>".join(f"• <b>{label}:</b> {value}" for label, value in _debt_lines(m, trading_ccy))
+        debt_html = "<br/>".join(
+            f"• <b>{label}:</b> {value}" for label, value in _debt_lines(m, trading_ccy)
+        )
         dcf_info_text = (
             f"• <b>Стоимость собственного капитала:</b> {ke_disclosure}<br/>"
             f"• <b>Стоимость долга после налога:</b> Kd×(1-T) = {m.cost_of_debt * 100:.2f}%×(1-21%) = {m.cost_of_debt_after_tax * 100:.2f}% "
@@ -379,7 +494,8 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
             + (
                 f"• <b>Fair value {'без' if m.lease_heavy_sector else 'с'} учётом аренды как долга (справочно):</b> "
                 f"{(m.fair_value_share_excl_leases if m.lease_heavy_sector else m.fair_value_share_incl_leases):.2f} {trading_ccy}<br/>"
-                if m.fair_value_share_incl_leases is not None else ""
+                if m.fair_value_share_incl_leases is not None
+                else ""
             )
         )
         val_banner_text = (
@@ -392,12 +508,19 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 "Расчет справедливой стоимости на основе темпов роста FCF и средневзвешенной стоимости капитала (WACC):",
                 body_style,
             ),
-            CalloutBox(dcf_info_text, USABLE_W, COLORS, callout_style, COLORS["accent"]),
-            CalloutBox(LEASE_ASSUMPTION_NOTE, USABLE_W, COLORS, callout_style, COLORS["muted"]),
+            CalloutBox(
+                dcf_info_text, USABLE_W, COLORS, callout_style, COLORS["accent"]
+            ),
+            CalloutBox(
+                LEASE_ASSUMPTION_NOTE, USABLE_W, COLORS, callout_style, COLORS["muted"]
+            ),
             Spacer(1, 8),
             CalloutBox(
-                val_banner_text, USABLE_W, COLORS,
-                ParagraphStyle("ValB", parent=callout_style, fontSize=10, leading=14), val_color,
+                val_banner_text,
+                USABLE_W,
+                COLORS,
+                ParagraphStyle("ValB", parent=callout_style, fontSize=10, leading=14),
+                val_color,
             ),
             Spacer(1, 6),
             Paragraph(_graham_note(m, trading_ccy), body_style),
@@ -405,15 +528,25 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
             create_reportlab_table(
                 ["Прогнозный показатель", "Год 1", "Год 2", "Год 3", "Год 4", "Год 5"],
                 [
-                    ["Прогнозный FCF (млн. USD)"] + [f"{v / 1e6:,.1f}" for v in m.projected_fcfs],
-                    ["Дисконтированный FCF (PV, млн.)"] + [f"{v / 1e6:,.1f}" for v in m.pv_fcfs],
+                    ["Прогнозный FCF (млн. USD)"]
+                    + [f"{v / 1e6:,.1f}" for v in m.projected_fcfs],
+                    ["Дисконтированный FCF (PV, млн.)"]
+                    + [f"{v / 1e6:,.1f}" for v in m.pv_fcfs],
                 ],
-                {}, COLORS, col_widths=[170, 60, 60, 60, 60, 60],
+                {},
+                COLORS,
+                col_widths=[170, 60, 60, 60, 60, 60],
             ),
             Spacer(1, 12),
             Paragraph(
                 "<b>Матрица чувствительности цены акции (WACC vs Рост g):</b>",
-                ParagraphStyle("SensT", fontName=FONT_BOLD, fontSize=9.5, textColor=COLORS["heading"], spaceAfter=4),
+                ParagraphStyle(
+                    "SensT",
+                    fontName=FONT_BOLD,
+                    fontSize=9.5,
+                    textColor=COLORS["heading"],
+                    spaceAfter=4,
+                ),
             ),
             Paragraph(
                 "Таблица показывает, как меняется внутренняя стоимость одной акции при изменении ставки дисконтирования "
@@ -421,16 +554,24 @@ def _valuation_section(m, trading_ccy, price_kind, quote_time_label):
                 "терминальный рост (зафиксирован отдельно на 2.5%, используется только в формуле Гордона).",
                 body_style,
             ),
-            create_reportlab_table(m.sensitivity_headers, m.sensitivity_rows, {}, COLORS),
+            create_reportlab_table(
+                m.sensitivity_headers, m.sensitivity_rows, {}, COLORS
+            ),
         ]
 
-    title = "Оценка справедливой стоимости (Модель DDM)" if is_ddm else "Модель дисконтирования денежных потоков (DCF)"
+    title = (
+        "Оценка справедливой стоимости (Модель DDM)"
+        if is_ddm
+        else "Модель дисконтирования денежных потоков (DCF)"
+    )
     return Section(title, markdown, flowables)
 
 
 def _forward_outlook_section(forward_outlook):
     peg_color_key, peg_label = _peg_assessment(forward_outlook["peg_ratio"])
-    peg_emoji = {"success": "🟢", "warning": "🟡", "danger": "🔴", "muted": "⚪"}[peg_color_key]
+    peg_emoji = {"success": "🟢", "warning": "🟡", "danger": "🔴", "muted": "⚪"}[
+        peg_color_key
+    ]
     forward_pe_txt = _fmt_or_na(forward_outlook["forward_pe"])
     growth_txt = _fmt_or_na(forward_outlook["growth_pct"], "{:.1f}%")
     peg_txt = _fmt_or_na(forward_outlook["peg_ratio"])
@@ -440,9 +581,9 @@ def _forward_outlook_section(forward_outlook):
 
 > Раздел носит справочный характер и не влияет на балл экспресс-чеклиста из раздела 1 — это форвардный (консенсусный) взгляд, балансирующий DCF-модель, построенную на экстраполяции исторических 4 лет.
 
-- Forward P/E: **{forward_pe_txt}** [источник: {forward_outlook['forward_pe_source'] or 'N/A'}]
-- Ожидаемый рост (консенсус): **{growth_txt}** [источник: {forward_outlook['growth_source'] or 'N/A'}]
-- PEG Ratio: **{peg_txt}** {peg_emoji} — {peg_label} [источник: {forward_outlook['peg_source'] or 'N/A'}]"""
+- Forward P/E: **{forward_pe_txt}** [источник: {forward_outlook["forward_pe_source"] or "N/A"}]
+- Ожидаемый рост (консенсус): **{growth_txt}** [источник: {forward_outlook["growth_source"] or "N/A"}]
+- PEG Ratio: **{peg_txt}** {peg_emoji} — {peg_label} [источник: {forward_outlook["peg_source"] or "N/A"}]"""
 
     def flowables():
         body_style = ParagraphStyle("Body", **_BODY)
@@ -463,10 +604,14 @@ def _forward_outlook_section(forward_outlook):
                 "на экстраполяции исторических 4 лет.",
                 body_style,
             ),
-            CalloutBox(outlook_text, USABLE_W, COLORS, callout_style, COLORS[peg_color_key]),
+            CalloutBox(
+                outlook_text, USABLE_W, COLORS, callout_style, COLORS[peg_color_key]
+            ),
         ]
 
-    return Section("Форвардные мультипликаторы и консенсус-прогноз", markdown, flowables)
+    return Section(
+        "Форвардные мультипликаторы и консенсус-прогноз", markdown, flowables
+    )
 
 
 def _catalysts_section(catalysts_text):
@@ -482,7 +627,9 @@ def _catalysts_section(catalysts_text):
     def flowables():
         callout_style = ParagraphStyle("CalloutText", **_CALLOUT_TEXT)
         catalysts_html = "<br/>".join(catalysts_text.splitlines())
-        return [CalloutBox(catalysts_html, USABLE_W, COLORS, callout_style, COLORS["muted"])]
+        return [
+            CalloutBox(catalysts_html, USABLE_W, COLORS, callout_style, COLORS["muted"])
+        ]
 
     return Section("Катализаторы и риски", markdown, flowables)
 
@@ -506,8 +653,16 @@ def _analyst_notes_section(notes_text, number):
     return Section("Заметки аналитика", markdown, flowables)
 
 
-def build_ordinary_sections(m, forward_outlook, catalysts_text, trading_ccy, price_kind, quote_time_label, ticker,
-                            analyst_notes=None):
+def build_ordinary_sections(
+    m,
+    forward_outlook,
+    catalysts_text,
+    trading_ccy,
+    price_kind,
+    quote_time_label,
+    ticker,
+    analyst_notes=None,
+):
     """Ordered list[Section] for the Ordinary report - the five numbered
     blocks build_markdown_report()/build_pdf_report() assemble inline
     today. Sector-warning-banner handling and the closing "important rule"
